@@ -1,0 +1,405 @@
+[
+  {
+    "id": "sparrow_v2",
+    "name": "Sparrow SMS (API v2)",
+    "website": "https://sparrowsms.com",
+    "docs_url": "https://docs.sparrowsms.com/sms/outgoing_sendsms/",
+    "confidence": "VERIFIED",
+    "send": {
+      "method": "POST",
+      "url": "https://api.sparrowsms.com/v2/sms/",
+      "content_type": "form",
+      "auth": { "style": "param", "fields": ["token"] },
+      "params": {
+        "token": "{token}",
+        "from": "{sender}",
+        "to": "{to}",
+        "text": "{text}"
+      },
+      "to_format": "local10",
+      "multi_recipient": { "supported": true, "separator": "," },
+      "success": { "http_status": [200], "json_path": "response_code", "equals": 200 },
+      "message_id_path": null,
+      "error_message_path": "response",
+      "error_code_path": "response_code"
+    },
+    "dlr": {
+      "mode": "none",
+      "details": "The public v2 SMS API documents no delivery-report callback and no per-message status endpoint, and the send response returns no message id (only `count`). DLRs are visible in the web dashboard only. Sparrow's separate Enterprise suite (ent-api.sparrowsms.com, JWT bearer auth) has batch reports for Viber and international SMS, but not for domestic v2 SMS."
+    },
+    "balance": {
+      "method": "GET",
+      "url": "https://api.sparrowsms.com/v2/credit/",
+      "content_type": "query",
+      "params": { "token": "{token}" },
+      "success": { "http_status": [200], "json_path": "response_code", "equals": 200 },
+      "balance_path": "credits_available",
+      "extra_paths": { "consumed": "credits_consumed" }
+    },
+    "credentials_needed": [
+      { "key": "token", "label": "API Token", "secret": true },
+      { "key": "sender", "label": "Sender identity (from)", "secret": false },
+      { "key": "base_url", "label": "API base URL", "secret": false, "default": "https://api.sparrowsms.com/v2" }
+    ],
+    "notes": "The docs show http://, but https://api.sparrowsms.com works (it was probed and returned the JSON 403 error envelope). Send also accepts GET with query params. Errors return HTTP 403 with {\"response_code\":<code>,\"response\":\"<msg>\"}, and live responses also include \"requested_ip\". Error codes: 1000 required field missing, 1001 invalid IP address (the account has an IP whitelist, so you must whitelist the gateway's egress IPs), 1002 invalid token, 1003/1004 account inactive, 1005/1006 account expired, 1007 invalid receiver, 1008 invalid sender, 1010 text empty, 1011 no valid receiver, 1012 no credits, 1013 insufficient credits. The success body is {\"count\":N,\"response_code\":200,\"response\":\"N mesages has been queued for delivery\"}. The `from` value must be an identity assigned to the account. No scheduling, no unicode flag (encoding is automatic; Sparrow's FAQ says Nepali text is billed at 70 chars for 1 credit and 67 chars per extra part). No documented rate limit. Docs last updated 2020-03-13 but the endpoint is live."
+  },
+  {
+    "id": "aakash_v3",
+    "name": "Aakash SMS (API v3)",
+    "website": "https://aakashsms.com",
+    "docs_url": "https://aakashsms.com/documentation/",
+    "confidence": "VERIFIED",
+    "send": {
+      "method": "POST",
+      "url": "https://sms.aakashsms.com/sms/v3/send",
+      "content_type": "form",
+      "auth": { "style": "param", "fields": ["auth_token"] },
+      "params": {
+        "auth_token": "{token}",
+        "to": "{to}",
+        "text": "{text}"
+      },
+      "to_format": "local10",
+      "multi_recipient": { "supported": true, "separator": "," },
+      "success": { "http_status": [200], "json_path": "error", "equals": false },
+      "message_id_path": "data.valid[*].id",
+      "error_message_path": "message",
+      "per_recipient": {
+        "accepted_path": "data.valid",
+        "rejected_path": "data.invalid",
+        "status_field": "status",
+        "accepted_value": "queued",
+        "rejected_value": "aborted",
+        "network_field": "network",
+        "credit_field": "credit"
+      }
+    },
+    "dlr": {
+      "mode": "poll",
+      "details": "There is no per-message status endpoint and no DLR webhook for outbound MT. The report list is paged and keyed by Aakash message id: POST https://sms.aakashsms.com/sms/v1/report/api (form: auth_token, page starting at 1). It returns {error,total_page,response_code:\"201\",data:[{id,receiver (masked),network,message,api_credit,delivery_at}]}. No explicit delivery-status field is documented, so the presence of delivery_at is the only signal. v4 alternative: POST https://sms.aakashsms.com/sms/v4/api-report with header auth-token and body start_date,end_date (Y-m-d). Its response shape is not documented.",
+      "poll": {
+        "method": "POST",
+        "url": "https://sms.aakashsms.com/sms/v1/report/api",
+        "content_type": "form",
+        "params": { "auth_token": "{token}", "page": "1" },
+        "records_path": "data",
+        "id_field": "id",
+        "status_field": null,
+        "delivered_at_field": "delivery_at"
+      }
+    },
+    "balance": {
+      "method": "POST",
+      "url": "https://sms.aakashsms.com/sms/v1/credit",
+      "content_type": "form",
+      "params": { "auth_token": "{token}" },
+      "success": { "http_status": [200], "json_path": "response_code", "equals": 202 },
+      "balance_path": "available_credit",
+      "extra_paths": { "total_sent": "total_sms_sent" },
+      "alternatives": [
+        { "method": "GET", "url": "https://sms.aakashsms.com/sms/v4/available-credit", "auth_header": "auth-token", "balance_path": "available_credit", "success_response_code": 200 },
+        { "method": "POST", "url": "https://sms.aakashsms.com/sms/v4/credit", "auth_header": "auth-token", "balance_path": "available_credit", "success_response_code": 202 }
+      ]
+    },
+    "credentials_needed": [
+      { "key": "token", "label": "Auth Token", "secret": true },
+      { "key": "base_url", "label": "API base URL", "secret": false, "default": "https://sms.aakashsms.com/sms" }
+    ],
+    "notes": "IMPORTANT: v3 send returns HTTP 200 even on errors. This was verified live: an invalid token returned 200 with {\"error\":true,\"message\":\"The provided Auth Token is not valid.\",\"data\":[]}. Always check the `error` boolean. Documented error messages: 'The provided Auth Token is not valid.', 'The auth token field is required.', 'The to field is required.', 'The text field is required.', 'Not enough balance.'. There are no numeric error codes. Partial success is possible: some numbers can land in data.invalid with status 'aborted' and credit 0 while others are queued. Each valid entry has id (integer), mobile (977-prefixed, sometimes masked), text, credit, network ('ntc'|'ncell'), status 'queued'. No sender/from parameter: the sender identity is fixed per account. No unicode flag or scheduling. The official curl example wrongly uses -F token=, but PHP/Python/C# examples and the docs table all use auth_token. A trailing slash (/send/) is also used in the examples. No documented rate limit. Inbound MO: Aakash GETs your URL with keyword, from, text."
+  },
+  {
+    "id": "aakash_v4",
+    "name": "Aakash SMS (API v4, JSON per-recipient)",
+    "website": "https://aakashsms.com",
+    "docs_url": "https://bitbucket.org/aakashsms/api/src/v4/README.md",
+    "confidence": "VERIFIED",
+    "send": {
+      "method": "POST",
+      "url": "https://sms.aakashsms.com/sms/v4/send-user",
+      "content_type": "json",
+      "auth": { "style": "header", "fields": ["auth-token"] },
+      "headers": { "auth-token": "{token}" },
+      "params": {
+        "to": "[{to}]",
+        "text": "[{text}]"
+      },
+      "to_format": "local10",
+      "multi_recipient": { "supported": true, "separator": null, "as_array": true },
+      "success": { "http_status": [200], "json_path": "responses[0].error", "equals": false },
+      "message_id_path": "responses[*].data.valid[*].id",
+      "error_message_path": "message"
+    },
+    "dlr": {
+      "mode": "poll",
+      "details": "Same as aakash_v3. Use POST https://sms.aakashsms.com/sms/v4/api-report (header auth-token; start_date, end_date as Y-m-d) or the v1 report. The v4 report response format is undocumented."
+    },
+    "balance": {
+      "method": "GET",
+      "url": "https://sms.aakashsms.com/sms/v4/available-credit",
+      "headers": { "auth-token": "{token}" },
+      "success": { "http_status": [200], "json_path": "response_code", "equals": 200 },
+      "balance_path": "available_credit"
+    },
+    "credentials_needed": [
+      { "key": "token", "label": "Auth Token", "secret": true }
+    ],
+    "notes": "Source is the official Aakash Bitbucket README (branch v4), which the aakashsms.com/documentation page links to. `to` and `text` are JSON arrays: one text means the same message to all numbers, and N texts map to N numbers. Success envelope: {\"responses\":[{error:false,message,data:{valid:[{id:\"8967_173191065276114\" (string id in v4),mobile,text,credit,network,status:\"queued\",shortcode}],invalid:[]}}],\"errors\":[]}. Failure envelope: {\"error\":true,\"message\":\"All messages encountered errors.\",\"errors\":[{error:true,message:\"No valid recipients.\"|\"Not enough balance.\",data:{...}}]}. A robust success test is a non-empty responses[] with no top-level error:true, and the adapter must also handle partial failures in errors[]. A live probe of v4/available-credit with a bad token returned HTTP 401 {\"error\":true,\"message\":\"Authentication token is invalid or expired\",\"response_code\":401,\"data\":[]}. The README's JSON samples use straight and curly quotes inconsistently, but the field names are clear. No sender parameter, and no documented rate limit. Prefer aakash_v3 for simple routes, and use v4 for per-recipient personalised text."
+  },
+  {
+    "id": "messengernepal",
+    "name": "MessengerNepal",
+    "website": "https://messengernepal.com.np",
+    "docs_url": "https://messengernepal.com.np/docs",
+    "confidence": "VERIFIED",
+    "send": {
+      "method": "POST",
+      "url": "https://api.messengernepal.com.np/api/v1/sms/send/with-sender-id",
+      "content_type": "json",
+      "auth": { "style": "header", "fields": ["X-API-Key"] },
+      "headers": { "X-API-Key": "{token}", "Idempotency-Key": "{message_uuid}" },
+      "params": {
+        "to": "{to}",
+        "message": "{text}",
+        "sender_id": "{sender}"
+      },
+      "to_format": "local10",
+      "multi_recipient": { "supported": true, "separator": ",", "as_array_allowed": true, "max": 1000 },
+      "success": { "http_status": [202], "json_path": "success", "equals": true },
+      "message_id_path": "data.message_id",
+      "bulk_message_ids_path": "data.dispatch_ids",
+      "error_message_path": "error",
+      "error_code_path": "code"
+    },
+    "dlr": {
+      "mode": "callback",
+      "details": "Opt-in signed webhooks are configured in the dashboard (API Integration > Webhooks), not per request. Events: sms.accepted, sms.sending, sms.sent, sms.delivered, sms.failed, sms.unknown, sms.cancelled. Body: {id,type,created_at,data:{message_id,dispatch_id,batch_id,status,channel:\"sms\",recipient:\"97798XXXXXXXX\",sent_at,delivered_at,failed_at,error_code,error_message,cost,environment}}. Signature: X-Msngr-Signature = 'sha256=' + hex(HMAC-SHA256(secret, `${X-Msngr-Timestamp}.${rawBody}`)). Other headers: X-Msngr-Event, X-Msngr-Delivery-Id. The public API has no SMS status poll endpoint (only WhatsApp has GET /messages/:id).",
+      "callback": {
+        "configured_in": "provider_dashboard",
+        "id_field": "data.message_id",
+        "status_field": "data.status",
+        "status_values": ["accepted", "sending", "sent", "delivered", "failed", "unknown", "cancelled"],
+        "signature_header": "X-Msngr-Signature",
+        "timestamp_header": "X-Msngr-Timestamp",
+        "signature_algo": "hmac-sha256 over '{timestamp}.{rawBody}', hex, prefixed 'sha256='"
+      }
+    },
+    "balance": null,
+    "credentials_needed": [
+      { "key": "token", "label": "API Key (msnp_live_... / msnp_test_...)", "secret": true },
+      { "key": "sender", "label": "Sender ID (blank = account default)", "secret": false },
+      { "key": "webhook_secret", "label": "Webhook signing secret", "secret": true }
+    ],
+    "notes": "Spec is from the official OpenAPI 3 document at https://api.messengernepal.com.np/api/v1/sms/openapi.json. Use POST /api/v1/sms/send (no sender_id) for the platform default sender, or /send/with-sender-id with a required sender_id. GET /api/v1/sms/sender-ids lists approved IDs. Optional fields: type (text|unicode|flash, auto-detected: one Nepali char makes the whole body UCS-2), message_type (promotional|transactional|otp, default transactional), template_id/template_name + variables. Length limit is 720 GSM-7 septets or 335 UCS-2 chars. `to` accepts a string, a CSV string or an array, as local 10-digit or 977-prefixed numbers, max 1000. A single recipient returns data.message_id (= dispatch_id = job_id). Multiple recipients return data.batch_id and data.dispatch_ids[]. Error envelope: {success:false,error,code}, with codes such as VALIDATION_ERROR, INSUFFICIENT_CREDITS and RATE_LIMIT_EXCEEDED (429 plus a Retry-After header and retry_after field). HTTP codes: 400, 401, 403, 429, 503. There is no balance endpoint, but the send response includes data.remaining_credits. Live keys need KYC and live-API approval. Sandbox keys (msnp_test_) do not deliver to handsets. This looks like the same white-label SaaS as NestSMS."
+  },
+  {
+    "id": "twozero",
+    "name": "Twozero SMS (Twozero Labs)",
+    "website": "https://sms.twozero.io",
+    "docs_url": "https://sms.twozero.io/api-docs",
+    "confidence": "VERIFIED",
+    "send": {
+      "method": "POST",
+      "url": "https://sms.twozero.io/api/v1/sms/send",
+      "content_type": "json",
+      "auth": { "style": "header", "fields": ["X-API-Key"] },
+      "headers": { "X-API-Key": "{token}", "Idempotency-Key": "{message_uuid}" },
+      "params": {
+        "to": "{to}",
+        "message": "{text}",
+        "sender_id": "{sender}"
+      },
+      "to_format": "local10",
+      "multi_recipient": { "supported": false, "separator": null },
+      "success": { "http_status": [200], "json_path": "status", "equals": "success" },
+      "message_id_path": "data.message_id",
+      "error_message_path": "message"
+    },
+    "bulk_send": {
+      "method": "POST",
+      "url": "https://sms.twozero.io/api/v1/sms/send-bulk",
+      "params": { "recipients": "[{to}]", "message": "{text}", "sender_id": "{sender}" },
+      "max_recipients": 1000,
+      "success": { "http_status": [202], "json_path": "status", "equals": "success" },
+      "batch_id_path": "data.batch_id",
+      "batch_status_url": "https://sms.twozero.io/api/v1/sms/batches/{batch_id}"
+    },
+    "dlr": {
+      "mode": "poll",
+      "details": "GET https://sms.twozero.io/api/v1/sms/status/{message_id} with header X-API-Key returns data.status in pending|sent|delivered|failed|rejected, plus delivered_at and delivery_report{status,description,reported_at}. No webhook is documented.",
+      "poll": {
+        "method": "GET",
+        "url": "https://sms.twozero.io/api/v1/sms/status/{message_id}",
+        "status_path": "data.status",
+        "status_map": { "delivered": "DELIVERED", "failed": "FAILED", "rejected": "FAILED", "sent": "SENT", "pending": "QUEUED" }
+      }
+    },
+    "balance": {
+      "method": "GET",
+      "url": "https://sms.twozero.io/api/v1/account/balance",
+      "headers": { "X-API-Key": "{token}" },
+      "success": { "http_status": [200], "json_path": "status", "equals": "success" },
+      "balance_path": "data.credits"
+    },
+    "credentials_needed": [
+      { "key": "token", "label": "API Key (sk_...)", "secret": true },
+      { "key": "sender", "label": "Sender ID (max 11 chars, optional)", "secret": false }
+    ],
+    "notes": "This is a reseller/aggregator: the docs say bulk sends 'fail over between gateways', so it routes over other Nepali providers. `to` accepts +977XXXXXXXXXX, 977XXXXXXXXXX or 10 digits. Message max is 1600 chars. Rate limits per key: send 100/min, send-bulk 10/min, status/history/balance 300/min. HTTP errors: 400 (e.g. insufficient credits), 401, 403 (inactive or IP not whitelisted), 404, 409 (Idempotency-Key reuse with a different body), 422, 429, 500. Error body: {status:\"error\",message,data}. Bulk can return 402 when provider capacity is short. KYC is required before sending to anyone other than your own number."
+  },
+  {
+    "id": "nestsms",
+    "name": "Nest SMS",
+    "website": "https://nestsms.com",
+    "docs_url": "https://nestsms.com/docs",
+    "confidence": "LIKELY",
+    "send": {
+      "method": "POST",
+      "url": "{base_url}/api/v1/sms/send",
+      "content_type": "json",
+      "auth": { "style": "header", "fields": ["X-API-Key"] },
+      "headers": { "X-API-Key": "{token}" },
+      "params": {
+        "to": "{to}",
+        "message": "{text}",
+        "sender_id": "{sender}"
+      },
+      "to_format": "local10",
+      "multi_recipient": { "supported": true, "separator": ",", "as_array_allowed": true, "max": 1000 },
+      "success": { "http_status": [200, 202], "json_path": "success", "equals": true },
+      "message_id_path": "data.job_id",
+      "error_message_path": "error",
+      "error_code_path": "code"
+    },
+    "dlr": {
+      "mode": "poll",
+      "details": "GET {base_url}/api/v1/sms/status/:messageId returns status, recipient, sent_at, delivered_at, failed_at, error_code, error_message, cost, delivery_reports[]. The docs say to use the job_id from the send response, but the status example shows a message_id field. No webhook is documented on the public docs page.",
+      "poll": { "method": "GET", "url": "{base_url}/api/v1/sms/status/{message_id}", "status_path": "data.status" }
+    },
+    "balance": {
+      "method": "GET",
+      "url": "{base_url}/api/v1/sms/balance",
+      "headers": { "X-API-Key": "{token}" },
+      "balance_path": "data.balance"
+    },
+    "credentials_needed": [
+      { "key": "base_url", "label": "API base URL (ask Nest SMS)", "secret": false, "default": null },
+      { "key": "token", "label": "API Key (nsms_live_...)", "secret": true },
+      { "key": "sender", "label": "Sender ID (optional)", "secret": false }
+    ],
+    "notes": "Official docs exist, but they show only a placeholder host (https://your-domain.com). The production API host could not be confirmed: nestsms.com/api/v1 returns 404 and myaccount.nestsms.com/api/v1/sms returns 'Route not found'. Ask the provider. Optional fields: type (text|unicode|flash), message_type (promotional|transactional|otp), template_id + variables. Limits: 720 chars (text) and 335 (unicode). Authorization: Bearer is also accepted. Error codes: NO_API_KEY/INVALID_API_KEY 401, ORG_INACTIVE/IP_RESTRICTED 403, MISSING_TO/INVALID_TO_FORMAT/MESSAGE_TOO_LONG/INSUFFICIENT_BALANCE 400, MESSAGE_NOT_FOUND 404, RATE_LIMIT_EXCEEDED 429 (retry_after). Default rate limit is 60 req/min and 1000 req/hr per key. The balance_path is inferred from the documented field name `balance`, but the exact JSON nesting is not confirmed. The platform appears identical to MessengerNepal (white-label)."
+  },
+  {
+    "id": "swift_smartsms",
+    "name": "Swift Technology SmartSMS",
+    "website": "https://swifttech.com.np/enterprise-messaging/",
+    "docs_url": null,
+    "confidence": "LIKELY",
+    "send": {
+      "method": "POST",
+      "url": "https://smartsms.swifttech.com.np:8083/api/Sms/ExecuteSendSmsV5",
+      "content_type": "json",
+      "auth": { "style": "basic", "fields": ["username", "password", "OrganisationCode"] },
+      "headers": { "OrganisationCode": "{organisation_code}" },
+      "params": {
+        "Message": "{text}",
+        "ReceiverNo": "{to}",
+        "IsClientLogin": "N",
+        "Date": "{now:yyyy/MM/dd HH:mm:ss}"
+      },
+      "to_format": null,
+      "multi_recipient": { "supported": false, "separator": null },
+      "success": { "http_status": [200], "json_path": "responseCode", "equals": 100 },
+      "message_id_path": "messageId",
+      "error_message_path": "responseDescription"
+    },
+    "bulk_send": {
+      "method": "POST",
+      "url": "https://smartsms.swifttech.com.np:8083/api/Sms/SaveBulkSMSV5",
+      "params": {
+        "SmsDetails": "[{\"Message\":\"{text}\",\"ReceiverNo\":\"{to}\"}, ...]",
+        "BatchId": "{client_batch_id}",
+        "Date": "{now:yyyy/MM/dd HH:mm:ss}",
+        "IsClientLogin": "N"
+      },
+      "success": { "json_path": "responseCode", "equals": 100 }
+    },
+    "dlr": { "mode": "none", "details": "Unknown. No public documentation. Swift's marketing mentions delivery monitoring in its web portal only." },
+    "balance": null,
+    "credentials_needed": [
+      { "key": "username", "label": "Username", "secret": false },
+      { "key": "password", "label": "Password", "secret": true },
+      { "key": "organisation_code", "label": "Organisation Code", "secret": false },
+      { "key": "base_url", "label": "API base URL", "secret": false, "default": "https://smartsms.swifttech.com.np:8083/api/Sms" }
+    ],
+    "notes": "The only source is a third-party client library (rayzenai/laravel-sms v7.0.0, src/Providers/SwiftSmsProvider.php). Swift publishes no API docs and shares them with customers on request. The recipient format is not stated in the library: its validator requires +977XXXXXXXXXX, while its README passes +977 numbers through unchanged. Confirm with Swift whether ReceiverNo expects 10-digit local numbers. No sender parameter (presumably fixed per organisation). Error codes other than responseCode 100 = success are unknown. Swift is a large bank-focused aggregator (an NTC/Ncell partner), so it matters to the market, but the API needs vendor confirmation."
+  },
+  {
+    "id": "bulletsms",
+    "name": "Bullet SMS (Zwicky Technology)",
+    "website": "https://bulletsms.com",
+    "docs_url": "https://bulletsms.com/developers",
+    "confidence": "LIKELY",
+    "send": {
+      "method": "POST",
+      "url": "https://bulletsms.com/api/v1/sms/send",
+      "content_type": "json",
+      "auth": { "style": "bearer", "fields": ["token"] },
+      "headers": { "Authorization": "Bearer {token}", "Idempotency-Key": "{message_uuid}" },
+      "params": {
+        "to": "[{to}]",
+        "message": "{text}",
+        "senderId": "{sender}"
+      },
+      "to_format": "local10",
+      "multi_recipient": { "supported": true, "separator": null, "as_array": true },
+      "success": { "http_status": [200, 201], "json_path": null },
+      "message_id_path": null,
+      "error_message_path": null
+    },
+    "dlr": {
+      "mode": "callback",
+      "details": "The marketing/developer page claims HMAC-signed delivery webhooks and GET /api/v1/sms/reports (filter by date and operator). Payload, signature header and status values are not public. Statuses mentioned: queued, sent, delivered, failed."
+    },
+    "balance": null,
+    "credentials_needed": [
+      { "key": "token", "label": "API Token", "secret": true },
+      { "key": "sender", "label": "Sender ID", "secret": false }
+    ],
+    "notes": "Only the curl sample on the developer landing page is public. Response body, error codes and message-id location are unknown. Tokens can be scoped by domain, IP and sender ID. Also has POST /api/v1/sms/send-dynamic, POST /api/v1/campaigns and DELETE /api/v1/campaigns/:id. A new and small provider."
+  },
+  {
+    "id": "bitmoro",
+    "name": "Bitmoro",
+    "website": "https://bitmoro.com",
+    "docs_url": "https://www.npmjs.com/package/bitmoro",
+    "confidence": "LIKELY",
+    "send": {
+      "method": "POST",
+      "url": "https://api.bitmoro.com/message/api/bulk",
+      "content_type": "json",
+      "auth": { "style": "bearer", "fields": ["token"] },
+      "headers": { "Authorization": "Bearer {token}" },
+      "params": {
+        "number": "[{to}]",
+        "message": "{text}",
+        "senderId": "{sender}",
+        "callbackUrl": "{dlr_callback_url}"
+      },
+      "to_format": "local10",
+      "multi_recipient": { "supported": true, "separator": null, "as_array": true },
+      "success": { "http_status": [200, 201], "json_path": "status", "regex": "^(QUEUED|SCHEDULED)$" },
+      "message_id_path": "messageId",
+      "error_message_path": null
+    },
+    "dlr": {
+      "mode": "callback",
+      "details": "A per-request `callbackUrl` gets a POST with a 'detailed response of message'. The payload is undocumented. The single/OTP endpoint (POST https://api.bitmoro.com/message/api/single-message, body {number (string), message, senderId?, callbackUrl?}) returns {status:\"DISPATCHED\"|\"FAILED\",messageId,statusUrl} where statusUrl = https://api.bitmoro.com/messages/{messageId} can be polled with the token. Library status enum: pending, sent, failed, cancel, spam, queue."
+    },
+    "balance": null,
+    "credentials_needed": [
+      { "key": "token", "label": "API Token", "secret": true },
+      { "key": "sender", "label": "Sender ID (registered in Bitmoro, optional)", "secret": false }
+    ],
+    "notes": "The source is the official-looking npm package `bitmoro` v1.1.2 (build/index.js and README), last published 2025-03. Optional scheduledDate is a UNIX ms timestamp. The response report[] has {to,messageId,text,from,type (1=ASCII,2=Unicode),credit} plus creditSpent and senderId. WARNING: on 2026-10-18 a POST to https://api.bitmoro.com/message/api/bulk returned HTTP 404 (Next.js HTML page), so the API may have moved. Re-verify with the vendor before enabling."
+  }
+]
