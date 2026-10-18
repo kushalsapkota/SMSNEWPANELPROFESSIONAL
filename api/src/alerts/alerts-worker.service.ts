@@ -4,7 +4,7 @@ import { APP_CONFIG } from '../config/config.module';
 import type { AppConfig } from '../config/config';
 import { DbService } from '../db/db.service';
 import { EngineClient } from '../engine/engine-client.service';
-import type { EngineConnectionStatus } from '../engine/engine.types';
+import { EngineConnectionStatus, isConnectionUp } from '../engine/engine.types';
 import { microsToDecimal } from '../messaging/money';
 import { RedisService } from '../redis/redis.module';
 import { AlertSender } from './alert-sender.service';
@@ -149,7 +149,7 @@ export class AlertsWorker implements OnModuleInit, OnModuleDestroy {
       this.logger.warn(`route-down check skipped, engine unreachable: ${(e as Error).message}`);
       return [];
     }
-    const bound = new Set(status.filter((c) => c.state === 'BOUND').map((c) => c.connection_id));
+    const bound = new Set(status.filter(isConnectionUp).map((c) => c.connection_id));
     const routes = await this.db.privileged
       .selectFrom('routes as r')
       .leftJoin('route_connections as rc', (j) => j.onRef('rc.route_id', '=', 'r.id').on('rc.enabled', '=', true))

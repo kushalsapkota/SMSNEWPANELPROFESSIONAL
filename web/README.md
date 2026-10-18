@@ -166,6 +166,29 @@ Charts follow one system: categorical slots 1-3 (validated for CVD in light and 
 colors for outcomes (always with a text label), one y-axis per chart, 2px lines, bars ≤24px with
 4px rounded ends, hairline solid grid, legend for ≥2 series, and a table view on every chart.
 
+### HTTP API connections
+
+Contract: `docs/providers/HTTP-CONNECTIONS-CONTRACT.md` (api details in `CONTRACTS-CHANGES.md`,
+"http connections (api/web)"). Every form is driven by the engine catalogue
+(`GET /api/connections/adapters`, `useAdapters()`); nothing about a provider is hard-coded.
+
+```
+lib/http-adapters.ts                    grouping, initial values, catalogue validation, request building
+                                        (create / PATCH merge), callback URL, NODLR label
+lib/carrier-status.ts                   READY / ERROR badges + describeHttpError (plain words)
+components/connections/http/
+  http-connection-fields.tsx            AdapterSelect (by country, "Best effort" for LIKELY), AdapterInfo,
+                                        HttpConnectionFields (credentials as password inputs, write-only on
+                                        edit; settings by type; generic_http template example)
+  http-connection-dialog.tsx            HttpConnectionForm (create/edit), EditHttpConnectionDialog, useAdapters
+  http-tools.tsx                        TestSendDialog, ProviderBalance (refresh), DlrCallbackUrl (copy)
+```
+
+Used by `/routes/new` (row type "HTTP API"), the route Carrier status card (HTTP rows), `/connections`
+(type column, SMPP / HTTP API create tabs) and `/connections/[id]`. Messages with `dlr_stat = NODLR`
+read "Sent (provider gives no delivery report)". Tests: `lib/__tests__/http-adapters.test.ts`,
+`__tests__/http-connections.smoke.test.tsx`.
+
 Build-time env (optional): `NEXT_PUBLIC_API_BASE_URL` (base URL shown in API docs, default this
 panel's origin, which proxies `/v1`), `NEXT_PUBLIC_SMPP_HOST` / `NEXT_PUBLIC_SMPP_PORT` (default the
 panel's hostname and 2775).

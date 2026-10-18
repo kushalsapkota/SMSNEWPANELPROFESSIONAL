@@ -2,7 +2,8 @@ import { Global, Injectable, Module } from '@nestjs/common';
 import { currentMeta, currentStore } from '../common/context';
 import { DbService } from '../db/db.service';
 
-const SENSITIVE_KEY = /(password|secret|_enc$|key_hash|token_hash|totp|recovery)/i;
+/** Keys dropped from audit rows. dlr_token / dlr_callback_* carry the provider callback secret (HTTP connections). */
+const SENSITIVE_KEY = /(password|secret|_enc$|key_hash|token_hash|totp|recovery|^dlr_token$|^dlr_callback_(url|path)$|^credentials$)/i;
 
 /** Deep-copies a record dropping credentials so audit before/after never stores secrets. */
 export function sanitizeForAudit(value: unknown): unknown {

@@ -1,5 +1,5 @@
 /**
- * Hand-written Kysely table types. MUST mirror db/migrations/ (001-006) exactly
+ * Hand-written Kysely table types. MUST mirror db/migrations/ (001-007) exactly
  * (column names, nullability, defaults). Update this file whenever a migration
  * changes a table.
  *
@@ -22,6 +22,8 @@ export type Int8 = ColumnType<number, number | bigint | string, number | bigint 
 export type GeneratedInt8 = ColumnType<number, never, never>; // GENERATED ALWAYS AS IDENTITY
 export type Timestamp = ColumnType<Date, Date | string, Date | string>;
 export type DefaultTimestamp = ColumnType<Date, Date | string | undefined, Date | string>;
+export const CONNECTION_KINDS = ['SMPP', 'HTTP'] as const;
+export type ConnectionKind = (typeof CONNECTION_KINDS)[number];
 export type Json = ColumnType<unknown, string | Record<string, unknown> | unknown[], string | Record<string, unknown> | unknown[]>;
 export type DefaultJson = ColumnType<
   unknown,
@@ -172,11 +174,13 @@ export interface BalanceTransactionsTable {
 export interface UpstreamConnectionsTable {
   id: Generated<string>;
   name: string;
-  host: string;
-  port: number;
+  /** 007: 'SMPP' (host/port/system_id/password_enc set) or 'HTTP' (adapter + http_credentials_enc set). */
+  kind: ColumnType<ConnectionKind, ConnectionKind | undefined, ConnectionKind>;
+  host: string | null;
+  port: number | null;
   use_tls: ColumnType<boolean, boolean | undefined, boolean>;
-  system_id: string;
-  password_enc: string;
+  system_id: string | null;
+  password_enc: string | null;
   system_type: ColumnType<string, string | undefined, string>;
   bind_type: ColumnType<BindType, BindType | undefined, BindType>;
   sessions: ColumnType<number, number | undefined, number>;
@@ -193,6 +197,14 @@ export interface UpstreamConnectionsTable {
   notes: string | null;
   created_at: DefaultTimestamp;
   updated_at: DefaultTimestamp;
+  /** 007: adapter id (HTTP only), e.g. 'aakash_v3'. */
+  adapter: string | null;
+  /** 007: 'v1:' AES-GCM of a JSON object {credential key: value} (HTTP only). Never returned. */
+  http_credentials_enc: string | null;
+  /** 007: non-secret adapter settings. */
+  http_settings: DefaultJson;
+  /** 007: random url-safe secret in the provider DLR callback URL. Never audited. */
+  dlr_token: string | null;
 }
 
 export interface UpstreamRatesTable {

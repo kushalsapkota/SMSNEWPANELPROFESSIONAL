@@ -2,7 +2,8 @@ import { Injectable } from '@nestjs/common';
 import { AuditService } from '../audit/audit.service';
 import { AppError } from '../common/errors';
 import { CryptoService } from '../crypto/crypto.service';
-import { connectionDto } from '../connections/connections.service';
+import { ConnectionsService, HTTP_DEFAULT_MAX_TPS, PreparedHttp } from '../connections/connections.service';
+import { generateDlrToken } from '../connections/http-adapters';
 import { DbService } from '../db/db.service';
 import type { BindType, MultipartMode, TemplateFallback, UpstreamConnection } from '../db/types';
 import { EngineClient } from '../engine/engine-client.service';
@@ -36,7 +37,20 @@ export interface QuickSmppConnection {
   cost_micros?: number;
 }
 
-export type QuickConnectionInput = QuickExistingConnection | QuickSmppConnection;
+/** New HTTP API connection (adapter + credentials), validated against the engine catalogue. */
+export interface QuickHttpConnection {
+  type: 'HTTP';
+  name?: string;
+  adapter: string;
+  credentials: Record<string, unknown>;
+  settings?: Record<string, unknown>;
+  max_tps?: number;
+  priority?: number;
+  weight: number;
+  cost_micros?: number;
+}
+
+export type QuickConnectionInput = QuickExistingConnection | QuickSmppConnection | QuickHttpConnection;
 
 export interface QuickRouteInput {
   name: string;
@@ -51,9 +65,11 @@ export interface QuickRouteInput {
 }
 
 /** Live state of one route connection (GET /api/routes/:id/status). UNKNOWN = engine unreachable or not loaded yet. */
-export type RouteConnectionState = 'BOUND' | 'CONNECTING' | 'DOWN' | 'DISABLED' | 'UNKNOWN';
+export type RouteConnectionState = 'BOUND' | 'CONNECTING' | 'DOWN' | 'DISABLED' | 'READY' | 'ERROR' | 'UNKNOWN';
 
 const isExisting = (c: QuickConnectionInput): c is QuickExistingConnection => 'existing_connection_id' in c;
+const isSmpp = (c: QuickConnectionInput): c is QuickSmppConnection => !isExisting(c) && c.type === 'SMPP';
+const isHttp = (c: QuickConnectionInput): c is QuickHttpConnection => !isExisting(c) && c.type === 'HTTP';
 
 interface PgUniqueError {
   code: string;
@@ -75,10 +91,27 @@ export class QuickRouteService {
     private readonly audit: AuditService,
     private readonly invalidation: InvalidationService,
     private readonly engine: EngineClient,
+    private readonly connections: ConnectionsService,
   ) {}
 
   async create(input: QuickRouteInput) {
     validateQuick(input);
+    // Validate every HTTP row against the engine catalogue before writing anything; issues of
+    // all rows are reported together (paths like connections.2.credentials.token).
+    const prepared = new Map<number, PreparedHttp>();
+    const issues: unknown[] = [];
+    for (const [i, c] of input.connections.entries()) {
+      if (!isHttp(c)) continue;
+      try {
+        const p = await this.connections.prepareHttp(c, null, `connections.${i}.`);
+        prepared.set(i, { adapter: p.adapter, http_credentials_enc: p.http_credentials_enc, http_settings: p.http_settings });
+      } catch (e) {
+        const det = e instanceof AppError && e.code === 'INVALID_REQUEST' ? (e.details?.issues as unknown[] | undefined) : undefined;
+        if (!det) throw e;
+        issues.push(...det);
+      }
+    }
+    if (issues.length) throw AppError.invalid(issues.length === 1 ? (issues[0] as { message: string }).message : 'Request validation failed', { issues });
     return this.db.tenant(async (trx) => {
       const existingIds = input.connections.filter(isExisting).map((c) => c.existing_connection_id);
       const existing = existingIds.length
@@ -101,31 +134,41 @@ export class QuickRouteService {
           links.push({ conn, created: false, priority: c.priority ?? 1, weight: c.weight ?? 100 });
           continue;
         }
-        const name = c.name ?? `${input.name} SMPP ${n}`;
+        const name = c.name ?? `${input.name} ${c.type} ${n}`;
+        const values = isSmpp(c)
+          ? {
+              kind: 'SMPP' as const,
+              name,
+              host: c.host,
+              port: c.port,
+              use_tls: c.use_tls,
+              system_id: c.system_id,
+              password_enc: this.crypto.encrypt(c.password),
+              ...(c.system_type !== undefined ? { system_type: c.system_type } : {}),
+              bind_type: c.bind_type,
+              sessions: c.sessions,
+              max_tps: c.max_tps,
+              ...(c.window_size !== undefined ? { window_size: c.window_size } : {}),
+              ...(c.enquire_link_interval_s !== undefined ? { enquire_link_interval_s: c.enquire_link_interval_s } : {}),
+              ...(c.multipart_mode !== undefined ? { multipart_mode: c.multipart_mode } : {}),
+              request_dlr: c.request_dlr,
+            }
+          : {
+              kind: 'HTTP' as const,
+              name,
+              ...(prepared.get(i) as PreparedHttp),
+              dlr_token: generateDlrToken(),
+              max_tps: c.max_tps ?? HTTP_DEFAULT_MAX_TPS,
+            };
         const conn = await trx
           .insertInto('upstream_connections')
-          .values({
-            name,
-            host: c.host,
-            port: c.port,
-            use_tls: c.use_tls,
-            system_id: c.system_id,
-            password_enc: this.crypto.encrypt(c.password),
-            ...(c.system_type !== undefined ? { system_type: c.system_type } : {}),
-            bind_type: c.bind_type,
-            sessions: c.sessions,
-            max_tps: c.max_tps,
-            ...(c.window_size !== undefined ? { window_size: c.window_size } : {}),
-            ...(c.enquire_link_interval_s !== undefined ? { enquire_link_interval_s: c.enquire_link_interval_s } : {}),
-            ...(c.multipart_mode !== undefined ? { multipart_mode: c.multipart_mode } : {}),
-            request_dlr: c.request_dlr,
-          })
+          .values(values)
           .returningAll()
           .executeTakeFirstOrThrow()
           .catch((e: unknown) => {
             throw mapConnectionConflict(e, i, name, c);
           });
-        await this.audit.record({ action: 'connection.create', entityType: 'upstream_connection', entityId: conn.id, after: connectionDto(conn) });
+        await this.audit.record({ action: 'connection.create', entityType: 'upstream_connection', entityId: conn.id, after: this.connections.dto(conn) });
         await this.invalidation.invalidate('upstream_connections', conn.id);
         if (c.cost_micros !== undefined) {
           await trx.insertInto('upstream_rates').values({ connection_id: conn.id, prefix: '', cost_micros: c.cost_micros }).execute();
@@ -190,7 +233,7 @@ export class QuickRouteService {
           weight: l.weight,
           enabled: true,
           created: l.created,
-          connection: connectionDto(l.conn),
+          connection: this.connections.dto(l.conn),
         })),
       };
     });
@@ -208,6 +251,9 @@ export class QuickRouteService {
           'rc.connection_id',
           'c.name as connection_name',
           'c.enabled as connection_enabled',
+          'c.kind',
+          'c.adapter',
+          'c.dlr_token',
           'c.host',
           'c.port',
           'c.use_tls',
@@ -237,7 +283,11 @@ export class QuickRouteService {
       engine_reachable: engineError === null,
       engine_error: engineError,
       checked_at: new Date().toISOString(),
-      connections: rows.conns.map((c) => ({ ...c, ...liveState(live.find((l) => l.connection_id === c.connection_id), c.connection_enabled) })),
+      connections: rows.conns.map(({ dlr_token, ...c }) => ({
+        ...c,
+        ...this.connections.callbackOf(c.kind, dlr_token),
+        ...liveState(live.find((l) => l.connection_id === c.connection_id), c.connection_enabled),
+      })),
     };
   }
 }
@@ -252,6 +302,8 @@ export function liveState(s: EngineConnectionStatus | undefined, enabled: boolea
       sessions_total: 0,
       bound_since: null as string | null,
       last_error: null as string | null,
+      last_error_at: null as string | null,
+      last_success_at: null as string | null,
       tps_limit: null as number | null,
       tps_current: null as number | null,
       inflight: null as number | null,
@@ -269,7 +321,10 @@ export function liveState(s: EngineConnectionStatus | undefined, enabled: boolea
     sessions_bound: bound.length,
     sessions_total: sessions.length,
     bound_since: since,
-    last_error: err,
+    // HTTP connections report last_error at the top level (sessions: []).
+    last_error: s.last_error ?? err,
+    last_error_at: s.last_error_at ?? null,
+    last_success_at: s.last_success_at ?? null,
     tps_limit: s.tps_limit,
     tps_current: s.tps_current,
     inflight: s.inflight,
@@ -292,19 +347,21 @@ function validateQuick(input: QuickRouteInput): void {
   }
   const ids = input.connections.filter(isExisting).map((c) => c.existing_connection_id);
   if (new Set(ids).size !== ids.length) throw AppError.invalid('The same existing connection is listed twice', { field: 'connections' });
-  const names = input.connections.filter((c): c is QuickSmppConnection => !isExisting(c) && c.name !== undefined).map((c) => c.name as string);
+  const names = input.connections
+    .filter((c): c is QuickSmppConnection | QuickHttpConnection => !isExisting(c) && c.name !== undefined)
+    .map((c) => c.name as string);
   if (new Set(names).size !== names.length) throw AppError.invalid('Two new connections have the same name', { field: 'connections' });
   const endpoints = input.connections
-    .filter((c): c is QuickSmppConnection => !isExisting(c))
+    .filter(isSmpp)
     .map((c) => `${c.host.toLowerCase()}|${c.port}|${c.system_id}`);
   if (new Set(endpoints).size !== endpoints.length) {
     throw AppError.invalid('Two new connections use the same host, port and username', { field: 'connections' });
   }
 }
 
-function mapConnectionConflict(e: unknown, index: number, name: string, c: QuickSmppConnection): unknown {
+function mapConnectionConflict(e: unknown, index: number, name: string, c: QuickSmppConnection | QuickHttpConnection): unknown {
   if (!isUniqueViolation(e)) return e;
-  if (e.constraint === 'upstream_connections_name_key') {
+  if (e.constraint === 'upstream_connections_name_key' || c.type === 'HTTP') {
     return AppError.conflict(`A connection named “${name}” already exists`, { field: `connections.${index}.name`, constraint: e.constraint });
   }
   return AppError.conflict(

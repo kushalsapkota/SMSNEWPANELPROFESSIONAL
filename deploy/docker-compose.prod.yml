@@ -159,6 +159,7 @@ services:
       REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379/0
       INTERNAL_TOKEN: ${INTERNAL_TOKEN:?set INTERNAL_TOKEN in deploy/.env}
       APP_ENC_KEY: ${APP_ENC_KEY:?set APP_ENC_KEY in deploy/.env}
+      PUBLIC_API_BASE_URL: ${PUBLIC_API_BASE_URL:-}
       ENGINE_HTTP_ADDR: ":8081"
       ENGINE_SMPP_ADDR: ":2775"
       ENGINE_METRICS_ADDR: ":9100"
@@ -206,6 +207,7 @@ services:
       ENGINE_URL: http://engine:8081
       ENGINE_METRICS_URL: http://engine:9100/metrics
       APP_ENC_KEY: ${APP_ENC_KEY:?set APP_ENC_KEY}
+      PUBLIC_API_BASE_URL: ${PUBLIC_API_BASE_URL:-}
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in deploy/.env}
       TRUST_PROXY: ${TRUST_PROXY:-1}
       TRUSTED_PROXIES: ${TRUSTED_PROXIES:-loopback,linklocal,uniquelocal}

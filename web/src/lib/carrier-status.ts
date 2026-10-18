@@ -14,6 +14,10 @@ export function connectionStateView(state: RouteConnectionState): {
       return { label: "Down", tone: "destructive" };
     case "DISABLED":
       return { label: "Disabled", tone: "muted" };
+    case "READY":
+      return { label: "Ready", tone: "success" };
+    case "ERROR":
+      return { label: "Error", tone: "destructive" };
     default:
       return { label: "Waiting for engine", tone: "muted" };
   }
@@ -36,9 +40,10 @@ const BIND_STATUS: Record<string, string> = {
  * ESME_RINVPASWD" or "dial: dial tcp 10.0.0.5:2775: connect: connection refused") into
  * plain words. Returns null when there is no error.
  */
-export function describeConnectionError(raw: string | null | undefined, endpoint?: { host: string; port: number }): string | null {
+export function describeConnectionError(raw: string | null | undefined, ep?: { host: string | null; port: number | null }): string | null {
   if (!raw) return null;
   const e = raw.toLowerCase();
+  const endpoint = ep && ep.host ? { host: ep.host, port: ep.port ?? 0 } : undefined;
   const where = endpoint ? `${endpoint.host}:${endpoint.port}` : "the host";
 
   const bind = /bind rejected: (\S+)/i.exec(raw);
@@ -68,5 +73,32 @@ export function describeConnectionError(raw: string | null | undefined, endpoint
   }
   if (e.includes("client closed")) return "Connection stopped";
   if (e.includes("enquire_link") || e.includes("keepalive")) return "The carrier stopped answering keep-alives. Reconnecting";
+  return raw;
+}
+
+/**
+ * HTTP API connections: the engine's `last_error` (e.g. "HTTP 401: invalid token",
+ * "Post \"https://…\": context deadline exceeded") in plain words. Returns null without an error.
+ */
+export function describeHttpError(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const e = raw.toLowerCase();
+  const status = /\b(?:http|status)[ :]*([1-5][0-9]{2})\b/i.exec(raw)?.[1];
+  if (e.includes("cannot be decrypted") || e.includes("decrypt")) return "The stored credentials cannot be decrypted. Enter the token again";
+  if (/(ip|address)[^a-z]*(not )?(allowed|whitelist|white-list|restricted)|invalid ip/.test(e)) {
+    return "The provider refused our IP address. Ask the provider to whitelist the gateway's IP";
+  }
+  if (/(insufficient|not enough|no) (balance|credit)|insufficient_balance|insufficient_credits/.test(e)) return "Not enough credit at the provider. Top up the provider account";
+  if (status === "401" || status === "403" || /(invalid|expired|wrong|bad)[^.]{0,20}(token|api key|key|credential)|(token|key|credentials?) is not valid|unauthori[sz]ed|authentication/.test(e)) {
+    return "The provider rejected the token or login. Check the credentials";
+  }
+  if (status === "429" || e.includes("rate limit") || e.includes("too many requests")) return "The provider is rate limiting us. Lower the TPS; it retries automatically";
+  if (e.includes("no such host") || e.includes("server misbehaving")) return "The provider's host name was not found (DNS). Check the API base URL";
+  if (e.includes("connection refused")) return "Cannot reach the provider: connection refused. Check the API base URL";
+  if (e.includes("deadline exceeded") || e.includes("timeout") || e.includes("timed out")) return "The provider did not answer in time. It retries automatically";
+  if (e.includes("x509") || e.includes("certificate") || e.includes("tls")) return "TLS/certificate error talking to the provider. Check the API base URL";
+  if (status && status.startsWith("5")) return `The provider had an internal error (HTTP ${status}). It retries automatically`;
+  if (status === "404") return "The provider says this API address does not exist (HTTP 404). Check the API base URL";
+  if (e.includes("destination") && (e.includes("not supported") || e.includes("country"))) return "This provider does not deliver to that destination country";
   return raw;
 }

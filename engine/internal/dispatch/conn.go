@@ -334,11 +334,19 @@ type SessionStatus struct {
 }
 
 // ConnStatus is one connection in GET /internal/v1/connections/status.
+// HTTP connections have kind "HTTP", their adapter, no sessions and state
+// READY | ERROR | DISABLED with last_error / last_error_at / last_success_at
+// (always null for SMPP connections, whose errors are per session).
 type ConnStatus struct {
 	ConnectionID   string          `json:"connection_id"`
 	Name           string          `json:"name"`
 	Enabled        bool            `json:"enabled"`
-	State          string          `json:"state"` // BOUND | CONNECTING | DOWN | DISABLED
+	Kind           string          `json:"kind"`    // SMPP | HTTP
+	Adapter        *string         `json:"adapter"` // HTTP only
+	State          string          `json:"state"`   // BOUND | CONNECTING | DOWN | DISABLED (SMPP); READY | ERROR | DISABLED (HTTP)
+	LastError      *string         `json:"last_error"`
+	LastErrorAt    *time.Time      `json:"last_error_at"`
+	LastSuccessAt  *time.Time      `json:"last_success_at"`
 	Sessions       []SessionStatus `json:"sessions"`
 	TPSLimit       int             `json:"tps_limit"`
 	TPSCurrent     float64         `json:"tps_current"`
@@ -350,7 +358,7 @@ type ConnStatus struct {
 
 func (u *upConn) status(name string, enabled bool, maxTPS int, backlog int64) ConnStatus {
 	st := ConnStatus{
-		ConnectionID: u.id, Name: name, Enabled: enabled, Sessions: []SessionStatus{},
+		ConnectionID: u.id, Name: name, Enabled: enabled, Kind: store.KindSMPP, Sessions: []SessionStatus{},
 		TPSLimit: maxTPS, TPSCurrent: u.meter.Rate(), InFlight: u.inFlight(),
 		QueueDepth: u.waiting.Load() + backlog, SubmittedTotal: u.submitted.Load(), FailedTotal: u.failed.Load(),
 	}

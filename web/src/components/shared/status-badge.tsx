@@ -34,6 +34,8 @@ const MAP: Record<string, Variant> = {
   CONNECTING: "warning",
   DOWN: "destructive",
   DISABLED: "muted",
+  READY: "success",
+  ERROR: "destructive",
   // template actions
   TEMPLATED: "success",
   SEND_RAW: "secondary",

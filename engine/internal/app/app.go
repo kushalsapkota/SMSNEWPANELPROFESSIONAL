@@ -56,7 +56,12 @@ type Overrides struct {
 	// negative disables (tests sharing a Redis DB with other engines).
 	DispatchScanInterval time.Duration
 	SessionSweep         time.Duration // default 5s
-	UpstreamTLS          func(*store.Connection) *tls.Config
+	// HTTP connection DLR polling: how often due pollers are checked
+	// (default 5s) and an interval overriding every connection's
+	// dlr_poll_interval_s (0 = use the setting).
+	HTTPDLRPollTick     time.Duration
+	HTTPDLRPollInterval time.Duration
+	UpstreamTLS         func(*store.Connection) *tls.Config
 }
 
 // App is a running engine.
@@ -196,6 +201,7 @@ func New(ctx context.Context, cfg *config.Config, log *slog.Logger, ov Overrides
 		InstanceID: cfg.InstanceID, Batch: cfg.DispatchBatch, Block: cfg.DispatchBlock, MaxFailover: maxFailover,
 		ClaimIdle: cfg.DispatchClaimIdle, MsgStateTTL: cfg.MsgStateTTL, MaxQueueAge: ov.DispatchMaxQueueAge, ScanInterval: ov.DispatchScanInterval,
 		DrainTimeout: cfg.ShutdownTimeout / 2, OnDeliver: a.DLR.HandleDeliver, TLSConfig: ov.UpstreamTLS,
+		Receipts: a.DLR, PublicBaseURL: cfg.PublicAPIBaseURL, PollTick: ov.HTTPDLRPollTick, PollInterval: ov.HTTPDLRPollInterval,
 		Refunder: a.Refunder, Logger: log, Metrics: a.Metrics,
 	})
 	a.Forwarder = dlr.NewForwarder(a.rdb, a.Store, a.SMPP, a.Webhooks, dlr.ForwarderOptions{
@@ -205,7 +211,7 @@ func New(ctx context.Context, cfg *config.Config, log *slog.Logger, ov Overrides
 	a.registerGauges()
 
 	api := internalapi.New(internalapi.Deps{
-		Token: cfg.InternalToken, Pipeline: a.Pipeline, Connections: a.Dispatch, SMPP: a.SMPP, Balances: a.Biller,
+		Token: cfg.InternalToken, Pipeline: a.Pipeline, Connections: a.Dispatch, HTTPConns: a.Dispatch, SMPP: a.SMPP, Balances: a.Biller,
 		Store: a.Store, DB: a.pool, Redis: a.rdb, Rates: rates{a.Metrics}, MaxBody: cfg.HTTPMaxBodyBytes, Logger: log,
 	})
 	a.httpSrv = &http.Server{Handler: api, ReadTimeout: cfg.HTTPReadTimeout, ReadHeaderTimeout: 5 * time.Second,
@@ -250,11 +256,11 @@ func (a *App) registerGauges() {
 	reg.GaugeFunc("smsgw_smpp_client_sessions", "Bound client SMPP sessions.", nil, func() []metrics.Sample {
 		return []metrics.Sample{{Value: float64(len(a.SMPP.Sessions()))}}
 	})
-	reg.GaugeFunc("smsgw_upstream_connection_up", "1 if the upstream connection has a bound session.", []string{"connection", "name"}, func() []metrics.Sample {
+	reg.GaugeFunc("smsgw_upstream_connection_up", "1 if the upstream connection has a bound session (SMPP) or is READY (HTTP).", []string{"connection", "name"}, func() []metrics.Sample {
 		var out []metrics.Sample
 		for _, s := range a.Dispatch.Status() {
 			v := 0.0
-			if s.State == "BOUND" {
+			if s.State == "BOUND" || s.State == "READY" {
 				v = 1
 			}
 			out = append(out, metrics.Sample{LabelValues: []string{s.ConnectionID, s.Name}, Value: v})

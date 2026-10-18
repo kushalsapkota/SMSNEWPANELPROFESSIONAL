@@ -8,6 +8,7 @@ import { OrgFilter, orgFilterConds, resolveOrgFilter } from '../messaging/org-fi
 import { ScopeService } from '../tenancy/scope.service';
 import { EngineMetricsService } from './engine-metrics.service';
 import { EngineClient } from '../engine/engine-client.service';
+import { isConnectionUp } from '../engine/engine.types';
 
 export interface StatsQuery {
   org_id?: string;
@@ -247,7 +248,7 @@ export class AnalyticsService {
       tps_out: round(conns.reduce((a, c) => a + (Number(c.tps_current) || 0), 0)),
       queue_depth: conns.reduce((a, c) => a + (Number(c.queue_depth) || 0), 0),
       inflight: conns.reduce((a, c) => a + (Number(c.inflight) || 0), 0),
-      connections_up: conns.filter((c) => c.state === 'BOUND').length,
+      connections_up: conns.filter(isConnectionUp).length,
       connections_total: conns.length,
       connections_enabled: conns.filter((c) => c.enabled).length,
     };

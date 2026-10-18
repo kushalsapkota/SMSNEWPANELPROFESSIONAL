@@ -11,6 +11,7 @@ import { DateRangePicker, useDateRangeParam } from "@/components/analytics/date-
 import { Money } from "@/components/shared/money";
 import { PageHeader } from "@/components/shared/page-header";
 import { StatusBadge } from "@/components/shared/status-badge";
+import { messageStatusLabel } from "@/lib/http-adapters";
 import { useChildOrgOptions } from "@/hooks/use-child-orgs";
 import { useCurrency } from "@/hooks/use-currency";
 import { useRouteOptions } from "@/hooks/use-route-options";
@@ -118,7 +119,7 @@ export function MessagesPage() {
       header: "Status",
       cell: (m) => (
         <div className="flex flex-col items-start gap-0.5">
-          <StatusBadge status={m.status} />
+          <StatusBadge status={m.status} label={messageStatusLabel(m)} />
           {m.error_code ? <span className="font-mono text-[10px] text-muted-foreground">{m.error_code}</span> : null}
         </div>
       ),

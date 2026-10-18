@@ -66,7 +66,15 @@ export interface EngineConnectionStatus {
   connection_id: string;
   name: string;
   enabled: boolean;
-  state: 'BOUND' | 'CONNECTING' | 'DOWN' | 'DISABLED';
+  /** HTTP connections (007): READY | ERROR | DISABLED. */
+  state: 'BOUND' | 'CONNECTING' | 'DOWN' | 'DISABLED' | 'READY' | 'ERROR';
+  /** Absent on engines that predate HTTP connections (= SMPP). */
+  kind?: 'SMPP' | 'HTTP';
+  adapter?: string | null;
+  /** HTTP connections: last failed call. */
+  last_error?: string | null;
+  last_error_at?: string | null;
+  last_success_at?: string | null;
   sessions: { index: number; state: string; bound_since: string | null; last_error: string | null }[];
   tps_limit: number;
   tps_current: number;
@@ -102,4 +110,82 @@ export interface EngineHealthResponse {
   ok: boolean;
   db: boolean;
   redis: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// HTTP upstream connections (docs/providers/HTTP-CONNECTIONS-CONTRACT.md)
+// ---------------------------------------------------------------------------
+
+export type AdapterSettingType = 'url' | 'string' | 'number' | 'bool' | 'select' | (string & {});
+
+export interface AdapterCredentialField {
+  key: string;
+  label: string;
+  secret: boolean;
+  required: boolean;
+  placeholder?: string | null;
+  help?: string | null;
+}
+
+export interface AdapterSelectOption {
+  value: string;
+  label?: string;
+}
+
+export interface AdapterSettingField {
+  key: string;
+  label: string;
+  type: AdapterSettingType;
+  default?: unknown;
+  /** For `select`: plain values or {value, label}. */
+  options?: (string | AdapterSelectOption)[] | null;
+  required: boolean;
+  help?: string | null;
+  placeholder?: string | null;
+}
+
+export interface EngineAdapter {
+  id: string;
+  name: string;
+  country: string | null;
+  website?: string | null;
+  docs_url?: string | null;
+  confidence: 'VERIFIED' | 'LIKELY' | (string & {});
+  credentials: AdapterCredentialField[];
+  settings: AdapterSettingField[];
+  dlr_mode: 'none' | 'poll' | 'callback';
+  supports_balance: boolean;
+  /** null = any destination. */
+  destination_countries: string[] | null;
+  notes?: string | null;
+}
+
+export interface EngineTestSendResponse {
+  ok: boolean;
+  provider_message_id: string | null;
+  http_status: number | null;
+  request: { method: string; url: string; body: unknown } | null;
+  response_body: string | null;
+  error: string | null;
+  duration_ms: number | null;
+}
+
+export interface EngineProviderBalanceResponse {
+  supported: boolean;
+  balance: string | null;
+  raw: string | null;
+  error: string | null;
+}
+
+/** Verbatim provider callback, forwarded to POST /internal/v1/provider-dlr/:dlr_token. */
+export interface EngineProviderDlrEnvelope {
+  method: string;
+  query: Record<string, string | string[]>;
+  headers: Record<string, string>;
+  body_base64: string;
+}
+
+/** A connection that can carry traffic: SMPP BOUND, or HTTP READY (last call ok / no calls yet). */
+export function isConnectionUp(s: Pick<EngineConnectionStatus, 'state'>): boolean {
+  return s.state === 'BOUND' || s.state === 'READY';
 }

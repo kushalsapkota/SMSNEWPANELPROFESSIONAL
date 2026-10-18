@@ -168,6 +168,18 @@ See `CONTRACTS-CHANGES.md` (api section) for the deviations and additions, all b
 - admin global blocklist;
 - other details.
 
+## HTTP upstream connections
+
+Contract: `docs/providers/HTTP-CONNECTIONS-CONTRACT.md`; api details in `CONTRACTS-CHANGES.md`
+("http connections (api/web)"). `connections/http-adapters.ts` holds the engine catalogue cache
+(`AdapterCatalogue`, 60s) and the pure credential/setting validation (`mergeCredentials`,
+`mergeSettings`). Credentials are one `v1:` AES-GCM JSON object in `http_credentials_enc`, never
+returned (`credentials_set` lists key names). `ConnectionsService.dto()` is the only response shape.
+The public provider DLR callback (`connections/provider-dlr.*`) reads the raw body through a
+middleware registered in `configureApp` before the json parser (64KB cap) and forwards it verbatim
+to the engine. Tests: `test/http-connections.e2e-spec.ts` against the fake catalogue in
+`test/fake-adapters.ts`.
+
 ## Security notes
 
 - Connection passwords, webhook secrets and TOTP secrets are stored only as `v1:` AES-GCM

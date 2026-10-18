@@ -51,11 +51,11 @@ describe("quickRouteSchema", () => {
     ]);
     expect(paths(values({ connections: [smpp({ password: "" })] }))).toEqual(["connections.0.password: Required"]);
   });
-  it("existing rows need a connection and no duplicates; HTTP is not allowed yet", () => {
+  it("existing rows need a connection and no duplicates; HTTP rows need a provider", () => {
     const ex = (id: string) => ({ ...newConnectionRow("EXISTING"), existing_connection_id: id });
     expect(paths(values({ connections: [ex("")] }))).toEqual(["connections.0.existing_connection_id: Pick a connection"]);
     expect(paths(values({ connections: [ex("a"), ex("a")] }))).toEqual(["connections.1.existing_connection_id: Already added above"]);
-    expect(paths(values({ connections: [newConnectionRow("HTTP")] }))).toEqual(["connections.0.kind: HTTP API connections are coming soon"]);
+    expect(paths(values({ connections: [newConnectionRow("HTTP")] }))).toEqual(["connections.0.http.adapter: Pick a provider"]);
     expect(paths(values({ connections: [] }))).toEqual(["connections: Add at least one connection"]);
     expect(paths(values({ connections: [smpp(), smpp()] }))).toEqual(["connections.1.host: Same host, port and username as another row"]);
   });

@@ -345,6 +345,8 @@ func setup() (int, error) {
 		InvalidateChannel: pfx + "cfg:invalidate", DLROutStream: pfx + "q:dlr-out", WebhookKeyPrefix: pfx + "wh:",
 		BalanceDirtyKey: pfx + "bal:dirty", WebhookBaseBackoff: 200 * time.Millisecond, WebhookPollInterval: 20 * time.Millisecond,
 		DLRRetryIdle: 2 * time.Second, SessionSweep: 200 * time.Millisecond,
+		// HTTP connections: poll DLRs every 500ms (http_adapter_test.go).
+		HTTPDLRPollTick: 100 * time.Millisecond, HTTPDLRPollInterval: 500 * time.Millisecond,
 		// Redis db 2 is shared with the dispatch unit tests: never adopt their streams.
 		DispatchScanInterval: -1,
 	})

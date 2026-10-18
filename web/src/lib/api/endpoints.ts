@@ -77,7 +77,12 @@ export const orgs = {
 export const connections = {
   list: (params: T.ConnectionListParams = {}) =>
     http.get<T.Paginated<T.Connection>>("/api/connections", { query: params }),
-  create: (body: T.CreateConnectionRequest) => http.post<T.Connection>("/api/connections", body),
+  create: (body: T.CreateConnectionRequest | T.CreateHttpConnectionRequest) => http.post<T.Connection>("/api/connections", body),
+  /** HTTP adapter catalogue (engine, cached 60s by the api). */
+  adapters: () => http.get<T.AdaptersResponse>("/api/connections/adapters"),
+  /** Sends ONE real SMS through the connection (outside billing). */
+  test: (id: T.Uuid, body: T.ConnectionTestRequest) => http.post<T.ConnectionTestResponse>(`/api/connections/${e(id)}/test`, body),
+  balance: (id: T.Uuid) => http.get<T.ProviderBalanceResponse>(`/api/connections/${e(id)}/balance`),
   get: (id: T.Uuid) => http.get<T.ConnectionDetail>(`/api/connections/${e(id)}`),
   update: (id: T.Uuid, body: T.UpdateConnectionRequest) =>
     http.patch<T.Connection>(`/api/connections/${e(id)}`, body),

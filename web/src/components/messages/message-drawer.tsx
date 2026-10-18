@@ -11,6 +11,7 @@ import { CopyButton } from "@/components/shared/copy-button";
 import { Money } from "@/components/shared/money";
 import { ErrorState, LoadingState } from "@/components/shared/states";
 import { StatusBadge } from "@/components/shared/status-badge";
+import { NO_DLR_LABEL, NO_DLR_STAT, messageStatusLabel } from "@/lib/http-adapters";
 import { api, qk } from "@/lib/api";
 import type { MessageLog, MsgStatus, OrgRole } from "@/lib/api/types";
 import { formatDateTime } from "@/lib/format";
@@ -50,6 +51,7 @@ export function messageTimeline(
   const accepted = timings?.accepted_at ?? m.created_at;
   const failedBeforeSubmit = !m.submitted_at && (m.status === "FAILED" || m.status === "REJECTED");
   const dlrFailed = m.status === "UNDELIVERED" || m.status === "EXPIRED" || m.status === "REJECTED" || (m.status === "FAILED" && !!m.submitted_at);
+  const noDlr = m.dlr_stat === NO_DLR_STAT;
   return [
     { label: "Accepted", at: accepted, state: "done" },
     {
@@ -62,9 +64,11 @@ export function messageTimeline(
     {
       label: "Delivery report",
       at: m.dlr_received_at,
-      state: m.dlr_received_at ? (dlrFailed ? "failed" : "done") : failedBeforeSubmit ? "skipped" : "pending",
+      state: noDlr ? "skipped" : m.dlr_received_at ? (dlrFailed ? "failed" : "done") : failedBeforeSubmit ? "skipped" : "pending",
       latency: timings?.dlr_latency_ms ?? latencyMs(m.submitted_at, m.dlr_received_at),
-      detail: m.dlr_stat ? (
+      detail: noDlr ? (
+        <span>{NO_DLR_LABEL}</span>
+      ) : m.dlr_stat ? (
         <span className="font-mono">
           stat:{m.dlr_stat}
           {m.dlr_err ? ` err:${m.dlr_err}` : ""}
@@ -184,7 +188,7 @@ export function MessageDrawer({
       <SheetContent className="w-full overflow-y-auto sm:max-w-xl">
         <SheetHeader>
           <SheetTitle className="flex flex-wrap items-center gap-2">
-            Message {m ? <StatusBadge status={m.status} /> : null}
+            Message {m ? <StatusBadge status={m.status} label={messageStatusLabel(m)} /> : null}
           </SheetTitle>
           <SheetDescription className="flex items-center gap-1 font-mono text-xs">
             {id}
@@ -263,8 +267,8 @@ export function MessageDrawer({
             <section className="space-y-3">
               <h3 className="text-sm font-semibold">Delivery</h3>
               <dl className="grid grid-cols-3 gap-3">
-                <Field label="DLR stat" mono>
-                  {m.dlr_stat}
+                <Field label="DLR stat" mono={m.dlr_stat !== NO_DLR_STAT}>
+                  {m.dlr_stat === NO_DLR_STAT ? NO_DLR_LABEL : m.dlr_stat}
                 </Field>
                 <Field label="DLR err" mono>
                   {m.dlr_err}

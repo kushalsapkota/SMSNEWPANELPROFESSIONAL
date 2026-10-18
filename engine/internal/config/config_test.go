@@ -94,3 +94,20 @@ func TestMissingKey(t *testing.T) {
 		t.Fatalf("%v", err)
 	}
 }
+
+func TestPublicAPIBaseURL(t *testing.T) {
+	m := base()
+	c, err := LoadFrom(env(m))
+	if err != nil || c.PublicAPIBaseURL != "" {
+		t.Fatalf("default: %v %q", err, c.PublicAPIBaseURL)
+	}
+	m["PUBLIC_API_BASE_URL"] = "https://sms.example.com/"
+	if c, err = LoadFrom(env(m)); err != nil || c.PublicAPIBaseURL != "https://sms.example.com" {
+		t.Fatalf("%v %q", err, c.PublicAPIBaseURL)
+	}
+	m["PUBLIC_API_BASE_URL"] = "sms.example.com"
+	var ve *ValidationError
+	if _, err = LoadFrom(env(m)); !errors.As(err, &ve) || !ve.Has("PUBLIC_API_BASE_URL") {
+		t.Fatalf("expected validation error, got %v", err)
+	}
+}

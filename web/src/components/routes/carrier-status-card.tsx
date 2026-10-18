@@ -2,7 +2,7 @@
 
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useQuery } from "@tanstack/react-query";
-import { AlertTriangle, ExternalLink, Pencil } from "lucide-react";
+import { AlertTriangle, ExternalLink, Pencil, Send } from "lucide-react";
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
@@ -16,7 +16,11 @@ import { EmptyState, ErrorState } from "@/components/shared/states";
 import { useApiMutation } from "@/hooks/use-api-mutation";
 import { api, qk } from "@/lib/api";
 import type { RouteConnectionStatus } from "@/lib/api/types";
-import { connectionStateView, describeConnectionError } from "@/lib/carrier-status";
+import type { Adapter } from "@/lib/api/types";
+import { connectionStateView, describeConnectionError, describeHttpError } from "@/lib/carrier-status";
+import { AdapterLabel } from "@/components/connections/http/http-connection-fields";
+import { EditHttpConnectionDialog, useAdapters } from "@/components/connections/http/http-connection-dialog";
+import { DlrCallbackUrl, ProviderBalance, TestSendDialog } from "@/components/connections/http/http-tools";
 import { formatDateTime, formatRelative } from "@/lib/format";
 import { connectionEndpointSchema, priorityLabel, toEndpointPatch, type ConnectionEndpointValues } from "@/lib/quick-route";
 import { cn } from "@/lib/utils";
@@ -28,16 +32,84 @@ const DOT: Record<string, string> = {
   muted: "bg-muted-foreground/50",
 };
 
+const endpointOf = (c: RouteConnectionStatus) => ({ host: c.host ?? "", port: c.port ?? 0, system_id: c.system_id ?? "" });
+
+/** One HTTP API connection in the Carrier status card (exported for tests). */
+export function HttpCarrierRow({
+  c,
+  index,
+  adapters,
+  onEdit,
+}: {
+  c: RouteConnectionStatus;
+  index: number;
+  adapters: Adapter[] | undefined;
+  onEdit: () => void;
+}) {
+  const [testing, setTesting] = useState(false);
+  const view = connectionStateView(c.state);
+  const adapter = adapters?.find((a) => a.id === c.adapter);
+  const problem = c.state === "ERROR" ? describeHttpError(c.last_error) : null;
+  return (
+    <li className="flex flex-col gap-2 p-3 sm:flex-row sm:items-start" data-testid="http-carrier-row">
+      <span className={cn("mt-1.5 hidden h-2.5 w-2.5 shrink-0 rounded-full sm:block", DOT[view.tone])} aria-hidden />
+      <div className="min-w-0 flex-1 space-y-1">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="font-medium">{c.connection_name}</span>
+          <span className="text-xs text-muted-foreground">
+            {c.priority} · {priorityLabel(index)}
+            {!c.enabled ? " · off on this route" : ""}
+          </span>
+          <Badge variant={view.tone}>{view.label}</Badge>
+        </div>
+        <div className="text-xs text-muted-foreground">
+          <AdapterLabel adapters={adapters} id={c.adapter} />
+        </div>
+        {problem ? (
+          <div className="text-sm text-destructive">
+            {problem}
+            {c.last_error_at ? <span className="text-muted-foreground"> · {formatRelative(c.last_error_at)}</span> : null}
+            {problem !== c.last_error ? <span className="block font-mono text-xs text-muted-foreground">{c.last_error}</span> : null}
+          </div>
+        ) : c.state === "UNKNOWN" ? (
+          <div className="text-sm text-muted-foreground">Starting. The engine picks up new connections within a few seconds.</div>
+        ) : null}
+        {c.state !== "DISABLED" && c.state !== "UNKNOWN" ? (
+          <div className="text-sm text-muted-foreground" title={c.last_success_at ? formatDateTime(c.last_success_at) : undefined}>
+            {c.last_success_at ? `Last successful send ${formatRelative(c.last_success_at)}` : "No messages sent yet"}
+          </div>
+        ) : null}
+        {adapter?.supports_balance ? <ProviderBalance connectionId={c.connection_id} /> : null}
+        {adapter?.dlr_mode === "callback" ? <DlrCallbackUrl connection={c} /> : null}
+      </div>
+      <div className="flex flex-wrap gap-1">
+        <Button type="button" variant="outline" size="sm" onClick={() => setTesting(true)}>
+          <Send /> Send test SMS
+        </Button>
+        <Button type="button" variant="outline" size="sm" onClick={onEdit}>
+          <Pencil /> Edit
+        </Button>
+        <Button variant="ghost" size="icon" asChild>
+          <Link href={`/connections/${c.connection_id}`} aria-label={`Open connection ${c.connection_name}`}>
+            <ExternalLink />
+          </Link>
+        </Button>
+      </div>
+      <TestSendDialog connectionId={c.connection_id} name={c.connection_name} open={testing} onOpenChange={setTesting} />
+    </li>
+  );
+}
+
 function EditEndpointDialog({ conn, onClose }: { conn: RouteConnectionStatus | null; onClose: () => void }) {
   const form = useForm<ConnectionEndpointValues>({
     resolver: zodResolver(connectionEndpointSchema),
     defaultValues: { host: "", port: 2775, system_id: "", password: "" },
   });
   useEffect(() => {
-    if (conn) form.reset({ host: conn.host, port: conn.port, system_id: conn.system_id, password: "" });
+    if (conn) form.reset({ host: conn.host ?? "", port: conn.port ?? 2775, system_id: conn.system_id ?? "", password: "" });
   }, [conn, form]);
   const save = useApiMutation({
-    mutationFn: (v: ConnectionEndpointValues) => api.connections.update((conn as RouteConnectionStatus).connection_id, toEndpointPatch(v, conn as RouteConnectionStatus)),
+    mutationFn: (v: ConnectionEndpointValues) => api.connections.update((conn as RouteConnectionStatus).connection_id, toEndpointPatch(v, endpointOf(conn as RouteConnectionStatus))),
     success: "Connection saved; it reconnects now",
     invalidate: [qk.routes.all, qk.connections.all],
     onSuccess: onClose,
@@ -52,7 +124,7 @@ function EditEndpointDialog({ conn, onClose }: { conn: RouteConnectionStatus | n
         <Form {...form}>
           <form
             onSubmit={form.handleSubmit((v) => {
-              if (conn && Object.keys(toEndpointPatch(v, conn)).length === 0) return onClose();
+              if (conn && Object.keys(toEndpointPatch(v, endpointOf(conn))).length === 0) return onClose();
               save.mutate(v);
             })}
             className="space-y-4"
@@ -92,7 +164,10 @@ export function CarrierStatusCard({ routeId }: { routeId: string }) {
     refetchIntervalInBackground: false,
   });
   const [editing, setEditing] = useState<RouteConnectionStatus | null>(null);
+  const [editingHttp, setEditingHttp] = useState<string | null>(null);
   const data = q.data;
+  const hasHttp = !!data?.connections.some((c) => c.kind === "HTTP");
+  const adapters = useAdapters(hasHttp);
 
   return (
     <Card>
@@ -116,8 +191,19 @@ export function CarrierStatusCard({ routeId }: { routeId: string }) {
             ) : null}
             <ul className="divide-y rounded-md border">
               {data.connections.map((c, i) => {
+                if (c.kind === "HTTP") {
+                  return (
+                    <HttpCarrierRow
+                      key={c.connection_id}
+                      c={c}
+                      index={i}
+                      adapters={adapters.data?.adapters}
+                      onEdit={() => setEditingHttp(c.connection_id)}
+                    />
+                  );
+                }
                 const view = connectionStateView(c.state);
-                const problem = c.state === "DOWN" || c.state === "CONNECTING" ? describeConnectionError(c.last_error, c) : null;
+                const problem = c.state === "DOWN" || c.state === "CONNECTING" ? describeConnectionError(c.last_error, endpointOf(c)) : null;
                 return (
                   <li key={c.connection_id} className="flex flex-col gap-2 p-3 sm:flex-row sm:items-start">
                     <span className={cn("mt-1.5 hidden h-2.5 w-2.5 shrink-0 rounded-full sm:block", DOT[view.tone])} aria-hidden />
@@ -173,6 +259,7 @@ export function CarrierStatusCard({ routeId }: { routeId: string }) {
         )}
       </CardContent>
       <EditEndpointDialog conn={editing} onClose={() => setEditing(null)} />
+      <EditHttpConnectionDialog connectionId={editingHttp} onClose={() => setEditingHttp(null)} />
     </Card>
   );
 }

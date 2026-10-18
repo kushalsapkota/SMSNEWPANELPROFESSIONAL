@@ -1,5 +1,6 @@
 import { z } from "zod";
-import type { QuickConnectionInput, QuickRouteRequest } from "./api/types";
+import type { Adapter, QuickConnectionInput, QuickRouteRequest } from "./api/types";
+import { buildCredentials, buildSettings, initialHttpValues, validateHttpValues } from "./http-adapters";
 import { isValidSender } from "./phone";
 import { hostSchema } from "./validation";
 
@@ -10,9 +11,18 @@ export type ConnectionKind = "SMPP" | "EXISTING" | "HTTP";
 const optInt = (min: number, max: number) =>
   z.number({ invalid_type_error: "Whole number" }).int("Whole number").min(min, `≥ ${min}`).max(max, `≤ ${max}`).nullable();
 
-export const connectionRowSchema = z
+const httpBlockSchema = z.object({
+  adapter: z.string(),
+  credentials: z.record(z.string()),
+  settings: z.record(z.union([z.string(), z.boolean()])),
+});
+
+/** Row schema; HTTP rows are validated against the adapter catalogue (`adapters`). */
+export const makeConnectionRowSchema = (adapters: Adapter[]) => z
   .object({
     kind: z.enum(["SMPP", "EXISTING", "HTTP"]),
+    /** HTTP API row: provider adapter + credentials/settings rendered from the catalogue. */
+    http: httpBlockSchema,
     existing_connection_id: z.string(),
     host: z.string(),
     port: z.number({ invalid_type_error: "Required" }).nullable(),
@@ -31,8 +41,12 @@ export const connectionRowSchema = z
     cost_micros: z.number().int().nonnegative("Must be ≥ 0").nullable(),
   })
   .superRefine((r, ctx) => {
-    const issue = (path: string, message: string) => ctx.addIssue({ code: z.ZodIssueCode.custom, path: [path], message });
-    if (r.kind === "HTTP") return issue("kind", "HTTP API connections are coming soon");
+    const issue = (path: string, message: string) => ctx.addIssue({ code: z.ZodIssueCode.custom, path: path.split("."), message });
+    if (r.kind === "HTTP") {
+      for (const i of validateHttpValues(adapters, r.http)) issue(`http.${i.path}`, i.message);
+      if (r.max_tps !== null && (!Number.isInteger(r.max_tps) || r.max_tps < 1)) issue("max_tps", "≥ 1");
+      return;
+    }
     if (r.kind === "EXISTING") {
       if (!r.existing_connection_id) issue("existing_connection_id", "Pick a connection");
       return;
@@ -49,9 +63,11 @@ export const connectionRowSchema = z
     else if (!Number.isInteger(r.max_tps) || r.max_tps < 1) issue("max_tps", "≥ 1");
   });
 
+export const connectionRowSchema = makeConnectionRowSchema([]);
+
 export type ConnectionRow = z.infer<typeof connectionRowSchema>;
 
-export const quickRouteSchema = z
+export const makeQuickRouteSchema = (adapters: Adapter[]) => z
   .object({
     name: z.string().trim().min(1, "Required").max(100),
     description: z.string().trim().max(2000),
@@ -65,7 +81,7 @@ export const quickRouteSchema = z
       .trim()
       .max(16)
       .refine((v) => v === "" || isValidSender(v), "Alphanumeric ≤ 11 chars or numeric ≤ 15 digits"),
-    connections: z.array(connectionRowSchema).min(1, "Add at least one connection").max(10, "At most 10 connections"),
+    connections: z.array(makeConnectionRowSchema(adapters)).min(1, "Add at least one connection").max(10, "At most 10 connections"),
   })
   .superRefine((v, ctx) => {
     if (v.template_mode) {
@@ -94,11 +110,15 @@ export const quickRouteSchema = z
     });
   });
 
+/** Without a catalogue (HTTP rows then report “Provider list is still loading”). */
+export const quickRouteSchema = makeQuickRouteSchema([]);
+
 export type QuickRouteValues = z.infer<typeof quickRouteSchema>;
 
 export function newConnectionRow(kind: ConnectionKind = "SMPP"): ConnectionRow {
   return {
     kind,
+    http: initialHttpValues(undefined),
     existing_connection_id: "",
     host: "",
     port: 2775,
@@ -135,10 +155,24 @@ export function priorityLabel(index: number): string {
 }
 
 /** Form values → request body. Priority = row order; only contract fields are sent (the api is .strict()). */
-export function toQuickRouteRequest(v: QuickRouteValues): QuickRouteRequest {
+export function toQuickRouteRequest(v: QuickRouteValues, adapters: Adapter[] = []): QuickRouteRequest {
   const connections: QuickConnectionInput[] = v.connections.map((r, i) => {
     const priority = i + 1;
     if (r.kind === "EXISTING") return { existing_connection_id: r.existing_connection_id, priority };
+    if (r.kind === "HTTP") {
+      const adapter = adapters.find((a) => a.id === r.http.adapter);
+      if (!adapter) throw new Error(`unknown adapter ${r.http.adapter}`);
+      const settings = buildSettings(adapter, r.http);
+      return {
+        type: "HTTP",
+        adapter: adapter.id,
+        credentials: buildCredentials(adapter, r.http),
+        ...(Object.keys(settings).length ? { settings } : {}),
+        ...(r.max_tps !== null ? { max_tps: r.max_tps } : {}),
+        priority,
+        ...(r.cost_micros !== null ? { cost_micros: r.cost_micros } : {}),
+      };
+    }
     return {
       type: "SMPP",
       host: r.host.trim(),
@@ -201,9 +235,15 @@ export function serverFieldErrors(details: Record<string, unknown> | undefined, 
   if (!details) return [];
   const out: Array<{ path: string; message: string }> = [];
   const known = (p: string) => FORM_FIELDS.has(p.split(".").pop() ?? "");
+  // HTTP rows: the api reports connections.<i>.credentials.<key> / settings.<key> / adapter;
+  // the form keeps them under connections.<i>.http.
+  const httpPath = (p: string) => /^connections\.\d+\.(credentials|settings)\.[^.]+$|^connections\.\d+\.adapter$/.test(p) ? p.replace(/^(connections\.\d+)\./, "$1.http.") : null;
   const issues = Array.isArray(details.issues) ? (details.issues as Array<{ path?: unknown; message?: unknown }>) : [];
   for (const i of issues) {
-    if (typeof i.path === "string" && typeof i.message === "string" && known(i.path)) out.push({ path: i.path, message: i.message });
+    if (typeof i.path !== "string" || typeof i.message !== "string") continue;
+    const hp = httpPath(i.path);
+    if (hp) out.push({ path: hp, message: i.message });
+    else if (known(i.path)) out.push({ path: i.path, message: i.message });
   }
   if (typeof details.field === "string" && known(details.field)) out.push({ path: details.field, message });
   return out;

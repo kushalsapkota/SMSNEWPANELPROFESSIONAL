@@ -44,7 +44,7 @@ describe('connections, routes & assignments', () => {
 
       const row = await ctx.db.selectFrom('upstream_connections').select('password_enc').where('id', '=', connId).executeTakeFirstOrThrow();
       expect(row.password_enc).toMatch(/^v1:[A-Za-z0-9+/=]+$/);
-      expect(new CryptoService(loadConfig()).decrypt(row.password_enc)).toBe('s3cr3t!');
+      expect(new CryptoService(loadConfig()).decrypt(row.password_enc as string)).toBe('s3cr3t!');
 
       for (const r of [await as(ctx, admin).get(`/api/connections/${connId}`), await as(ctx, admin).get('/api/connections')]) {
         expect(r.status).toBe(200);
@@ -54,7 +54,7 @@ describe('connections, routes & assignments', () => {
       expect(patched.body.max_tps).toBe(50);
       expect(JSON.stringify(patched.body)).not.toMatch(/password_enc|n3w/);
       const row2 = await ctx.db.selectFrom('upstream_connections').select('password_enc').where('id', '=', connId).executeTakeFirstOrThrow();
-      expect(new CryptoService(loadConfig()).decrypt(row2.password_enc)).toBe('n3w');
+      expect(new CryptoService(loadConfig()).decrypt(row2.password_enc as string)).toBe('n3w');
       const audits = await ctx.db.selectFrom('audit_logs').select(['before', 'after']).where('entity_id', '=', connId).execute();
       expect(JSON.stringify(audits)).not.toMatch(/s3cr3t|n3w|password_enc|v1:/);
       await waitFor(() => ctx.invalidations.some((m) => m.entity === 'upstream_connections' && m.id === connId));

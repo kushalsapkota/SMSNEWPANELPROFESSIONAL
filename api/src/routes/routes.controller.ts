@@ -6,6 +6,7 @@ import { UuidPipe } from '../common/uuid.pipe';
 import { digitsPrefix, hostOrIp, queryBool, senderAddress, uuid } from '../common/validation';
 import { ZodPipe } from '../common/zod.pipe';
 import { BIND_TYPES, MULTIPART_MODES, TEMPLATE_FALLBACKS } from '../db/types';
+import { adapterId, credentialMap, settingMap } from '../connections/http-adapters';
 import { AssignmentsService } from './assignments.service';
 import { QuickConnectionInput, QuickRouteService } from './quick-route.service';
 import { RoutesService } from './routes.service';
@@ -60,17 +61,28 @@ const quickSmpp = z
     cost_micros: z.number().int().nonnegative().safe().optional(),
   })
   .strict();
-/** Either `{existing_connection_id}` or `{type: "SMPP", ...}`; errors are reported against the matching shape. */
+/** New HTTP API connection: adapter + credentials (+ settings), checked against the engine catalogue in the service. */
+const quickHttp = z
+  .object({
+    type: z.literal('HTTP'),
+    name: z.string().trim().min(1).max(100).optional(),
+    adapter: adapterId,
+    credentials: credentialMap.default({}),
+    settings: settingMap.optional(),
+    max_tps: z.number().int().positive().max(1_000_000).optional(),
+    priority: priority.optional(),
+    weight: weight.default(100),
+    cost_micros: z.number().int().nonnegative().safe().optional(),
+  })
+  .strict();
+/** `{existing_connection_id}`, `{type: "SMPP", ...}` or `{type: "HTTP", ...}`; errors are reported against the matching shape. */
 const quickConnection = z.unknown().transform((v, ctx): QuickConnectionInput => {
   const isObj = typeof v === 'object' && v !== null;
   if (isObj && 'existing_connection_id' in v) return parseInto(quickExisting, v, ctx);
-  if (isObj && (v as { type?: unknown }).type !== 'SMPP') {
-    const t = (v as { type?: unknown }).type;
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      path: ['type'],
-      message: t === 'HTTP' ? 'HTTP API connections are not supported yet' : 'type must be "SMPP" (or pass existing_connection_id)',
-    });
+  const t = isObj ? (v as { type?: unknown }).type : undefined;
+  if (t === 'HTTP') return parseInto(quickHttp, v, ctx);
+  if (isObj && t !== 'SMPP') {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['type'], message: 'type must be "SMPP" or "HTTP" (or pass existing_connection_id)' });
     return z.NEVER;
   }
   return parseInto(quickSmpp, v, ctx);

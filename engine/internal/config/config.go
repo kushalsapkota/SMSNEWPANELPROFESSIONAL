@@ -77,8 +77,13 @@ type Config struct {
 	// api) lets webhooks reach loopback / private / reserved addresses. Dev and
 	// tests only; off = SSRF guard on (webhook.Options.BlockPrivate).
 	WebhookAllowPrivate bool
-	CDRFlushInterval    time.Duration // ENGINE_CDR_FLUSH_INTERVAL, default 250ms
-	CDRBatchSize        int           // ENGINE_CDR_BATCH_SIZE, default 500
+	// PublicAPIBaseURL (PUBLIC_API_BASE_URL, optional, same name as the api):
+	// the public base of the provider DLR callback URL
+	// (<base>/v1/provider-dlr/<dlr_token>), sent to adapters that take a
+	// callback URL per request. Empty = not sent.
+	PublicAPIBaseURL string
+	CDRFlushInterval time.Duration // ENGINE_CDR_FLUSH_INTERVAL, default 250ms
+	CDRBatchSize     int           // ENGINE_CDR_BATCH_SIZE, default 500
 
 	// Process
 	ShutdownTimeout time.Duration // ENGINE_SHUTDOWN_TIMEOUT, default 20s
@@ -144,6 +149,7 @@ func LoadFrom(getenv Getenv) (*Config, error) {
 		WebhookTimeout:      l.dur("ENGINE_WEBHOOK_TIMEOUT", 10*time.Second, time.Millisecond),
 		WebhookWorkers:      l.int("ENGINE_WEBHOOK_WORKERS", 16, 1, 1024),
 		WebhookAllowPrivate: truthy(l.str("WEBHOOK_ALLOW_PRIVATE_TARGETS", "")),
+		PublicAPIBaseURL:    strings.TrimRight(l.str("PUBLIC_API_BASE_URL", ""), "/"),
 		CDRFlushInterval:    l.dur("ENGINE_CDR_FLUSH_INTERVAL", 250*time.Millisecond, time.Millisecond),
 		CDRBatchSize:        l.int("ENGINE_CDR_BATCH_SIZE", 500, 1, 100000),
 
@@ -184,6 +190,11 @@ func LoadFrom(getenv Getenv) (*Config, error) {
 			l.fail(a.name, fmt.Sprintf("must be host:port (%v)", err))
 		} else if p, err := strconv.Atoi(port); err != nil || p < 0 || p > 65535 {
 			l.fail(a.name, "port must be 0-65535")
+		}
+	}
+	if c.PublicAPIBaseURL != "" {
+		if u, err := url.Parse(c.PublicAPIBaseURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			l.fail("PUBLIC_API_BASE_URL", "must be an http(s) URL")
 		}
 	}
 	if c.DBMinConns > c.DBMaxConns {

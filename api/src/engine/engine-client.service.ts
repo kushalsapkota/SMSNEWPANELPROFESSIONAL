@@ -7,7 +7,11 @@ import type {
   EngineBatchResult,
   EngineConnectionStatus,
   EngineCreditResponse,
+  EngineAdapter,
   EngineHealthResponse,
+  EngineProviderBalanceResponse,
+  EngineProviderDlrEnvelope,
+  EngineTestSendResponse,
   EngineSmppSession,
   EngineSubmitOk,
   EngineSubmitRequest,
@@ -17,8 +21,12 @@ import type {
 
 /** Network failure / timeout / 5xx: the engine could not be reached or failed internally. */
 export class EngineUnavailableError extends AppError {
-  constructor(message: string) {
+  /** The engine's HTTP status when it answered (non-contract 4xx / 5xx); undefined on network errors. */
+  readonly upstreamStatus?: number;
+
+  constructor(message: string, upstreamStatus?: number) {
     super('INTERNAL', `Engine unavailable: ${message}`, undefined, 502);
+    this.upstreamStatus = upstreamStatus;
   }
 }
 
@@ -109,6 +117,28 @@ export class EngineClient {
     return this.request('GET', `/internal/v1/balance/${encodeURIComponent(orgId)}`);
   }
 
+  /** HTTP adapter catalogue (engine is the single source of truth). Cached by AdapterCatalogue. */
+  async adapters(): Promise<EngineAdapter[]> {
+    const r = await this.request<{ adapters: EngineAdapter[] }>('GET', '/internal/v1/adapters');
+    if (!r || !Array.isArray(r.adapters)) throw new EngineUnavailableError('malformed adapter catalogue');
+    return r.adapters;
+  }
+
+  /** Sends ONE real message through the connection outside billing/CDR (secrets masked in the echo). */
+  testConnection(id: string, body: { to: string; text: string }): Promise<EngineTestSendResponse> {
+    // A provider can take up to the engine's 10s outbound timeout (+ retries): allow more than the default.
+    return this.request('POST', `/internal/v1/connections/${encodeURIComponent(id)}/test`, body, Math.max(this.timeoutMs, 30_000));
+  }
+
+  providerBalance(id: string): Promise<EngineProviderBalanceResponse> {
+    return this.request('GET', `/internal/v1/connections/${encodeURIComponent(id)}/balance`, undefined, Math.max(this.timeoutMs, 15_000));
+  }
+
+  /** Forwards a provider DLR callback verbatim. Engine 404 (unknown token) surfaces as AppError NOT_FOUND. */
+  providerDlr(dlrToken: string, envelope: EngineProviderDlrEnvelope): Promise<{ accepted: number }> {
+    return this.request('POST', `/internal/v1/provider-dlr/${encodeURIComponent(dlrToken)}`, envelope);
+  }
+
   health(): Promise<EngineHealthResponse> {
     return this.request('GET', '/internal/v1/health', undefined, 2000);
   }
@@ -136,7 +166,7 @@ export class EngineClient {
       try {
         json = JSON.parse(text);
       } catch {
-        throw new EngineUnavailableError(`non-JSON response (HTTP ${res.status}) from ${path}`);
+        throw new EngineUnavailableError(`non-JSON response (HTTP ${res.status}) from ${path}`, res.status);
       }
     }
     if (res.ok) return json as T;
@@ -149,7 +179,7 @@ export class EngineClient {
         res.status,
       );
     }
-    throw new EngineUnavailableError(`HTTP ${res.status} from ${path}`);
+    throw new EngineUnavailableError(`HTTP ${res.status} from ${path}`, res.status);
   }
 }
 

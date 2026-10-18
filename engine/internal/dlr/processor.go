@@ -115,35 +115,74 @@ func (p *Processor) HandleDeliver(connID string, d *pdu.DeliverSM) pdu.CommandSt
 		}
 		return pdu.ESME_ROK
 	}
-	status, final := StatusForStat(r.Stat)
-	if !final {
-		p.m.DLRReceived.With("intermediate").Inc()
-		return pdu.ESME_ROK
-	}
-	p.m.DLRReceived.With(r.Stat).Inc()
 	ctx, cancel := context.WithTimeout(context.Background(), p.opts.LookupWait+10*time.Second)
 	defer cancel()
-
-	msgID, parts, createdMS, found, err := p.lookup(ctx, connID, r.ID)
-	if err != nil {
-		p.log.Warn("dlrmap lookup failed", "connection_id", connID, "smsc_id", r.ID, "err", err)
+	switch p.applyReceipt(ctx, connID, r.ID, r.Stat, r.Err, false) {
+	case receiptRetry:
 		return pdu.ESME_RX_T_APPN
+	case receiptUnmatched:
+		return p.unmatched(ctx, connID, r.ID)
 	}
-	stat := truncate(r.Stat, 7)
-	errCode := normalizeErr(r.Err)
+	return pdu.ESME_ROK
+}
+
+// HandleProviderReceipt applies a delivery status reported by an HTTP
+// provider (DLR poll or callback) for providerID on connection connID; stat
+// is a receipt word (DELIVRD, UNDELIV, EXPIRED, REJECTD, UNKNOWN...). The id
+// is matched exactly (no hex/decimal variants). It implements
+// dispatch.ReceiptSink.
+func (p *Processor) HandleProviderReceipt(ctx context.Context, connID, providerID, stat, errCode string) (bool, error) {
+	switch p.applyReceipt(ctx, connID, providerID, stat, errCode, true) {
+	case receiptRetry:
+		return false, fmt.Errorf("dlr: receipt for %s could not be recorded", providerID)
+	case receiptUnmatched:
+		p.m.DLRReceived.With("unmatched").Inc()
+		return false, nil
+	case receiptIntermediate:
+		return false, nil
+	}
+	return true, nil
+}
+
+type receiptResult int
+
+const (
+	receiptDone         receiptResult = iota // recorded (or already final)
+	receiptIntermediate                      // not a final status: ignored
+	receiptUnmatched                         // no message has this id
+	receiptRetry                             // infrastructure error: try again later
+)
+
+// applyReceipt records a final receipt for smscID on connID. exact limits
+// matching to the id itself (HTTP provider ids), without the hex/decimal
+// variants SMPP SMSCs need.
+func (p *Processor) applyReceipt(ctx context.Context, connID, smscID, rawStat, rawErr string, exact bool) receiptResult {
+	status, final := StatusForStat(rawStat)
+	if !final {
+		p.m.DLRReceived.With("intermediate").Inc()
+		return receiptIntermediate
+	}
+	p.m.DLRReceived.With(rawStat).Inc()
+	msgID, parts, createdMS, found, err := p.lookup(ctx, connID, smscID, exact)
+	if err != nil {
+		p.log.Warn("dlrmap lookup failed", "connection_id", connID, "smsc_id", smscID, "err", err)
+		return receiptRetry
+	}
+	stat := truncate(rawStat, 7)
+	errCode := normalizeErr(rawErr)
 	// The receipt's "done date" is in the SMSC's local zone with minute
 	// precision and no zone marker; the client sees our own receive time
 	// (the same instant recorded as dlr_received_at).
 	doneAt := p.opts.Now().UTC()
 	if !found {
-		return p.fallback(ctx, connID, r.ID, status, stat, errCode)
+		return p.fallback(ctx, connID, smscID, status, stat, errCode, exact)
 	}
 	token := uuid.NewString()
 	for _, part := range parts {
 		o, err := recordPart(ctx, p.rdb, msgID, part, status, stat, errCode, token, p.opts.Now())
 		if err != nil {
 			p.log.Warn("record DLR failed", "message_id", msgID, "err", err)
-			return pdu.ESME_RX_T_APPN
+			return receiptRetry
 		}
 		switch o.Kind {
 		case OutcomeFinal:
@@ -152,18 +191,18 @@ func (p *Processor) HandleDeliver(connID string, d *pdu.DeliverSM) pdu.CommandSt
 				if rerr := ReleaseFinal(ctx, p.rdb, msgID); rerr != nil {
 					p.log.Warn("release final claim failed", "message_id", msgID, "err", rerr)
 				}
-				return pdu.ESME_RX_T_APPN
+				return receiptRetry
 			}
-			return pdu.ESME_ROK
+			return receiptDone
 		case OutcomeNoMsg:
 			// Message state expired: update the CDR as a single final outcome.
 			p.updateCDR(ctx, msgID, time.UnixMilli(createdMS).UTC(), status, stat, errCode)
-			return pdu.ESME_ROK
+			return receiptDone
 		case OutcomeDone:
-			return pdu.ESME_ROK
+			return receiptDone
 		}
 	}
-	return pdu.ESME_ROK
+	return receiptDone
 }
 
 // idForm names how a receipt id relates to the id stored from
@@ -211,10 +250,13 @@ func idForms(smscID string) map[idForm]string {
 // form — and tries the other forms once at the end. Polling every variant at
 // once would match another message whose id happens to equal this one's
 // conversion while this receipt's own entry is still being written.
-func (p *Processor) lookup(ctx context.Context, connID, smscID string) (msgID string, parts []int, createdMS int64, found bool, err error) {
+func (p *Processor) lookup(ctx context.Context, connID, smscID string, exact bool) (msgID string, parts []int, createdMS int64, found bool, err error) {
 	forms := idForms(smscID)
 	if len(forms) == 0 {
 		return "", nil, 0, false, nil
+	}
+	if exact {
+		forms = map[idForm]string{formExact: forms[formExact]}
 	}
 	primary := formExact
 	if f, ok := p.forms.Load(connID); ok {
@@ -281,23 +323,23 @@ func (p *Processor) lookup(ctx context.Context, connID, smscID string) (msgID st
 
 // fallback matches a receipt whose dlrmap entry is gone against
 // message_logs.smsc_msg_ids (GIN index) for the last 35 days, preferring a
-// row whose stored id is the receipt id itself over a hex/decimal variant.
-// A receipt that matches nothing is answered ESME_RX_T_APPN a few times
-// (UnmatchedRetries; its submit may still be in flight) before it is
-// acknowledged and dropped.
-func (p *Processor) fallback(ctx context.Context, connID, smscID, status, stat, errCode string) pdu.CommandStatus {
+// row whose stored id is the receipt id itself over a hex/decimal variant
+// (exact: the id itself only).
+func (p *Processor) fallback(ctx context.Context, connID, smscID, status, stat, errCode string, exact bool) receiptResult {
 	if p.db == nil {
-		return p.unmatched(ctx, connID, smscID)
+		return receiptUnmatched
 	}
 	raw := strings.TrimSpace(smscID)
-	exact := []string{raw, strings.ToLower(raw), strings.ToUpper(raw)}
-	forms := idForms(smscID)
-	cands := append([]string(nil), exact...)
-	for _, v := range forms {
-		cands = append(cands, v, strings.ToUpper(v))
-	}
-	if n, ok := forms[formExact]; ok {
-		exact = append(exact, n, strings.ToUpper(n))
+	exactIDs := []string{raw, strings.ToLower(raw), strings.ToUpper(raw)}
+	cands := append([]string(nil), exactIDs...)
+	if !exact {
+		forms := idForms(smscID)
+		for _, v := range forms {
+			cands = append(cands, v, strings.ToUpper(v))
+		}
+		if n, ok := forms[formExact]; ok {
+			exactIDs = append(exactIDs, n, strings.ToUpper(n))
+		}
 	}
 	var id string
 	var created time.Time
@@ -305,16 +347,16 @@ func (p *Processor) fallback(ctx context.Context, connID, smscID, status, stat, 
 		SELECT id::text, created_at FROM message_logs
 		 WHERE smsc_msg_ids && $1::text[] AND connection_id = $2
 		   AND created_at > now() - interval '35 days'
-		 ORDER BY (smsc_msg_ids && $3::text[]) DESC, created_at DESC LIMIT 1`, cands, connID, exact).Scan(&id, &created)
+		 ORDER BY (smsc_msg_ids && $3::text[]) DESC, created_at DESC LIMIT 1`, cands, connID, exactIDs).Scan(&id, &created)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return p.unmatched(ctx, connID, smscID)
+		return receiptUnmatched
 	}
 	if err != nil {
 		p.log.Warn("DLR fallback lookup failed", "err", err)
-		return pdu.ESME_RX_T_APPN
+		return receiptRetry
 	}
 	p.updateCDR(ctx, id, created, status, stat, errCode)
-	return pdu.ESME_ROK
+	return receiptDone
 }
 
 // unmatched answers ESME_RX_T_APPN for the first UnmatchedRetries

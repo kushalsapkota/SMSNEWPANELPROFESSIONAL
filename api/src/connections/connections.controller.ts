@@ -1,12 +1,13 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post, Put, Query } from '@nestjs/common';
+import { Body, Controller, Delete, Get, HttpCode, Param, Patch, Post, Put, Query } from '@nestjs/common';
 import { z } from 'zod';
-import { Roles } from '../common/decorators';
+import { NoRequestTransaction, Roles } from '../common/decorators';
 import { paginationSchema } from '../common/pagination';
 import { UuidPipe } from '../common/uuid.pipe';
 import { digitsPrefix, queryBool } from '../common/validation';
-import { ZodPipe } from '../common/zod.pipe';
-import { BIND_TYPES, MULTIPART_MODES } from '../db/types';
+import { ZodPipe, parseOrThrow } from '../common/zod.pipe';
+import { BIND_TYPES, CONNECTION_KINDS, MULTIPART_MODES } from '../db/types';
 import { ConnectionsService } from './connections.service';
+import { adapterId, credentialMap, settingMap } from './http-adapters';
 
 const smallint = (min: number, max: number) => z.number().int().min(min).max(max);
 const base = {
@@ -32,12 +33,37 @@ const base = {
   notes: z.string().max(2000).nullable(),
 };
 const createSchema = z
-  .object(base)
+  .object({ ...base, kind: z.literal('SMPP') })
   .partial()
   .required({ name: true, host: true, port: true, system_id: true, password: true, max_tps: true })
   .strict();
-const patchSchema = z.object(base).partial().strict();
-const listSchema = paginationSchema.extend({ q: z.string().trim().min(1).max(100).optional(), enabled: queryBool.optional() });
+const httpCreateSchema = z
+  .object({
+    kind: z.literal('HTTP'),
+    name: base.name,
+    adapter: adapterId,
+    credentials: credentialMap.default({}),
+    settings: settingMap.default({}),
+    max_tps: base.max_tps.optional(),
+    enabled: base.enabled.optional(),
+    notes: base.notes.optional(),
+  })
+  .strict();
+const patchSchema = z
+  .object({ ...base, kind: z.enum(CONNECTION_KINDS), adapter: adapterId, credentials: credentialMap, settings: settingMap })
+  .partial()
+  .strict();
+const listSchema = paginationSchema.extend({
+  q: z.string().trim().min(1).max(100).optional(),
+  enabled: queryBool.optional(),
+  kind: z.enum(CONNECTION_KINDS).optional(),
+});
+const testSchema = z
+  .object({
+    to: z.string().trim().regex(/^\+?[0-9][0-9 ()-]{4,19}$/, 'must be a phone number (digits, optional +)'),
+    text: z.string().min(1, 'text is required').max(1600),
+  })
+  .strict();
 const ratesSchema = z
   .array(z.object({ prefix: digitsPrefix.default(''), cost_micros: z.number().int().nonnegative().safe() }).strict())
   .max(10_000);
@@ -53,8 +79,16 @@ export class ConnectionsController {
   }
 
   @Post()
-  create(@Body(new ZodPipe(createSchema)) body: z.infer<typeof createSchema>) {
-    return this.connections.create(body);
+  create(@Body() body: unknown) {
+    const isHttp = typeof body === 'object' && body !== null && (body as { kind?: unknown }).kind === 'HTTP';
+    return this.connections.create(isHttp ? parseOrThrow(httpCreateSchema, body) : parseOrThrow(createSchema, body));
+  }
+
+  /** HTTP adapter catalogue (engine, cached 60s). Declared before `:id` routes. */
+  @Get('adapters')
+  @NoRequestTransaction()
+  adapters() {
+    return this.connections.adapters();
   }
 
   @Get(':id')
@@ -65,6 +99,20 @@ export class ConnectionsController {
   @Patch(':id')
   patch(@Param('id', UuidPipe) id: string, @Body(new ZodPipe(patchSchema)) body: z.infer<typeof patchSchema>) {
     return this.connections.update(id, body);
+  }
+
+  /** Sends ONE real SMS through the connection (engine; outside billing/CDR). */
+  @Post(':id/test')
+  @HttpCode(200)
+  @NoRequestTransaction()
+  test(@Param('id', UuidPipe) id: string, @Body(new ZodPipe(testSchema)) body: z.infer<typeof testSchema>) {
+    return this.connections.test(id, body);
+  }
+
+  @Get(':id/balance')
+  @NoRequestTransaction()
+  balance(@Param('id', UuidPipe) id: string) {
+    return this.connections.balance(id);
   }
 
   @Delete(':id')

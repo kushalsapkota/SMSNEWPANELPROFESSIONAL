@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { FAKE_ADAPTERS } from './fake-adapters';
 
 export interface FakeReject {
   status: number;
@@ -63,6 +64,22 @@ export class FakeEngine {
   /** /submit accepts the message, then answers 503 (outcome unknown to the api). */
   submitFailAfterAccept = false;
   connections: unknown[] = [];
+  /** HTTP adapter catalogue served at /internal/v1/adapters; `adaptersDown` → 503 for that path only. */
+  adapters: unknown[] = FAKE_ADAPTERS;
+  adaptersDown = false;
+  /** Reply of POST /internal/v1/connections/:id/test (connection id substituted in `request`). */
+  testReply: Record<string, unknown> = {
+    ok: true,
+    provider_message_id: 'prov-123',
+    http_status: 200,
+    request: { method: 'POST', url: 'https://sms.aakashsms.com/sms/v3/send', body: 'auth_token=****&to=9800000000&text=hi' },
+    response_body: '{"error":false,"message":"1 messages has been queued"}',
+    error: null,
+    duration_ms: 42,
+  };
+  balanceReply: Record<string, unknown> = { supported: true, balance: '1234', raw: '{"available_credit":1234}', error: null };
+  /** dlr tokens the engine knows (provider-dlr → 404 for others); null = accept every token. */
+  dlrTokens: Set<string> | null = null;
   /** Prometheus counter value served at /metrics (smsgw_submit_total). */
   metricsSubmitTotal = 0;
   /** Telegram Bot API requests received at /bot<token>/sendMessage. */
@@ -144,6 +161,18 @@ export class FakeEngine {
       return send(200, { sessions: this.sessions });
     }
     if (method === 'GET' && path === '/internal/v1/connections/status') return send(200, { connections: this.connections });
+    if (method === 'GET' && path === '/internal/v1/adapters') {
+      if (this.adaptersDown) return send(503, { error_code: 'INTERNAL', message: 'down' });
+      return send(200, { adapters: this.adapters });
+    }
+    const ct = /^\/internal\/v1\/connections\/([0-9a-f-]+)\/(test|balance)$/.exec(path);
+    if (ct && method === 'POST' && ct[2] === 'test') return send(200, this.testReply);
+    if (ct && method === 'GET' && ct[2] === 'balance') return send(200, this.balanceReply);
+    const pd = /^\/internal\/v1\/provider-dlr\/([^/?]+)$/.exec(path);
+    if (pd && method === 'POST') {
+      if (this.dlrTokens && !this.dlrTokens.has(decodeURIComponent(pd[1]))) return send(404, { error_code: 'NOT_FOUND', message: 'unknown token' });
+      return send(200, { accepted: 1 });
+    }
     if (method === 'GET' && path === '/internal/v1/health') return send(200, { ok: true, db: true, redis: true });
     if (method === 'POST' && path === '/internal/v1/template/preview') {
       const m = /\b[0-9]{4,8}\b/.exec(body.text ?? '');
@@ -199,6 +228,9 @@ export class FakeEngine {
     this.submitFailAfterAccept = false;
     this.connections = [];
     this.telegram = [];
+    this.adapters = FAKE_ADAPTERS;
+    this.adaptersDown = false;
+    this.dlrTokens = null;
   }
 
   async stop(): Promise<void> {

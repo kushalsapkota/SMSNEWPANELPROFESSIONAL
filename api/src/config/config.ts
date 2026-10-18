@@ -86,6 +86,30 @@ export const envSchema = z.object({
   /** api_keys.last_used_at is written at most once per key per this interval. */
   API_KEY_TOUCH_INTERVAL_MS: intWithDefault(60000, 0),
 
+  // HTTP upstream connections (docs/providers/HTTP-CONNECTIONS-CONTRACT.md)
+  /**
+   * Public base URL of this deployment (e.g. https://sms.example.com; nginx proxies /v1/ to the api).
+   * Used to show admins the provider DLR callback URL `${PUBLIC_API_BASE_URL}/v1/provider-dlr/<token>`.
+   * Unset → responses carry dlr_callback_url: null and only dlr_callback_path.
+   */
+  PUBLIC_API_BASE_URL: z
+    .string()
+    .optional()
+    .transform((v, ctx) => {
+      if (v === undefined || v.trim() === '') return undefined;
+      const t = v.trim().replace(/\/+$/, '');
+      if (!/^https?:\/\/[^\s/]+/.test(t)) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'must be an http(s):// URL' });
+        return z.NEVER;
+      }
+      return t;
+    }),
+  /** Engine adapter catalogue cache (GET /internal/v1/adapters). */
+  ADAPTER_CATALOGUE_TTL_MS: intWithDefault(60000, 0),
+  /** Provider DLR callbacks: requests per second per dlr_token, and per client IP. */
+  PROVIDER_DLR_RATE_LIMIT: intWithDefault(200, 1),
+  PROVIDER_DLR_IP_RATE_LIMIT: intWithDefault(400, 1),
+
   // Background workers (0 disables the in-process timer)
   CAMPAIGN_WORKER_INTERVAL_MS: intWithDefault(1000, 0),
   ALERTS_INTERVAL_MS: intWithDefault(60000, 0),

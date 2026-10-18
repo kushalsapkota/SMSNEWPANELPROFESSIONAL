@@ -632,3 +632,214 @@ All items are backward compatible additions to §10 (admin only).
    `GET /internal/v1/connections/status`. `state` adds `UNKNOWN` (engine unreachable → still 200 with
    `engine_reachable:false`, or the engine has not loaded the connection yet). 404 for unknown route.
 3. **`GET /api/routes/:id`** connection items add `host`, `port`, `use_tls`, `system_id`.
+
+## http connections (api/web)
+
+Clarifications of `docs/providers/HTTP-CONNECTIONS-CONTRACT.md` as implemented by api/ and web/. All
+backward compatible (SMPP requests and responses unchanged except the added fields).
+
+1. **Connection DTO** (`GET/POST/PATCH /api/connections[/:id]`, quick route `connection`) adds `kind`,
+   `adapter`, `credentials_set` (sorted key names; `[]` for SMPP), `settings` (the `http_settings`
+   column; `{}` for SMPP), `dlr_callback_path` (`/v1/provider-dlr/<dlr_token>`, HTTP only, else null) and
+   `dlr_callback_url` (`${PUBLIC_API_BASE_URL}` + path; **null when the api has no
+   `PUBLIC_API_BASE_URL`** — the web then shows its own origin + path). The callback URL is returned for
+   every HTTP connection, not only `dlr_mode = callback` ones (the web shows it only for callback
+   adapters). `http_credentials_enc`, `password_enc` and `dlr_token` are never returned. HTTP rows have
+   `host/port/system_id = null`, `has_password = false`. `GET /api/connections` adds `?kind=SMPP|HTTP`;
+   `q` also matches `adapter`.
+2. **Create** `POST /api/connections` with `kind: "HTTP"`: strict body `{kind, name, adapter,
+   credentials? = {}, settings? = {}, max_tps? = 10, enabled?, notes?}` (no SMPP fields). Without
+   `kind` (or `kind: "SMPP"`) the SMPP body is unchanged. `dlr_token` = 32 random bytes base64url
+   (43 chars) for every HTTP connection.
+3. **Validation against the engine catalogue** (cached 60s, `ADAPTER_CATALOGUE_TTL_MS`): unknown
+   adapter → 400 `details.issues[{path:"adapter"}]`; credentials must be strings ≤ 4096, unknown keys
+   rejected, required keys non-empty after the merge; settings: unknown keys rejected; `number` → JSON
+   number, `bool` → boolean, `select` → one of `options` (strings or `{value,label}`), `url` (and any
+   key `url` / `*_url`) → http(s) URL (`{placeholder}`s allowed), `json` → object or JSON string, other
+   types → string ≤ 16384; a `required` setting without a catalogue default must be set. Issue paths are
+   `credentials.<key>` / `settings.<key>` (quick route: `connections.<i>.credentials.<key>` …). Engine
+   unreachable while validating → **502 INTERNAL** `details.reason = "ENGINE_UNAVAILABLE"`, nothing
+   written. A PATCH that touches only name/max_tps/enabled/notes does not need the catalogue.
+4. **PATCH merge**: `credentials` key omitted = unchanged, `""` (or null) = clear; `settings` key
+   omitted = unchanged, `null` or `""` = back to the catalogue default (key removed from
+   `http_settings`). `adapter` may change (stored credentials/settings whose keys the new adapter does
+   not have are dropped; required ones must then be supplied). `kind` cannot change (400). SMPP-only
+   fields on an HTTP row, or `adapter/credentials/settings` on an SMPP row → 400 with one issue per
+   field. Audit `connection.update.after.credentials_changed` = key names only.
+5. **Audit**: `dlr_token`, `dlr_callback_url`, `dlr_callback_path` and `credentials` keys are stripped
+   from every audit row (`sanitizeForAudit`), like passwords/secrets.
+6. **`POST /api/connections/:id/test`** `{to: phone (digits, optional +, spaces/dashes/() allowed),
+   text 1-1600}` → 200 with the engine body verbatim (`ok:false` is still 200). Audited as
+   `connection.test` with `{to, ok, http_status, provider_message_id}` (never the text). 404 unknown
+   id, 502 engine down. **`GET /api/connections/:id/balance`** → engine body verbatim. Both are proxied
+   for SMPP connections too (the engine decides). `GET /api/connections/adapters` → `{adapters}` (502
+   when the engine is unreachable and nothing is cached). All SUPER_ADMIN only.
+7. **Quick route** HTTP rows: `{type:"HTTP", adapter, credentials = {}, settings?, name? = "<route>
+   HTTP <n>", max_tps? = 10, priority? = n, weight? = 100, cost_micros?}` (strict). All HTTP rows are
+   validated before anything is written (issues of every row in one 400). Same transaction / audit /
+   invalidation as SMPP rows; a later row's conflict rolls back earlier SMPP and HTTP rows. A name
+   conflict on an HTTP row → 409 `details.field = connections.<i>.name`.
+8. **`GET /api/routes/:id/status`** rows add `kind`, `adapter`, `last_error_at`, `last_success_at`,
+   `dlr_callback_path`, `dlr_callback_url`; `last_error` prefers the engine's top-level `last_error`
+   (HTTP) over session errors; `state` adds `READY` / `ERROR`. `host/port/system_id` are null for HTTP.
+   Dashboard `connections_up`, analytics live `connections_up` and the route-down alert count `READY`
+   like `BOUND`.
+9. **Public `POST|GET /v1/provider-dlr/:dlr_token`** (no auth): raw body (any content type, max 64KB,
+   read before the JSON parser) forwarded as `{method, query (repeated keys → arrays), headers
+   (lowercased; cookie and x-internal-token dropped), body_base64}`. Replies, `text/plain`:
+   `200 OK` when forwarded, and also for malformed / unknown tokens (looked up in
+   `upstream_connections.dlr_token`, not forwarded — no probing signal) and when the engine answers 4xx
+   (incl. 404 unknown token); **`503`** (`Retry-After: 30`) when the engine is unreachable / 5xx so the
+   provider retries instead of losing the DLR; `429` (`Retry-After: 1`) over the limit; `413` over
+   64KB. Rate limits (Redis fixed 1s windows, fail open): per client IP `PROVIDER_DLR_IP_RATE_LIMIT`
+   (400/s, `rl:pdlr:ip:<ip>:<sec>`) and per known token `PROVIDER_DLR_RATE_LIMIT` (200/s,
+   `rl:pdlr:tok:<sha256(token)[:24]>:<sec>`). The token never appears in logs.
+10. **api env**: `PUBLIC_API_BASE_URL` (http(s) URL, trailing `/` stripped), `ADAPTER_CATALOGUE_TTL_MS`,
+    `PROVIDER_DLR_RATE_LIMIT`, `PROVIDER_DLR_IP_RATE_LIMIT`. Deployment must pass `PUBLIC_API_BASE_URL`
+    to the api container (deploy/ currently passes it to the web build only).
+11. **Web**: "HTTP API" rows in `/routes/new`, HTTP rows in the Carrier status card (Ready/Error in plain
+    words, last success, balance + refresh, test-send dialog with masked request/response, callback URL
+    copy for `dlr_mode = callback`, edit with write-only credentials), `/connections` type column +
+    SMPP/HTTP create tabs, HTTP edit on `/connections/[id]`, monitor tiles for HTTP, and
+    "Sent (provider gives no delivery report)" for `dlr_stat = NODLR` in the message list and drawer.
+    Web form settings are sent typed (numbers as numbers, switches as booleans, only when changed from
+    the default on create).
+
+## http connections (engine)
+
+Engine side of `docs/providers/HTTP-CONNECTIONS-CONTRACT.md` (engine/internal/httpadapter, dispatch/http.go,
+dlr, internalapi). All additions are backward compatible; clarifications of the contract are listed here.
+
+1. **Catalogue (`GET /internal/v1/adapters`)** lists 10 adapters in this order: `sparrow_v2`, `aakash_v3`,
+   `aakash_v4`, `swift_smartsms`, `messengernepal`, `twozero`, `nestsms`, `bulletsms`, `bitmoro`, `generic_http`.
+   Every entry has all contract keys (`docs_url` null for swift_smartsms and generic_http,
+   `destination_countries` null for generic_http, `options` null except for `select` settings).
+   - **Credential keys:** the API token is `token` for every adapter (the contract's `auth_token` was only an
+     example). messengernepal adds `webhook_secret` (optional). swift_smartsms takes `username`, `password` and
+     `organisation_code`. generic_http takes `token`, `username` and `password`, all optional. Only
+     `secret: true` values are masked; swift's `username` and `organisation_code` are not secret.
+   - **Settings in use:** `base_url` (every adapter except generic_http; required for nestsms, which has no
+     default host), `max_concurrency` (default 10, capped at 1000), `sender` and `use_message_sender`.
+     Poll adapters add `dlr_poll_interval_s` (default 60, minimum 10) and `dlr_poll_batch`. messengernepal and
+     nestsms add `message_type`; swift_smartsms adds `recipient_format`. generic_http takes `url`, `method`,
+     `body_type`, `params`, `headers`, `recipient_format`, `sender`, `success_status`, `success_json_path`,
+     `success_equals`, `success_regex`, `message_id_path` and `error_path`.
+   - **Sender resolution:** the `sender` setting is used first. If it is blank, the message's own sender is
+     used when `use_message_sender` is on, and always for Sparrow, which requires `from`. Otherwise no sender is
+     sent and the account default applies. generic_http's `{sender}` falls back to the message's sender.
+   - Number and string settings are read leniently, so `"10"` and `10` are both accepted.
+2. **Store.** HTTP rows load with NULL SMPP columns. `http_credentials_enc` must decrypt to a JSON object; a
+   non-string value is kept as its JSON text. If decryption or parsing fails, the connection is unusable
+   (`PasswordErr`, exactly like an SMPP password) and its status is `ERROR`. `kind` changes rebind the
+   connection. HTTP field changes (adapter, credentials, settings, dlr_token) never rebind anything: the next
+   request reads the new config. `max_tps` and `max_concurrency` apply in place.
+3. **Status (`GET /internal/v1/connections/status`).** Every row now has `kind` (`SMPP` or `HTTP`), plus
+   `adapter`, `last_error`, `last_error_at` and `last_success_at`. These keys are always present and are null
+   for SMPP rows.
+   - HTTP `state` is `DISABLED` when the connection is disabled. It is `ERROR` when the credentials cannot be
+     decrypted, the adapter is unknown, or the last call failed. Otherwise it is `READY`.
+   - Rejections about one message do not set `ERROR`: invalid recipient, empty text, Sparrow 1007/1010/1011,
+     Aakash aborted numbers, and destinations outside the adapter's countries.
+   - Test sends update `last_success_at` / `last_error`, but not the totals.
+   - `inflight` is the number of requests holding a `max_concurrency` slot.
+   - `connections_up` (`/internal/v1/stats`) and the `smsgw_upstream_connection_up` metric count `READY` as up.
+4. **Send outcomes.** One HTTP request carries the whole text, so the message counts as one DLR unit
+   (`msg:<id>.pdus = 1`). Billed parts are unchanged.
+   - **Accepted:** status `SUBMITTED`. `smsc_msg_ids` holds the raw provider id, or our message id when the
+     provider returns none (Sparrow, Swift without `messageId`). The dlrmap key is the lowercased id. Route
+     cost = longest-prefix `upstream_rates` of the HTTP connection × billed parts.
+   - **Definite rejection** (fail over, then `FAILED` + refund): documented error codes, any 4xx except 408/429,
+     a body with error=true (including Aakash 200-on-error and per-number `aborted`), and missing credentials
+     or config.
+   - **Retried on the same connection, then fail over:** 408, 429, 500, 502, 503, other non-2xx/non-4xx
+     answers, and network errors before the request was fully written. There are 3 attempts in total, waiting
+     500 ms then doubling up to 5 s, or `Retry-After` up to 10 s, all within the dispatcher's 60 s throttle
+     window. Providers that take an `Idempotency-Key` (messengernepal, nestsms, twozero, bulletsms) get our
+     message id in it.
+   - **Unknown outcome** (never resent, never refunded; the message ends `UNKNOWN` like an SMPP
+     submit_sm_resp timeout):
+     - a timeout after the request was written (`SUBMIT_TIMEOUT`);
+     - the connection lost after the write (`SUBMIT_UNKNOWN`);
+     - **HTTP 504** (`SUBMIT_TIMEOUT`): a gateway may have forwarded the request, so it is not treated as a
+       retryable 5xx;
+     - a 2xx body the adapter cannot interpret (`SUBMIT_UNKNOWN`).
+   - **New `error_code` values:**
+     - provider codes as returned: Sparrow `1002` etc., MessengerNepal/Nest `INSUFFICIENT_CREDITS`,
+       `INVALID_API_KEY` etc.;
+     - `HTTP_<status>`, `HTTP_NETWORK`, `SUBMIT_ABORTED`;
+     - Aakash `INVALID_TOKEN`, `INSUFFICIENT_BALANCE`, `INVALID_RECIPIENT`, `EMPTY_TEXT`, `PROVIDER_ERROR`;
+     - Swift `SWIFT_<responseCode>`;
+     - `PROVIDER_ERROR` / `PROVIDER_FAILED` from generic, bulletsms and bitmoro;
+     - `DESTINATION_NOT_SUPPORTED`, `BAD_CONFIG`, `ADAPTER_UNKNOWN`.
+   - The NP destination check (`977` + 10 digits starting with 9) runs before anything is sent. A non-NP
+     destination fails over without a request.
+5. **NODLR.** Adapters whose dlr_mode is `none` (sparrow_v2, swift_smartsms, generic_http) write
+   `dlr_stat = 'NODLR'` together with `SUBMITTED`. Nothing is forwarded to the client, and the message stays
+   `SUBMITTED` without a refund.
+   - The engine has **no** stuck or pending-message sweeper, so nothing can fail these messages. The DLR
+     poller only selects `dlr_stat IS NULL`.
+   - Any future sweeper (engine or api) must skip `dlr_stat = 'NODLR'`.
+   - An unknown-outcome HTTP send is not NODLR: it ends `UNKNOWN`.
+6. **Poll DLR** (aakash_v3, aakash_v4, twozero, nestsms):
+   - **Which messages:** `message_logs` rows on the connection with status `SUBMITTED`, `dlr_stat IS NULL`,
+     created in the last 48 h, and a provider id different from our message id. They are read oldest first in
+     pages of `dlr_poll_batch` (Aakash reads up to 1000 ids and treats `dlr_poll_batch` as report pages),
+     rotating through the backlog.
+   - **One instance per round:** each round takes Redis lock `httpdlr:poll:<connection_id>` (SET NX,
+     TTL 0.9 × interval).
+   - **Aakash** reports only `delivery_at` → `DELIVRD`. It has no failure status, so undelivered Aakash
+     messages stay `SUBMITTED`.
+   - **Twozero:** `delivered` → DELIVRD, `failed` → UNDELIV, `rejected` → REJECTD; `pending` and `sent` are
+     not final.
+   - **Nest SMS / MessengerNepal:** `delivered`, `failed`, `cancelled` → REJECTD, `unknown` → UNKNOWN; other
+     statuses are not final.
+   - **Bitmoro:** `sent` → DELIVRD, because its SDK has no delivered status.
+   - Results go through the same aggregation, CDR update and `q:dlr-out` client forwarding (webhook / SMPP
+     deliver_sm) as SMPP receipts. Provider ids match exactly, without the SMPP hex/decimal variants. The
+     `message_logs.smsc_msg_ids` fallback still applies.
+7. **`POST|GET /internal/v1/provider-dlr/:dlr_token`:**
+   - **Body:** the api's forward `{method, query, headers, body_base64}`. Header names are lowercased by the
+     engine too. A request with an empty body is read as the provider's own call: its query string and
+     headers.
+   - **Responses:**
+     - `{"accepted": n}`, where n = receipts with a final status that matched a message. Intermediate statuses
+       and unknown ids count 0.
+     - `404 NOT_FOUND` for an unknown token.
+     - `403 FORBIDDEN` when messengernepal's `X-Msngr-Signature` does not verify. The signature is checked only
+       when `webhook_secret` is set.
+     - `400 INVALID_REQUEST` for an unreadable callback.
+   - Callbacks are accepted for disabled connections too.
+   - Each receipt may wait up to 3 s for a dlrmap entry that is still being written (callback racing the send
+     response).
+   - bulletsms and bitmoro payloads are undocumented. They are parsed best effort from JSON (object, array or
+     `data[]`), a form body or the query string, with the id taken from
+     `messageId|message_id|msgId|id|data.*` and the status from `status|deliveryStatus|state`. No signature
+     is checked.
+8. **`POST /internal/v1/connections/:id/test`:**
+   - **Body:** `{to, text, from?}`. `from` is optional and is the message's sender; adapters still prefer their
+     `sender` setting. For NP adapters, `to` may be the local 10-digit number; otherwise it must be E.164
+     digits.
+   - **Errors:** `404` for an unknown connection and `400` for missing to/text. Everything else is 200 with
+     `ok:false` and `error`, for example `test send is HTTP-only` for SMPP, credentials not decryptable,
+     destination not served, or an unknown outcome.
+   - **What it does:** one attempt, with no retry, failover, billing, CDR, limiter or concurrency slot.
+   - **Masking:** request url and body, `response_body` (first 4 KB) and `error` have every secret credential
+     value masked as `***`, including its URL-, JSON- and base64-encoded forms. Authorization headers are never
+     echoed. Transport errors never contain the request URL.
+9. **`GET /internal/v1/connections/:id/balance`:**
+   - **Unsupported** (SMPP or no balance API): `{supported:false, balance:null, raw:"", error:null}`.
+   - **Errors:** `404` for an unknown connection. Provider errors are reported in `error`, with the masked `raw`
+     body (first 1 KB).
+   - **Endpoints:**
+     - Sparrow `credits_available`;
+     - Aakash v3 `POST /v1/credit`;
+     - Aakash v4 `GET /v4/available-credit`;
+     - Twozero `data.credits`;
+     - Nest `data.balance` (or `balance`).
+10. **New optional engine env `PUBLIC_API_BASE_URL`** (same name as the api, http(s) URL). When it is set,
+    adapters that take a per-request callback (bitmoro `callbackUrl`) receive
+    `<base>/v1/provider-dlr/<dlr_token>`. Deployments must pass it to the engine container for that; nothing
+    else depends on it.
+11. **Outbound requests** have a 10 s timeout, keep-alive pooling and `User-Agent: smsgw/1.0`. Redirects are
+    not followed: a 3xx counts as a retryable failure. No private-IP guard applies. generic_http URLs must be
+    http(s) (`BAD_CONFIG` otherwise).

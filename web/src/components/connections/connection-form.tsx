@@ -83,10 +83,10 @@ const DEFAULTS: Values = {
 function toValues(c: Connection): Values {
   return {
     name: c.name,
-    host: c.host,
-    port: c.port,
+    host: c.host ?? "",
+    port: c.port ?? 2775,
     use_tls: c.use_tls,
-    system_id: c.system_id,
+    system_id: c.system_id ?? "",
     password: "",
     system_type: c.system_type,
     bind_type: c.bind_type,

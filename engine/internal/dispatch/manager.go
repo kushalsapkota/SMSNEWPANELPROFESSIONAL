@@ -52,6 +52,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"smsgw/engine/internal/cdr"
+	"smsgw/engine/internal/httpadapter"
 	"smsgw/engine/internal/metrics"
 	"smsgw/engine/internal/pipeline"
 	"smsgw/engine/internal/routing"
@@ -118,6 +119,26 @@ type Options struct {
 	// biller, Redis and the CDR sink.
 	Refunder *pipeline.Refunder
 
+	// HTTP connections. HTTPTransport performs provider requests (default
+	// httpadapter.NewHTTPTransport). A transient provider failure is
+	// retried HTTPRetries times in total (default 3) on the same
+	// connection, waiting HTTPRetryBackoff (default 500ms, doubling, max 5s,
+	// or the provider's Retry-After up to 10s) within ThrottleRetry.
+	HTTPTransport    httpadapter.Transport
+	HTTPRetries      int
+	HTTPRetryBackoff time.Duration
+	// Receipts applies provider delivery statuses (poll / callback DLRs);
+	// Pending lists messages to poll (default DBPending(db) when db is set).
+	// PollTick is how often due pollers are checked (default 5s);
+	// PollInterval overrides every connection's dlr_poll_interval_s (tests).
+	Receipts     ReceiptSink
+	Pending      PendingFunc
+	PollTick     time.Duration
+	PollInterval time.Duration
+	// PublicBaseURL (PUBLIC_API_BASE_URL) builds the provider DLR callback
+	// URL for adapters that take one per request ("" = not sent).
+	PublicBaseURL string
+
 	OnDeliver DeliverFunc                         // upstream deliver_sm (receipts)
 	TLSConfig func(*store.Connection) *tls.Config // nil: verify against the host name
 	Logger    *slog.Logger
@@ -138,6 +159,7 @@ type Manager struct {
 
 	mu      sync.RWMutex
 	conns   map[string]*upConn
+	https   map[string]*httpConn   // HTTP connections
 	queues  map[string]*routeQueue // by stream key
 	backlog map[string]int64       // route id -> XLEN
 
@@ -207,6 +229,21 @@ func New(src ConfigSource, rdb redis.UniversalClient, biller pipeline.Biller, db
 	if o.ThrottleBackoff <= 0 {
 		o.ThrottleBackoff = 200 * time.Millisecond
 	}
+	if o.HTTPTransport == nil {
+		o.HTTPTransport = httpadapter.NewHTTPTransport(nil)
+	}
+	if o.HTTPRetries <= 0 {
+		o.HTTPRetries = 3
+	}
+	if o.HTTPRetryBackoff <= 0 {
+		o.HTTPRetryBackoff = 500 * time.Millisecond
+	}
+	if o.PollTick <= 0 {
+		o.PollTick = 5 * time.Second
+	}
+	if o.Pending == nil && db != nil {
+		o.Pending = DBPending(db)
+	}
 	if o.Logger == nil {
 		o.Logger = slog.Default()
 	}
@@ -219,7 +256,7 @@ func New(src ConfigSource, rdb redis.UniversalClient, biller pipeline.Biller, db
 	m := &Manager{
 		src: src, rdb: rdb, biller: biller, db: db, sink: sink, fin: fin, opts: o,
 		log: o.Logger.With("component", "dispatch"), m: o.Metrics,
-		conns: map[string]*upConn{}, queues: map[string]*routeQueue{}, backlog: map[string]int64{},
+		conns: map[string]*upConn{}, https: map[string]*httpConn{}, queues: map[string]*routeQueue{}, backlog: map[string]int64{},
 		inproc: map[string]map[string]struct{}{}, quit: make(chan struct{}),
 	}
 	m.workCtx, m.workCancel = context.WithCancel(context.Background())
@@ -241,8 +278,9 @@ func (m *Manager) Run(ctx context.Context) {
 	var bg sync.WaitGroup
 	readCtx, stopRead := context.WithCancel(ctx)
 	defer stopRead()
-	bg.Add(4)
+	bg.Add(5)
 	go func() { defer bg.Done(); m.watchConfig(readCtx, diffs) }()
+	go func() { defer bg.Done(); m.pollLoop(readCtx) }()
 	go func() { defer bg.Done(); m.readLoop(readCtx) }()
 	go func() { defer bg.Done(); m.claimLoop(readCtx) }()
 	go func() { defer bg.Done(); m.backlogLoop(readCtx) }()
@@ -286,9 +324,12 @@ func (m *Manager) conn(id string) *upConn {
 
 // reconcile makes the running connections match snap (startup / full resync).
 func (m *Manager) reconcile(snap *store.Snapshot) {
+	m.reconcileHTTP(snap)
 	want := map[string]*store.Connection{}
 	for _, c := range snap.Connections() {
-		want[c.ID] = c
+		if !c.IsHTTP() {
+			want[c.ID] = c
+		}
 	}
 	m.mu.Lock()
 	var stale []*upConn
@@ -357,8 +398,8 @@ func (m *Manager) watchConfig(ctx context.Context, diffs <-chan store.ConnDiff) 
 			}
 			for _, id := range append(append([]string(nil), d.Added...), d.Updated...) {
 				c := d.New.Connection(id)
-				if c == nil {
-					continue
+				if c == nil || c.IsHTTP() {
+					continue // HTTP connections: applied by reconcile, nothing to bind
 				}
 				if u := m.conn(id); u != nil && u.cfg.SessionConfigEqual(c) {
 					// Only per-message fields or max_tps changed: no rebind.
@@ -716,6 +757,7 @@ type attemptResult struct {
 	errCode     string
 	unknownCode string
 	abort       bool // shutdown before anything was written: leave pending
+	noDLR       bool // HTTP adapter without delivery reports (dlr_stat NODLR)
 }
 
 func (r *attemptResult) accepted() int { return r.pdus - len(r.failed) - len(r.unknown) }
@@ -769,6 +811,9 @@ func (m *Manager) handle(job *pipeline.DispatchJob) bool {
 				if tried[c.ID] {
 					return false
 				}
+				if c.IsHTTP() {
+					return m.httpUsable(c)
+				}
 				u := m.conn(c.ID)
 				return u != nil && u.canTransmit()
 			}, nil)
@@ -782,11 +827,20 @@ func (m *Manager) handle(job *pipeline.DispatchJob) bool {
 				m.log.Info("failing over", "message_id", job.ID, "to_connection", c.ID, "previous_error", lastErr)
 			}
 			attempts++
-			u := m.conn(c.ID)
-			if u == nil {
-				continue
+			var r attemptResult
+			if c.IsHTTP() {
+				h := m.httpConn(c.ID)
+				if h == nil {
+					continue
+				}
+				r = m.attemptHTTP(ctx, job, c, h)
+			} else {
+				u := m.conn(c.ID)
+				if u == nil {
+					continue
+				}
+				r = m.attempt(ctx, job, c, u)
 			}
-			r := m.attempt(ctx, job, c, u)
 			if r.abort {
 				return false
 			}
@@ -990,6 +1044,11 @@ func (m *Manager) succeed(job *pipeline.DispatchJob, c *store.Connection, r atte
 	if len(r.unknown) > 0 {
 		code := r.unknownCode
 		upd.ErrorCode = &code
+	} else if r.noDLR && len(r.failed) == 0 {
+		// No delivery report will ever come: SUBMITTED is final for this
+		// message (never failed / refunded by anything later).
+		stat := NoDLRStat
+		upd.DLRStat = &stat
 	}
 	switch {
 	case len(r.failed) > 0:
@@ -1129,6 +1188,14 @@ func (m *Manager) Status() []ConnStatus {
 	sort.Slice(conns, func(i, j int) bool { return conns[i].Name < conns[j].Name })
 	out := make([]ConnStatus, 0, len(conns))
 	for _, c := range conns {
+		if c.IsHTTP() {
+			h := m.httpConn(c.ID)
+			if h == nil {
+				h = newHTTPConn(c)
+			}
+			out = append(out, h.status(c, connBacklog[c.ID]))
+			continue
+		}
 		u := m.conn(c.ID)
 		if u == nil {
 			u = &upConn{id: c.ID, cfg: c, meter: metrics.NewRateMeter(nil)}
@@ -1150,14 +1217,15 @@ func (m *Manager) QueueDepth() int64 {
 	return n
 }
 
-// ConnectionsUp returns (connections with a bound session, enabled connections).
+// ConnectionsUp returns (connections with a bound session or a READY HTTP
+// connection, enabled connections).
 func (m *Manager) ConnectionsUp() (up, total int) {
 	for _, s := range m.Status() {
 		if !s.Enabled {
 			continue
 		}
 		total++
-		if s.State == "BOUND" {
+		if s.State == "BOUND" || s.State == "READY" {
 			up++
 		}
 	}

@@ -25,6 +25,7 @@ import (
 
 	"smsgw/engine/internal/billing"
 	"smsgw/engine/internal/dispatch"
+	"smsgw/engine/internal/httpadapter"
 	"smsgw/engine/internal/pipeline"
 	"smsgw/engine/internal/policy"
 	"smsgw/engine/internal/smpp/server"
@@ -42,6 +43,14 @@ type Connections interface {
 	Status() []dispatch.ConnStatus
 	QueueDepth() int64
 	ConnectionsUp() (up, total int)
+}
+
+// HTTPConnections serves the HTTP upstream connection endpoints
+// (dispatch.Manager).
+type HTTPConnections interface {
+	TestSend(ctx context.Context, id, to, text, from string) (*dispatch.TestResult, error)
+	ProviderBalance(ctx context.Context, id string) (*dispatch.BalanceResult, error)
+	ProviderDLR(ctx context.Context, dlrToken string, cb *httpadapter.Callback) (int, error)
 }
 
 // SMPPServer is the client-facing SMPP server.
@@ -78,6 +87,7 @@ type Deps struct {
 	Token       string
 	Pipeline    Submitter
 	Connections Connections
+	HTTPConns   HTTPConnections
 	SMPP        SMPPServer
 	Balances    Balances
 	Store       Snapshotter
@@ -116,6 +126,11 @@ func New(d Deps) *API {
 	a.mux.HandleFunc("POST /internal/v1/submit/batch", a.submitBatch)
 	a.mux.HandleFunc("POST /internal/v1/template/preview", a.preview)
 	a.mux.HandleFunc("GET /internal/v1/connections/status", a.connStatus)
+	a.mux.HandleFunc("GET /internal/v1/adapters", a.adapters)
+	a.mux.HandleFunc("POST /internal/v1/connections/{id}/test", a.testSend)
+	a.mux.HandleFunc("GET /internal/v1/connections/{id}/balance", a.providerBalance)
+	a.mux.HandleFunc("POST /internal/v1/provider-dlr/{token}", a.providerDLR)
+	a.mux.HandleFunc("GET /internal/v1/provider-dlr/{token}", a.providerDLR)
 	a.mux.HandleFunc("GET /internal/v1/smpp/sessions", a.sessions)
 	a.mux.HandleFunc("POST /internal/v1/smpp/sessions/kick", a.kick)
 	a.mux.HandleFunc("POST /internal/v1/config/reload", a.reload)

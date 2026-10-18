@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/netip"
 	"regexp"
@@ -106,10 +107,13 @@ func loadOrgs(ctx context.Context, q querier, d *Data, _ *crypto.Cipher) error {
 
 func loadConnections(ctx context.Context, q querier, d *Data, c *crypto.Cipher) error {
 	rows, err := q.Query(ctx, `
-		SELECT id::text, name, host, port, use_tls, system_id, password_enc, system_type,
+		SELECT id::text, name, coalesce(host, ''), coalesce(port, 0), use_tls, coalesce(system_id, ''),
+		       coalesce(password_enc, ''), system_type,
 		       bind_type::text, sessions, max_tps, window_size, enquire_link_interval_s,
 		       reconnect_min_s, reconnect_max_s, submit_timeout_ms, request_dlr, multipart_mode,
-		       default_data_coding, enabled, coalesce(notes, ''), updated_at
+		       default_data_coding, enabled, coalesce(notes, ''), updated_at,
+		       kind, coalesce(adapter, ''), coalesce(http_credentials_enc, ''), http_settings::text,
+		       coalesce(dlr_token, '')
 		  FROM upstream_connections`)
 	if err != nil {
 		return err
@@ -117,19 +121,21 @@ func loadConnections(ctx context.Context, q querier, d *Data, c *crypto.Cipher) 
 	defer rows.Close()
 	for rows.Next() {
 		x := &Connection{}
-		var enc string
+		var enc, credEnc string
 		var enq, rmin, rmax, subMS int
 		if err := rows.Scan(&x.ID, &x.Name, &x.Host, &x.Port, &x.UseTLS, &x.SystemID, &enc,
 			&x.SystemType, &x.BindType, &x.Sessions, &x.MaxTPS, &x.WindowSize, &enq, &rmin, &rmax,
 			&subMS, &x.RequestDLR, &x.MultipartMode, &x.DefaultDataCoding, &x.Enabled, &x.Notes,
-			&x.UpdatedAt); err != nil {
+			&x.UpdatedAt, &x.Kind, &x.Adapter, &credEnc, &x.HTTPSettingsRaw, &x.DLRToken); err != nil {
 			return err
 		}
 		x.EnquireLinkInterval = time.Duration(enq) * time.Second
 		x.ReconnectMin = time.Duration(rmin) * time.Second
 		x.ReconnectMax = time.Duration(rmax) * time.Second
 		x.SubmitTimeout = time.Duration(subMS) * time.Millisecond
-		if c == nil {
+		if x.IsHTTP() {
+			decodeHTTP(x, credEnc, c)
+		} else if c == nil {
 			x.PasswordErr = fmt.Errorf("no APP_ENC_KEY configured")
 		} else if pw, err := c.DecryptString(enc); err != nil {
 			x.PasswordErr = err
@@ -139,6 +145,44 @@ func loadConnections(ctx context.Context, q querier, d *Data, c *crypto.Cipher) 
 		d.Connections = append(d.Connections, x)
 	}
 	return rows.Err()
+}
+
+// decodeHTTP fills the HTTP fields of x: settings (a JSON object; anything
+// else is ignored with an empty map) and the decrypted credentials (a JSON
+// object of key -> value; non-string values are kept in their JSON text).
+// A credentials problem is recorded in PasswordErr, which makes the
+// connection unusable, exactly like an undecryptable SMPP password.
+func decodeHTTP(x *Connection, credEnc string, c *crypto.Cipher) {
+	x.HTTPSettings = map[string]any{}
+	if x.HTTPSettingsRaw != "" {
+		var m map[string]any
+		if json.Unmarshal([]byte(x.HTTPSettingsRaw), &m) == nil && m != nil {
+			x.HTTPSettings = m
+		}
+	}
+	x.HTTPCredentials = map[string]string{}
+	if c == nil {
+		x.PasswordErr = fmt.Errorf("no APP_ENC_KEY configured")
+		return
+	}
+	plain, err := c.DecryptString(credEnc)
+	if err != nil {
+		x.PasswordErr = fmt.Errorf("http credentials: %w", err)
+		return
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(plain), &raw); err != nil {
+		x.PasswordErr = fmt.Errorf("http credentials: not a JSON object")
+		return
+	}
+	for k, v := range raw {
+		var s string
+		if json.Unmarshal(v, &s) == nil {
+			x.HTTPCredentials[k] = s
+		} else if string(v) != "null" {
+			x.HTTPCredentials[k] = string(v)
+		}
+	}
 }
 
 // loadRates keeps, per (connection, prefix), the latest row already in

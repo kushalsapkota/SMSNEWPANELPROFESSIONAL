@@ -52,7 +52,7 @@ describe('POST /api/routes/quick + GET /api/routes/:id/status', () => {
     expect(JSON.stringify(res.body)).not.toMatch(/S3cr3t|password_enc|v1:/);
 
     const row = await ctx.db.selectFrom('upstream_connections').select('password_enc').where('id', '=', c.connection_id).executeTakeFirstOrThrow();
-    expect(new CryptoService(loadConfig()).decrypt(row.password_enc)).toBe('S3cr3t!');
+    expect(new CryptoService(loadConfig()).decrypt(row.password_enc as string)).toBe('S3cr3t!');
     const rates = await ctx.db.selectFrom('upstream_rates').select(['prefix', 'cost_micros']).where('connection_id', '=', c.connection_id).execute();
     expect(rates).toEqual([{ prefix: '', cost_micros: 2500 }]);
     const links = await ctx.db.selectFrom('route_connections').selectAll().where('route_id', '=', res.body.id).execute();
@@ -137,7 +137,9 @@ describe('POST /api/routes/quick + GET /api/routes/:id/status', () => {
       expect(h.body.details.issues.map((i: { path: string }) => i.path)).toEqual(['connections.0.password']);
     }
     const http = await post({ type: 'HTTP', url: 'https://x' });
-    expect(http.body.details.issues[0]).toMatchObject({ path: 'connections.0.type', message: 'HTTP API connections are not supported yet' });
+    // HTTP rows are supported now (http-connections.e2e-spec.ts); this one lacks an adapter and has an unknown field.
+    expect(http.status).toBe(400);
+    expect(http.body.details.issues.map((i: { path: string }) => i.path)).toEqual(expect.arrayContaining(['connections.0.adapter']));
     const none = await as(ctx, admin).post('/api/routes/quick', { name: uniq('v'), connections: [] });
     expect(none.status).toBe(400);
     const extra = await post(smpp({ password_enc: 'x' }));

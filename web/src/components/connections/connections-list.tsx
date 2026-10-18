@@ -20,9 +20,12 @@ import { BoolBadge } from "@/components/shared/status-badge";
 import { useApiMutation } from "@/hooks/use-api-mutation";
 import { useTableState } from "@/hooks/use-table-state";
 import { api, qk } from "@/lib/api";
-import type { Connection, CreateConnectionRequest } from "@/lib/api/types";
+import type { Connection, CreateConnectionRequest, CreateHttpConnectionRequest } from "@/lib/api/types";
 import { formatNumber } from "@/lib/format";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ConnectionForm } from "./connection-form";
+import { AdapterLabel } from "./http/http-connection-fields";
+import { HttpConnectionForm, useAdapters } from "./http/http-connection-dialog";
 
 export function ConnectionsList() {
   const router = useRouter();
@@ -33,8 +36,10 @@ export function ConnectionsList() {
     placeholderData: keepPreviousData,
   });
   const [open, setOpen] = useState(false);
+  const [newKind, setNewKind] = useState<"SMPP" | "HTTP">("SMPP");
+  const adapters = useAdapters();
   const create = useApiMutation({
-    mutationFn: (body: CreateConnectionRequest) => api.connections.create(body),
+    mutationFn: (body: CreateConnectionRequest | CreateHttpConnectionRequest) => api.connections.create(body),
     success: (c) => `Connection “${c.name}” created`,
     invalidate: [qk.connections.all, qk.dashboard],
     onSuccess: (c) => {
@@ -55,17 +60,27 @@ export function ConnectionsList() {
       ),
     },
     {
+      id: "kind",
+      header: "Type",
+      cell: (c) => (c.kind === "HTTP" ? <AdapterLabel adapters={adapters.data?.adapters} id={c.adapter} /> : <span className="text-sm">SMPP</span>),
+    },
+    {
       id: "host",
       header: "Endpoint",
-      cell: (c) => (
-        <span className="inline-flex items-center gap-1 font-mono text-sm">
-          {c.use_tls ? <Lock className="h-3 w-3" aria-label="TLS" /> : null}
-          {c.host}:{c.port}
-        </span>
-      ),
+      hideOnMobile: true,
+      cell: (c) =>
+        c.kind === "HTTP" ? (
+          <span className="text-sm text-muted-foreground">
+            {c.credentials_set.length ? `Credentials: ${c.credentials_set.join(", ")}` : "No credentials saved"}
+          </span>
+        ) : (
+          <span className="inline-flex items-center gap-1 font-mono text-sm">
+            {c.use_tls ? <Lock className="h-3 w-3" aria-label="TLS" /> : null}
+            {c.host}:{c.port} · <code>{c.system_id}</code>
+          </span>
+        ),
     },
-    { id: "system_id", header: "System ID", hideOnMobile: true, cell: (c) => <code className="text-sm">{c.system_id}</code> },
-    { id: "bind_type", header: "Bind", hideOnMobile: true, cell: (c) => `${c.bind_type} × ${c.sessions}` },
+    { id: "bind_type", header: "Bind", hideOnMobile: true, cell: (c) => (c.kind === "HTTP" ? "—" : `${c.bind_type} × ${c.sessions}`) },
     { id: "max_tps", header: "Max TPS", align: "right", hideOnMobile: true, cell: (c) => formatNumber(c.max_tps) },
     { id: "enabled", header: "Status", cell: (c) => <BoolBadge value={c.enabled} /> },
   ];
@@ -74,7 +89,7 @@ export function ConnectionsList() {
     <>
       <PageHeader
         title="Connections"
-        description="Upstream SMPP binds to carriers / aggregators. Live state is on the Monitor page."
+        description="Upstream carriers / aggregators over SMPP or a provider HTTP API. Live state is on the Monitor page."
         actions={
           <Dialog open={open} onOpenChange={setOpen}>
             <DialogTrigger asChild>
@@ -87,7 +102,28 @@ export function ConnectionsList() {
                 <DialogTitle>New upstream connection</DialogTitle>
                 <DialogDescription>The engine binds as soon as the connection is saved and enabled.</DialogDescription>
               </DialogHeader>
-              <ConnectionForm pending={create.isPending} onSubmit={(b) => create.mutate(b)} submitLabel="Create connection" />
+              <Tabs value={newKind} onValueChange={(v) => setNewKind(v as "SMPP" | "HTTP")}>
+                <TabsList>
+                  <TabsTrigger value="SMPP">SMPP</TabsTrigger>
+                  <TabsTrigger value="HTTP">HTTP API</TabsTrigger>
+                </TabsList>
+                <TabsContent value="SMPP" className="mt-4">
+                  <ConnectionForm pending={create.isPending} onSubmit={(b) => create.mutate(b)} submitLabel="Create connection" />
+                </TabsContent>
+                <TabsContent value="HTTP" className="mt-4">
+                  {adapters.isError ? (
+                    <p className="text-sm text-destructive">Cannot load the provider list. Check that the engine is running.</p>
+                  ) : (
+                    <HttpConnectionForm
+                      adapters={adapters.data?.adapters ?? []}
+                      pending={create.isPending}
+                      serverError={create.error}
+                      onCreate={(b) => create.mutate(b)}
+                      submitLabel="Create connection"
+                    />
+                  )}
+                </TabsContent>
+              </Tabs>
             </DialogContent>
           </Dialog>
         }
@@ -104,10 +140,10 @@ export function ConnectionsList() {
         state={t.state}
         onStateChange={t.setState}
         onRowClick={(c) => router.push(`/connections/${c.id}`)}
-        empty={{ title: "No connections", description: "Add an upstream SMPP connection to start routing traffic." }}
+        empty={{ title: "No connections", description: "Add an upstream SMPP or HTTP API connection to start routing traffic." }}
         toolbar={
           <>
-            <SearchFilter value={t.filters.q} onChange={(v) => t.setFilter("q", v)} placeholder="Search name or host…" />
+            <SearchFilter value={t.filters.q} onChange={(v) => t.setFilter("q", v)} placeholder="Search name, host or provider…" />
             <ResetFiltersButton visible={!!t.filters.q} onClick={t.resetFilters} />
           </>
         }

@@ -110,10 +110,18 @@ type Rate struct {
 	EffectiveFrom time.Time
 }
 
-// Connection is an upstream_connections row with the decrypted password.
+// Upstream connection kinds (upstream_connections.kind).
+const (
+	KindSMPP = "SMPP"
+	KindHTTP = "HTTP"
+)
+
+// Connection is an upstream_connections row with the decrypted password
+// (SMPP) or decrypted credentials (HTTP).
 type Connection struct {
 	ID                  string
 	Name                string
+	Kind                string // SMPP | HTTP ("" is treated as SMPP)
 	Host                string
 	Port                int
 	UseTLS              bool
@@ -136,6 +144,14 @@ type Connection struct {
 	Notes               string
 	UpdatedAt           time.Time
 
+	// HTTP connections only (kind = 'HTTP'). PasswordErr reports a
+	// credentials decryption / parse failure for them (not usable).
+	Adapter         string            // adapter id, e.g. "aakash_v3"
+	HTTPCredentials map[string]string // decrypted http_credentials_enc
+	HTTPSettings    map[string]any    // http_settings (non-secret)
+	HTTPSettingsRaw string            // http_settings as loaded (for change detection)
+	DLRToken        string            // provider DLR callback token ("" = none)
+
 	// Rates sorted by prefix length descending (longest-prefix first).
 	Rates []*Rate
 }
@@ -150,7 +166,7 @@ func (c *Connection) SessionConfigEqual(o *Connection) bool {
 	if c == nil || o == nil {
 		return c == o
 	}
-	return c.Host == o.Host && c.Port == o.Port && c.UseTLS == o.UseTLS &&
+	return c.IsHTTP() == o.IsHTTP() && c.Host == o.Host && c.Port == o.Port && c.UseTLS == o.UseTLS &&
 		c.SystemID == o.SystemID && c.Password == o.Password && (c.PasswordErr == nil) == (o.PasswordErr == nil) &&
 		c.SystemType == o.SystemType && c.BindType == o.BindType && c.Sessions == o.Sessions &&
 		c.WindowSize == o.WindowSize && c.EnquireLinkInterval == o.EnquireLinkInterval &&
@@ -169,7 +185,24 @@ func (c *Connection) ConfigEqual(o *Connection) bool {
 		return true
 	}
 	return c.Name == o.Name && c.MaxTPS == o.MaxTPS && c.RequestDLR == o.RequestDLR &&
-		c.MultipartMode == o.MultipartMode && c.DefaultDataCoding == o.DefaultDataCoding
+		c.MultipartMode == o.MultipartMode && c.DefaultDataCoding == o.DefaultDataCoding &&
+		c.Adapter == o.Adapter && c.HTTPSettingsRaw == o.HTTPSettingsRaw && c.DLRToken == o.DLRToken &&
+		equalStringMaps(c.HTTPCredentials, o.HTTPCredentials)
+}
+
+// IsHTTP reports whether this is an HTTP API connection (kind = 'HTTP').
+func (c *Connection) IsHTTP() bool { return c != nil && c.Kind == KindHTTP }
+
+func equalStringMaps(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if w, ok := b[k]; !ok || w != v {
+			return false
+		}
+	}
+	return true
 }
 
 // RouteConnection is a route_connections row joined to its connection

@@ -64,14 +64,15 @@ function sessionDot(state: string) {
 function ConnectionTile({ c }: { c: ConnectionStatus }) {
   const load = c.tps_limit > 0 ? Math.min(100, (c.tps_current / c.tps_limit) * 100) : 0;
   const bound = c.sessions.filter((s) => s.state.startsWith("BOUND")).length;
-  const lastError = c.sessions.find((s) => s.last_error)?.last_error;
+  const isHttp = c.kind === "HTTP";
+  const lastError = isHttp ? c.last_error : c.sessions.find((s) => s.last_error)?.last_error;
   return (
     <Card className={cn(!c.enabled && "opacity-70")}>
       <CardHeader className="flex flex-row items-start justify-between gap-2 space-y-0 pb-3">
         <div className="min-w-0">
           <CardTitle className="truncate text-base">{c.name}</CardTitle>
           <CardDescription>
-            {bound}/{c.sessions.length} sessions bound
+            {isHttp ? `HTTP API${c.adapter ? ` · ${c.adapter}` : ""}` : `${bound}/${c.sessions.length} sessions bound`}
           </CardDescription>
         </div>
         <StatusBadge status={c.state} />
@@ -96,7 +97,11 @@ function ConnectionTile({ c }: { c: ConnectionStatus }) {
               </TooltipContent>
             </Tooltip>
           ))}
-          {c.sessions.length === 0 ? <span className="text-xs text-muted-foreground">No sessions</span> : null}
+          {c.sessions.length === 0 ? (
+            <span className="text-xs text-muted-foreground">
+              {isHttp ? (c.last_success_at ? `Last success ${formatRelative(c.last_success_at)}` : "No calls yet") : "No sessions"}
+            </span>
+          ) : null}
         </div>
         <div className="space-y-1">
           <div className="flex justify-between text-xs">
@@ -230,7 +235,7 @@ export function MonitorPage() {
   const stamp = admin ? (live.data ? live.dataUpdatedAt : conns.dataUpdatedAt) : sessions.dataUpdatedAt;
   const samples = useSamples(sample, stamp);
 
-  const up = live.data?.connections_up ?? connList.filter((c) => c.state === "BOUND").length;
+  const up = live.data?.connections_up ?? connList.filter((c) => c.state === "BOUND" || c.state === "READY").length;
   const total = live.data?.connections_total ?? connList.length;
   const series = admin
     ? [

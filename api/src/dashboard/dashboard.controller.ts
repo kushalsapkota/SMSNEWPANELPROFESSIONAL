@@ -9,6 +9,7 @@ import { currentAuth } from '../common/context';
 import { NoRequestTransaction } from '../common/decorators';
 import { DbService } from '../db/db.service';
 import { EngineClient } from '../engine/engine-client.service';
+import { isConnectionUp } from '../engine/engine.types';
 
 /**
  * CONTRACTS §10 GET /api/dashboard (role-appropriate):
@@ -77,7 +78,7 @@ export class DashboardService {
       }));
       const up = await this.engine
         .connectionsStatus()
-        .then((conns) => conns.filter((x) => x.state === 'BOUND').length)
+        .then((conns) => conns.filter(isConnectionUp).length)
         .catch(() => null);
       return { ...c, connections_up: up };
     }

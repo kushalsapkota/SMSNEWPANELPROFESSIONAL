@@ -22,6 +22,8 @@ export const qk = {
     list: (params: object) => ["connections", "list", params] as const,
     detail: (id: string) => ["connections", "detail", id] as const,
     rates: (id: string) => ["connections", "rates", id] as const,
+    adapters: ["connections", "adapters"] as const,
+    balance: (id: string) => ["connections", "balance", id] as const,
   },
   routes: {
     all: ["routes"] as const,

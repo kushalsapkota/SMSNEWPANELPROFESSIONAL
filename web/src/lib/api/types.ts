@@ -44,7 +44,9 @@ export type CampaignStatus =
   | "CANCELLED"
   | "FAILED";
 export type MultipartMode = "UDH" | "SAR" | "PAYLOAD";
-export type ConnectionState = "BOUND" | "CONNECTING" | "DOWN" | "DISABLED";
+/** SMPP: BOUND | CONNECTING | DOWN; HTTP: READY | ERROR; both: DISABLED. */
+export type ConnectionState = "BOUND" | "CONNECTING" | "DOWN" | "DISABLED" | "READY" | "ERROR";
+export type ConnectionKind = "SMPP" | "HTTP";
 export type SessionState = "BOUND_TRX" | "CONNECTING" | "DOWN";
 
 /** CONTRACTS §4 */
@@ -416,10 +418,15 @@ export interface JwtClaims {
 export interface Connection {
   id: Uuid;
   name: string;
-  host: string;
-  port: number;
+  /** Rows created before HTTP connections omit nothing: the api always sends kind. */
+  kind: ConnectionKind;
+  /** HTTP only: adapter id from GET /api/connections/adapters. */
+  adapter: string | null;
+  /** SMPP only (null for HTTP). */
+  host: string | null;
+  port: number | null;
   use_tls: boolean;
-  system_id: string;
+  system_id: string | null;
   system_type: string;
   bind_type: BindType;
   sessions: number;
@@ -436,6 +443,13 @@ export interface Connection {
   notes: string | null;
   /** password_enc is never returned */
   has_password?: boolean;
+  /** HTTP: names of the stored credentials (values are write-only). [] for SMPP. */
+  credentials_set: string[];
+  /** HTTP: non-secret adapter settings. {} for SMPP. */
+  settings: Record<string, unknown>;
+  /** HTTP: provider DLR callback path (always) and absolute URL (null when the api has no PUBLIC_API_BASE_URL). */
+  dlr_callback_path: string | null;
+  dlr_callback_url: string | null;
   created_at: IsoDateTime;
   updated_at: IsoDateTime;
 }
@@ -469,8 +483,96 @@ export interface CreateConnectionRequest {
   notes?: string | null;
 }
 
-/** PATCH body; omit `password` to keep the current one. */
-export type UpdateConnectionRequest = Partial<CreateConnectionRequest>;
+/** POST body for an HTTP API connection (validated against the adapter catalogue). */
+export interface CreateHttpConnectionRequest {
+  kind: "HTTP";
+  name: string;
+  adapter: string;
+  credentials: Record<string, string>;
+  settings?: Record<string, unknown>;
+  max_tps?: number;
+  enabled?: boolean;
+  notes?: string | null;
+}
+
+/**
+ * PATCH body; omit `password` to keep the current one. HTTP rows: `credentials` merge
+ * (omitted key = unchanged, "" = clear), `settings` merge (null = back to the default).
+ */
+export type UpdateConnectionRequest = Partial<CreateConnectionRequest> & {
+  adapter?: string;
+  credentials?: Record<string, string>;
+  settings?: Record<string, unknown>;
+};
+
+/* ------------------------------------------------- HTTP adapter catalogue */
+
+export type AdapterConfidence = "VERIFIED" | "LIKELY";
+export type AdapterSettingType = "url" | "string" | "number" | "bool" | "select" | "json";
+export type AdapterDlrMode = "none" | "poll" | "callback";
+
+export interface AdapterCredentialField {
+  key: string;
+  label: string;
+  secret: boolean;
+  required: boolean;
+  placeholder?: string | null;
+  help?: string | null;
+}
+
+export interface AdapterSettingField {
+  key: string;
+  label: string;
+  type: AdapterSettingType | (string & {});
+  default?: unknown;
+  options?: Array<string | { value: string; label?: string }> | null;
+  required: boolean;
+  help?: string | null;
+  placeholder?: string | null;
+}
+
+export interface Adapter {
+  id: string;
+  name: string;
+  country: string | null;
+  website?: string | null;
+  docs_url?: string | null;
+  confidence: AdapterConfidence | (string & {});
+  credentials: AdapterCredentialField[];
+  settings: AdapterSettingField[];
+  dlr_mode: AdapterDlrMode;
+  supports_balance: boolean;
+  destination_countries: string[] | null;
+  notes?: string | null;
+}
+
+export interface AdaptersResponse {
+  adapters: Adapter[];
+}
+
+/** POST /api/connections/:id/test (engine; secrets masked). */
+export interface ConnectionTestRequest {
+  to: string;
+  text: string;
+}
+
+export interface ConnectionTestResponse {
+  ok: boolean;
+  provider_message_id: string | null;
+  http_status: number | null;
+  request: { method: string; url: string; body: unknown } | null;
+  response_body: string | null;
+  error: string | null;
+  duration_ms: number | null;
+}
+
+/** GET /api/connections/:id/balance */
+export interface ProviderBalanceResponse {
+  supported: boolean;
+  balance: string | null;
+  raw: string | null;
+  error: string | null;
+}
 
 export interface ConnectionRate {
   id?: Uuid;
@@ -487,6 +589,7 @@ export interface ConnectionRateInput {
 export interface ConnectionListParams extends PageParams {
   q?: string;
   enabled?: boolean;
+  kind?: ConnectionKind;
 }
 
 /* -------------------------------------------------------------- routes */
@@ -510,11 +613,11 @@ export interface RouteConnection {
   connection_id: Uuid;
   connection_name?: string;
   connection_enabled?: boolean;
-  /** GET /api/routes/:id adds the upstream endpoint (never the password). */
-  host?: string;
-  port?: number;
+  /** GET /api/routes/:id adds the upstream endpoint (never the password); null for HTTP connections. */
+  host?: string | null;
+  port?: number | null;
   use_tls?: boolean;
-  system_id?: string;
+  system_id?: string | null;
   priority: number;
   weight: number;
   enabled: boolean;
@@ -578,7 +681,20 @@ export interface QuickSmppConnectionInput {
   cost_micros?: number;
 }
 
-export type QuickConnectionInput = QuickExistingConnectionInput | QuickSmppConnectionInput;
+/** New HTTP API connection (adapter + credentials), validated against the catalogue. */
+export interface QuickHttpConnectionInput {
+  type: "HTTP";
+  name?: string;
+  adapter: string;
+  credentials: Record<string, string>;
+  settings?: Record<string, unknown>;
+  max_tps?: number;
+  priority?: number;
+  weight?: number;
+  cost_micros?: number;
+}
+
+export type QuickConnectionInput = QuickExistingConnectionInput | QuickSmppConnectionInput | QuickHttpConnectionInput;
 
 export interface QuickRouteRequest {
   name: string;
@@ -605,10 +721,13 @@ export interface RouteConnectionStatus {
   connection_id: Uuid;
   connection_name: string;
   connection_enabled: boolean;
-  host: string;
-  port: number;
+  /** Absent from apis that predate HTTP connections (= SMPP). */
+  kind?: ConnectionKind;
+  adapter?: string | null;
+  host: string | null;
+  port: number | null;
   use_tls: boolean;
-  system_id: string;
+  system_id: string | null;
   bind_type: BindType;
   priority: number;
   weight: number;
@@ -619,6 +738,12 @@ export interface RouteConnectionStatus {
   sessions_total: number;
   bound_since: IsoDateTime | null;
   last_error: string | null;
+  /** HTTP: when the last call failed / last succeeded. */
+  last_error_at?: IsoDateTime | null;
+  last_success_at?: IsoDateTime | null;
+  /** HTTP: provider DLR callback (url null when the api has no PUBLIC_API_BASE_URL). */
+  dlr_callback_path?: string | null;
+  dlr_callback_url?: string | null;
   tps_limit: number | null;
   tps_current: number | null;
   inflight: number | null;
@@ -1267,6 +1392,11 @@ export interface ConnectionStatus {
   connection_id: Uuid;
   name: string;
   enabled: boolean;
+  kind?: ConnectionKind;
+  adapter?: string | null;
+  last_error?: string | null;
+  last_error_at?: IsoDateTime | null;
+  last_success_at?: IsoDateTime | null;
   state: ConnectionState;
   sessions: ConnectionSessionStatus[];
   tps_limit: number;

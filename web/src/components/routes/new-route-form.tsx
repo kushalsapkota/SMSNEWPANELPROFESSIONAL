@@ -4,8 +4,8 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import { useQuery } from "@tanstack/react-query";
 import { ArrowDown, ArrowUp, ChevronDown, ChevronRight, Plus, Trash2 } from "lucide-react";
 import { useRouter } from "next/navigation";
-import { useState } from "react";
-import { useFieldArray, useForm, useWatch, type Control } from "react-hook-form";
+import { useRef, useState } from "react";
+import { useFieldArray, useForm, useWatch, type Control, type Resolver } from "react-hook-form";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -23,13 +23,15 @@ import {
 import { DEFAULT_PATTERNS, FALLBACK_OPTIONS } from "@/components/templates/template-editor";
 import { TemplatePreview } from "@/components/templates/template-preview";
 import { useApiMutation } from "@/hooks/use-api-mutation";
-import { ApiError, api, qk } from "@/lib/api";
-import type { QuickRouteRequest } from "@/lib/api/types";
+import { ApiError, api, errorMessage, qk } from "@/lib/api";
+import type { Adapter, QuickRouteRequest } from "@/lib/api/types";
+import { HttpConnectionFields } from "@/components/connections/http/http-connection-fields";
+import { useAdapters } from "@/components/connections/http/http-connection-dialog";
 import {
   QUICK_ROUTE_DEFAULTS,
+  makeQuickRouteSchema,
   newConnectionRow,
   priorityLabel,
-  quickRouteSchema,
   serverFieldErrors,
   toQuickRouteRequest,
   type ConnectionKind,
@@ -55,6 +57,8 @@ function ConnectionRowEditor({
   onMove,
   onRemove,
   existingOptions,
+  adapters,
+  adaptersError,
 }: {
   control: Control<QuickRouteValues>;
   index: number;
@@ -62,6 +66,8 @@ function ConnectionRowEditor({
   onMove: (to: number) => void;
   onRemove: () => void;
   existingOptions: Array<{ value: string; label: string }>;
+  adapters: Adapter[];
+  adaptersError: string | null;
 }) {
   const [advanced, setAdvanced] = useState(false);
   const kind = useWatch({ control, name: `connections.${index}.kind` });
@@ -86,9 +92,7 @@ function ConnectionRowEditor({
                 <SelectContent>
                   <SelectItem value="SMPP">SMPP (new)</SelectItem>
                   <SelectItem value="EXISTING">Existing connection</SelectItem>
-                  <SelectItem value="HTTP" disabled>
-                    HTTP API (coming soon)
-                  </SelectItem>
+                  <SelectItem value="HTTP">HTTP API (token)</SelectItem>
                 </SelectContent>
               </Select>
               <FormMessage />
@@ -118,7 +122,14 @@ function ConnectionRowEditor({
           disabled={existingOptions.length === 0}
         />
       ) : kind === "HTTP" ? (
-        <p className="text-sm text-muted-foreground">HTTP API carriers are coming soon. Use SMPP for now.</p>
+        <div className="space-y-4" data-testid="http-row">
+          {adaptersError ? <p className="text-sm text-destructive">Cannot load the provider list: {adaptersError}</p> : null}
+          <HttpConnectionFields control={control} prefix={`${p}.http`} adapters={adapters} />
+          <div className="grid gap-4 sm:grid-cols-2">
+            <NumberField control={control} name={`${p}.max_tps`} label="TPS" min={1} description="Messages per second sent to this provider." />
+            <MoneyField control={control} name={`${p}.cost_micros`} label="Cost per SMS" placeholder="(none)" description="Default rate for all destinations." />
+          </div>
+        </div>
       ) : (
         <>
           <div className="grid gap-4 sm:grid-cols-3">
@@ -172,7 +183,13 @@ function ConnectionRowEditor({
 /** One-step route creation: basics + connections (new SMPP inline or existing) → POST /api/routes/quick. */
 export function NewRouteForm() {
   const router = useRouter();
-  const form = useForm<QuickRouteValues>({ resolver: zodResolver(quickRouteSchema), defaultValues: QUICK_ROUTE_DEFAULTS });
+  const adaptersQ = useAdapters();
+  const adapters = adaptersQ.data?.adapters ?? [];
+  // The schema depends on the (async) catalogue: resolve with the latest one.
+  const adaptersRef = useRef<Adapter[]>(adapters);
+  adaptersRef.current = adapters;
+  const resolver: Resolver<QuickRouteValues> = (values, ctx, opts) => zodResolver(makeQuickRouteSchema(adaptersRef.current))(values, ctx, opts);
+  const form = useForm<QuickRouteValues>({ resolver, defaultValues: QUICK_ROUTE_DEFAULTS });
   const { fields, append, remove, move } = useFieldArray({ control: form.control, name: "connections" });
   const conns = useQuery({
     queryKey: qk.connections.list({ page_size: 200 }),
@@ -180,7 +197,7 @@ export function NewRouteForm() {
   });
   const existingOptions = (conns.data?.items ?? []).map((c) => ({
     value: c.id,
-    label: `${c.name} (${c.host}:${c.port})${c.enabled ? "" : " (disabled)"}`,
+    label: `${c.name} (${c.kind === "HTTP" ? (adapters.find((a) => a.id === c.adapter)?.name ?? c.adapter) : `${c.host}:${c.port}`})${c.enabled ? "" : " (disabled)"}`,
   }));
   const [templateMode, templateBody, defaultBody, fallback] = useWatch({
     control: form.control,
@@ -204,7 +221,7 @@ export function NewRouteForm() {
 
   return (
     <Form {...form}>
-      <form onSubmit={form.handleSubmit((v) => create.mutate(toQuickRouteRequest(v)))} className="space-y-6" noValidate>
+      <form onSubmit={form.handleSubmit((v) => create.mutate(toQuickRouteRequest(v, adapters)))} className="space-y-6" noValidate>
         <Card>
           <CardHeader>
             <CardTitle className="text-base">Route</CardTitle>
@@ -282,6 +299,8 @@ export function NewRouteForm() {
                 onMove={(to) => move(i, to)}
                 onRemove={() => remove(i)}
                 existingOptions={existingOptions}
+                adapters={adapters}
+                adaptersError={adaptersQ.isError ? errorMessage(adaptersQ.error) : null}
               />
             ))}
             {connError ? <p className="text-sm font-medium text-destructive">{connError}</p> : null}

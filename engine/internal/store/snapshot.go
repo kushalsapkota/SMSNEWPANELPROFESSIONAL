@@ -27,6 +27,7 @@ type Snapshot struct {
 	children    map[string][]*Org
 	routes      map[string]*Route
 	connections map[string]*Connection
+	byDLRToken  map[string]*Connection   // HTTP connections by dlr_token
 	assignments map[string][]*Assignment // org -> sorted
 	templates   map[string]map[string]*Template
 	senders     map[string][]*SenderID
@@ -51,6 +52,7 @@ func NewSnapshot(d Data) *Snapshot {
 		children:    make(map[string][]*Org),
 		routes:      make(map[string]*Route, len(d.Routes)),
 		connections: make(map[string]*Connection, len(d.Connections)),
+		byDLRToken:  make(map[string]*Connection),
 		assignments: make(map[string][]*Assignment),
 		templates:   make(map[string]map[string]*Template),
 		senders:     make(map[string][]*SenderID),
@@ -87,6 +89,9 @@ func NewSnapshot(d Data) *Snapshot {
 	for _, c := range d.Connections {
 		c.Rates = nil
 		s.connections[c.ID] = c
+		if c.DLRToken != "" {
+			s.byDLRToken[c.DLRToken] = c
+		}
 		if c.PasswordErr != nil {
 			warn("upstream connection %s (%s): password: %v", c.ID, c.Name, c.PasswordErr)
 		}
@@ -297,6 +302,14 @@ func (s *Snapshot) Routes() []*Route {
 
 // Connection returns the upstream connection or nil.
 func (s *Snapshot) Connection(id string) *Connection { return s.connections[id] }
+
+// ConnectionByDLRToken returns the connection whose dlr_token is token, or nil.
+func (s *Snapshot) ConnectionByDLRToken(token string) *Connection {
+	if token == "" {
+		return nil
+	}
+	return s.byDLRToken[token]
+}
 
 // Connections returns all upstream connections sorted by id.
 func (s *Snapshot) Connections() []*Connection {

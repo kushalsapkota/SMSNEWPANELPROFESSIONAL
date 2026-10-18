@@ -16,7 +16,12 @@ import { useTabParam } from "@/hooks/use-tab-param";
 import { api, qk } from "@/lib/api";
 import type { UpdateConnectionRequest } from "@/lib/api/types";
 import { ConnectionForm } from "./connection-form";
+import { AdapterLabel } from "./http/http-connection-fields";
+import { HttpConnectionForm, useAdapters } from "./http/http-connection-dialog";
+import { DlrCallbackUrl, ProviderBalance, TestSendDialog } from "./http/http-tools";
 import { RatesEditor } from "./rates-editor";
+import { Send } from "lucide-react";
+import { useState } from "react";
 
 const TABS = ["settings", "rates"] as const;
 
@@ -24,6 +29,9 @@ export function ConnectionDetail({ id }: { id: string }) {
   const router = useRouter();
   const [tab, setTab] = useTabParam(TABS, "settings");
   const q = useQuery({ queryKey: qk.connections.detail(id), queryFn: () => api.connections.get(id) });
+  const isHttp = q.data?.kind === "HTTP";
+  const adapters = useAdapters(isHttp);
+  const [testing, setTesting] = useState(false);
   const save = useApiMutation({
     mutationFn: (body: UpdateConnectionRequest) => api.connections.update(id, body),
     success: "Connection saved — the engine will rebind",
@@ -56,12 +64,22 @@ export function ConnectionDetail({ id }: { id: string }) {
         description={
           <span className="flex flex-wrap items-center gap-2">
             <BoolBadge value={c.enabled} />
-            <code className="text-xs">
-              {c.system_id}@{c.host}:{c.port}
-            </code>
+            {c.kind === "HTTP" ? (
+              <AdapterLabel adapters={adapters.data?.adapters} id={c.adapter} />
+            ) : (
+              <code className="text-xs">
+                {c.system_id}@{c.host}:{c.port}
+              </code>
+            )}
           </span>
         }
         actions={
+          <>
+          {c.kind === "HTTP" ? (
+            <Button variant="outline" onClick={() => setTesting(true)}>
+              <Send /> Send test SMS
+            </Button>
+          ) : null}
           <ConfirmDialog
             trigger={
               <Button variant="destructive">
@@ -74,19 +92,51 @@ export function ConnectionDetail({ id }: { id: string }) {
             confirmLabel="Delete connection"
             onConfirm={() => remove.mutateAsync()}
           />
+          </>
         }
       />
+      {c.kind === "HTTP" ? <TestSendDialog connectionId={c.id} name={c.name} open={testing} onOpenChange={setTesting} /> : null}
       <Tabs value={tab} onValueChange={setTab}>
         <TabsList>
           <TabsTrigger value="settings">Settings</TabsTrigger>
           <TabsTrigger value="rates">Rates</TabsTrigger>
         </TabsList>
         <TabsContent value="settings" className="mt-6 space-y-6">
-          <Card>
-            <CardContent className="pt-6">
-              <ConnectionForm connection={c} pending={save.isPending} onSubmit={(b) => save.mutate(b)} submitLabel="Save changes" />
-            </CardContent>
-          </Card>
+          {c.kind === "HTTP" ? (
+            <Card>
+              <CardContent className="space-y-4 pt-6">
+                {(() => {
+                  const adapter = adapters.data?.adapters.find((a) => a.id === c.adapter);
+                  return (
+                    <>
+                      {adapter?.supports_balance ? <ProviderBalance connectionId={c.id} /> : null}
+                      {adapter?.dlr_mode === "callback" ? <DlrCallbackUrl connection={c} /> : null}
+                    </>
+                  );
+                })()}
+                {adapters.isError ? (
+                  <p className="text-sm text-destructive">Cannot load the provider list. Check that the engine is running.</p>
+                ) : adapters.data ? (
+                  <HttpConnectionForm
+                    connection={c}
+                    adapters={adapters.data.adapters}
+                    pending={save.isPending}
+                    serverError={save.error}
+                    onUpdate={(b) => (Object.keys(b).length ? save.mutate(b) : undefined)}
+                    submitLabel="Save changes"
+                  />
+                ) : (
+                  <p className="text-sm text-muted-foreground">Loading…</p>
+                )}
+              </CardContent>
+            </Card>
+          ) : (
+            <Card>
+              <CardContent className="pt-6">
+                <ConnectionForm connection={c} pending={save.isPending} onSubmit={(b) => save.mutate(b)} submitLabel="Save changes" />
+              </CardContent>
+            </Card>
+          )}
           <Card>
             <CardHeader>
               <CardTitle className="text-base">Used by routes</CardTitle>
