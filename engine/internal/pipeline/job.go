@@ -35,19 +35,44 @@ func DLRMapValue(messageID string, part int, createdMS int64) string {
 	return messageID + "|" + strconv.Itoa(part) + "|" + strconv.FormatInt(createdMS, 10)
 }
 
-// ParseDLRMapValue decodes a dlrmap value.
+// DLRMapValueParts encodes a dlrmap value for an SMSC id shared by several
+// parts of one message (SMSCs that return the same message_id for every
+// segment): "<message_id>|<p1>,<p2>,...|<created_at_unix_ms>". With one part
+// it is exactly DLRMapValue.
+func DLRMapValueParts(messageID string, parts []int, createdMS int64) string {
+	ps := make([]string, len(parts))
+	for i, p := range parts {
+		ps[i] = strconv.Itoa(p)
+	}
+	return messageID + "|" + strings.Join(ps, ",") + "|" + strconv.FormatInt(createdMS, 10)
+}
+
+// ParseDLRMapValue decodes a dlrmap value; part is the first part listed.
 func ParseDLRMapValue(v string) (messageID string, part int, createdMS int64, err error) {
+	messageID, parts, createdMS, err := ParseDLRMapParts(v)
+	if err != nil {
+		return "", 0, 0, err
+	}
+	return messageID, parts[0], createdMS, nil
+}
+
+// ParseDLRMapParts decodes a dlrmap value with every part it covers.
+func ParseDLRMapParts(v string) (messageID string, parts []int, createdMS int64, err error) {
 	f := strings.Split(v, "|")
 	if len(f) != 3 || f[0] == "" {
-		return "", 0, 0, fmt.Errorf("pipeline: bad dlrmap value %q", v)
+		return "", nil, 0, fmt.Errorf("pipeline: bad dlrmap value %q", v)
 	}
-	if part, err = strconv.Atoi(f[1]); err != nil || part < 0 {
-		return "", 0, 0, fmt.Errorf("pipeline: bad dlrmap part in %q", v)
+	for _, ps := range strings.Split(f[1], ",") {
+		p, err := strconv.Atoi(ps)
+		if err != nil || p < 0 {
+			return "", nil, 0, fmt.Errorf("pipeline: bad dlrmap part in %q", v)
+		}
+		parts = append(parts, p)
 	}
 	if createdMS, err = strconv.ParseInt(f[2], 10, 64); err != nil {
-		return "", 0, 0, fmt.Errorf("pipeline: bad dlrmap timestamp in %q", v)
+		return "", nil, 0, fmt.Errorf("pipeline: bad dlrmap timestamp in %q", v)
 	}
-	return f[0], part, createdMS, nil
+	return f[0], parts, createdMS, nil
 }
 
 // Message state hash fields (msg:<id>). The first block is CONTRACTS §7;
@@ -71,6 +96,7 @@ const (
 	FPDUs        = "pdus"          // PDUs actually submitted upstream (DLRs expected); defaults to parts
 	FConnection  = "connection_id" // connection used
 	FSubmittedMS = "submitted_ms"  // submit_sm_resp time
+	FSubmitting  = "submitting_ms" // set before the first submit_sm is written (crash recovery: never resend)
 	FDone        = "done"          // "1" once the final status was emitted
 	FStatus      = "status"        // final status once done
 )

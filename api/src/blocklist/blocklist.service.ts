@@ -6,7 +6,7 @@ import { Pagination, offsetOf, page } from '../common/pagination';
 import { likeContains } from '../common/validation';
 import { DbService } from '../db/db.service';
 import { InvalidationService } from '../redis/redis.module';
-import { ScopeService, ScopedOrg } from '../tenancy/scope.service';
+import { ScopeService, ScopedOrg, isParentActor } from '../tenancy/scope.service';
 
 type Kind = 'numbers' | 'keywords';
 const TABLE = { numbers: 'blocked_numbers', keywords: 'blocked_keywords' } as const;
@@ -26,6 +26,12 @@ export class BlocklistService {
 
   private ownerOf(org: ScopedOrg): string | null {
     return org.role === 'SUPER_ADMIN' ? null : org.id;
+  }
+
+  /** The caller's real org (the parent while impersonating): recorded as the row's creator. */
+  private creatorOrg(): string {
+    const auth = currentAuth();
+    return auth.originalOrgId ?? auth.orgId;
   }
 
   async list(kind: Kind, q: Pagination & { org_id?: string; q?: string }) {
@@ -55,7 +61,7 @@ export class BlocklistService {
     return this.db.tenant(async (trx) => {
       const row = await trx
         .insertInto('blocked_numbers')
-        .values({ org_id: this.ownerOf(org), prefix, note: input.note ?? null })
+        .values({ org_id: this.ownerOf(org), prefix, note: input.note ?? null, created_by_org_id: this.creatorOrg() })
         .returningAll()
         .executeTakeFirstOrThrow();
       await this.audit.record({ action: 'blocklist.number_add', entityType: 'blocked_number', entityId: row.id, targetOrgId: row.org_id, after: row });
@@ -69,7 +75,7 @@ export class BlocklistService {
     return this.db.tenant(async (trx) => {
       const row = await trx
         .insertInto('blocked_keywords')
-        .values({ org_id: this.ownerOf(org), pattern: input.pattern, note: input.note ?? null })
+        .values({ org_id: this.ownerOf(org), pattern: input.pattern, note: input.note ?? null, created_by_org_id: this.creatorOrg() })
         .returningAll()
         .executeTakeFirstOrThrow();
       await this.audit.record({ action: 'blocklist.keyword_add', entityType: 'blocked_keyword', entityId: row.id, targetOrgId: row.org_id, after: row });
@@ -78,6 +84,7 @@ export class BlocklistService {
     });
   }
 
+  /** Global rows: admin only. Rows the parent added to an org: only that parent (also while impersonating). */
   async remove(kind: Kind, id: string) {
     const auth = currentAuth();
     return this.db.tenant(async (trx) => {
@@ -89,7 +96,11 @@ export class BlocklistService {
       if (row.org_id === null) {
         if (auth.role !== 'SUPER_ADMIN') throw AppError.forbidden('Global blocklist entries are managed by the admin');
       } else {
-        await this.scope.assertOrgAccess(row.org_id, 'write');
+        const org = await this.scope.assertOrgAccess(row.org_id, 'write');
+        // An entry the parent put on this org is the parent's control: the org can't remove it.
+        if (row.created_by_org_id && row.created_by_org_id !== row.org_id && !isParentActor(auth, org)) {
+          throw AppError.forbidden('This entry was added by your parent organization and can only be removed by it');
+        }
       }
       if (kind === 'numbers') await trx.deleteFrom('blocked_numbers').where('id', '=', id).execute();
       else await trx.deleteFrom('blocked_keywords').where('id', '=', id).execute();

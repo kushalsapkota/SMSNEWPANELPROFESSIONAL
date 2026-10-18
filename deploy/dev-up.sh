@@ -19,6 +19,9 @@
 #
 # Env knobs:
 #   DEV_DB=sms_dev  DEV_REDIS_DB=6  REDIS_PORT=6399  PGPORT=5432
+#   DEV_PORT_OFFSET=0   added to every default port below (to run beside another stack)
+#   DEV_API_PORT=3000 DEV_WEB_PORT=3001 DEV_ENGINE_HTTP_PORT=8081 DEV_SMPP_PORT=2775
+#   DEV_METRICS_PORT=9100 DEV_SIM_PORT=2776 DEV_SIM_HTTP_PORT=2777   (saved to .run/ports.env)
 #   DEV_RESET_DB=1      0 = keep the existing DB and Redis data (skips reset, flush and demo)
 #   WEB_MODE=prod       prod = next build + next start; dev = next dev (hot reload)
 #   DEV_DEMO=1          0 = skip demo provisioning / SMS round trip
@@ -42,8 +45,17 @@ DEV_DEMO="${DEV_DEMO:-1}"
 ADMIN_EMAIL="${ADMIN_EMAIL:-admin@smsgw.local}"
 ADMIN_PASSWORD="${ADMIN_PASSWORD:-Admin-Passw0rd!}"
 
-API_PORT=3000 WEB_PORT=3001 ENGINE_HTTP_PORT=8081 SMPP_PORT=2775 METRICS_PORT=9100
-SIM_PORT=2776 SIM_HTTP_PORT=2777
+# Ports (CONTRACTS §1 defaults). Override them to run next to another stack on this machine,
+# e.g. DEV_PORT_OFFSET=10000 → api 13000, web 13001, SMPP 12775, ... (individual DEV_*_PORT win).
+DEV_PORT_OFFSET="${DEV_PORT_OFFSET:-0}"
+[[ "$DEV_PORT_OFFSET" =~ ^[0-9]{1,5}$ ]] || { echo "[dev-up] ERROR: DEV_PORT_OFFSET must be a number" >&2; exit 1; }
+API_PORT="${DEV_API_PORT:-$((3000 + DEV_PORT_OFFSET))}"
+WEB_PORT="${DEV_WEB_PORT:-$((3001 + DEV_PORT_OFFSET))}"
+ENGINE_HTTP_PORT="${DEV_ENGINE_HTTP_PORT:-$((8081 + DEV_PORT_OFFSET))}"
+SMPP_PORT="${DEV_SMPP_PORT:-$((2775 + DEV_PORT_OFFSET))}"
+METRICS_PORT="${DEV_METRICS_PORT:-$((9100 + DEV_PORT_OFFSET))}"
+SIM_PORT="${DEV_SIM_PORT:-$((2776 + DEV_PORT_OFFSET))}"
+SIM_HTTP_PORT="${DEV_SIM_HTTP_PORT:-$((2777 + DEV_PORT_OFFSET))}"
 
 log()  { printf '\033[1;34m[dev-up]\033[0m %s\n' "$*" >&2; }
 warn() { printf '\033[1;33m[dev-up]\033[0m %s\n' "$*" >&2; }
@@ -52,6 +64,11 @@ die()  { printf '\033[1;31m[dev-up] ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 [[ "$DEV_DB" =~ ^[a-z_][a-z0-9_]*$ ]] || die "DEV_DB must be a plain identifier"
 [[ "$DEV_REDIS_DB" =~ ^[0-9]+$ ]] || die "DEV_REDIS_DB must be a number"
 [[ "$WEB_MODE" == prod || "$WEB_MODE" == dev ]] || die "WEB_MODE must be prod or dev"
+for p in "$API_PORT" "$WEB_PORT" "$ENGINE_HTTP_PORT" "$SMPP_PORT" "$METRICS_PORT" "$SIM_PORT" "$SIM_HTTP_PORT"; do
+  if ! [[ "$p" =~ ^[0-9]+$ ]] || ((p < 1 || p > 65535)); then
+    die "invalid port $p (check DEV_PORT_OFFSET / DEV_*_PORT)"
+  fi
+done
 
 # --- preflight -------------------------------------------------------------------------------
 for cmd in go node npm psql redis-cli curl jq setsid; do
@@ -102,8 +119,15 @@ if [[ ! -s "$SECRETS" ]]; then
   umask 022
   log "generated dev secrets in ${SECRETS#"$ROOT"/}"
 fi
-# shellcheck disable=SC1090
-set -a; source "$SECRETS"; set +a
+set -a
+# shellcheck source=/dev/null
+source "$SECRETS"
+set +a
+
+# Ports of this run, for dev-demo.sh and anyone scripting against the stack.
+printf '%s\n' "DEV_API_PORT=$API_PORT" "DEV_WEB_PORT=$WEB_PORT" "DEV_ENGINE_HTTP_PORT=$ENGINE_HTTP_PORT" \
+  "DEV_SMPP_PORT=$SMPP_PORT" "DEV_METRICS_PORT=$METRICS_PORT" "DEV_SIM_PORT=$SIM_PORT" \
+  "DEV_SIM_HTTP_PORT=$SIM_HTTP_PORT" >"$RUN/ports.env"
 
 DB_ENGINE_URL="postgres://sms_engine_login:sms_engine_dev@localhost:$PGPORT/$DEV_DB"
 DB_API_URL="postgres://sms_api_login:sms_api_dev@localhost:$PGPORT/$DEV_DB"

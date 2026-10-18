@@ -110,6 +110,16 @@ Settings: `WEB_MODE=dev` (hot reload), `DEV_RESET_DB=0` (keep data), `DEV_DEMO=0
 `DEV_REDIS_DB`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`. Run `deploy/dev-demo.sh` any time as an end-to-end
 smoke test.
 
+To run beside another stack on the same machine (for example the integration e2e run), shift every
+port: `DEV_PORT_OFFSET=10000 make dev-up` gives api 13000, web 13001, SMPP 12775, engine 18081 /
+19100 and smsc-sim 12776 / 12777. Single ports can be set with `DEV_API_PORT`, `DEV_WEB_PORT`,
+`DEV_ENGINE_HTTP_PORT`, `DEV_SMPP_PORT`, `DEV_METRICS_PORT`, `DEV_SIM_PORT`, `DEV_SIM_HTTP_PORT`.
+The ports in use are saved to `deploy/.run/ports.env`, which `dev-demo.sh` reads. A different api
+port means a web rebuild, because `API_URL` is baked into `web/.next`. Use a different `DEV_DB` and
+`DEV_REDIS_DB` too. The engine's `cfg:invalidate` channel is shared by every Redis DB, so two
+stacks on one Redis trigger each other's config reloads. That is harmless: each engine reloads
+from its own database.
+
 ```bash
 source deploy/.run/demo.env
 curl -s localhost:3000/v1/sms/send -H "Authorization: Bearer $DEMO_API_KEY" \
@@ -143,14 +153,19 @@ The stack is defined in `deploy/docker-compose.prod.yml`:
 
 Postgres and Redis sit only on the internal `data` network. The engine's internal API (8081) and
 metrics (9100) sit only on the internal `backend` network. The only published ports are web 3001,
-api 3000 and SMPP 2775, bound to `PUBLISH_ADDR`. Images: `deploy/engine.Dockerfile` (static Go,
+api 3000 (bound to `PUBLISH_ADDR`, default `127.0.0.1` so only nginx reaches them) and SMPP 2775
+(bound to `SMPP_PUBLISH_ADDR`, default `0.0.0.0`). Images: `deploy/engine.Dockerfile` (static Go,
 non-root uid 10001), `deploy/api.Dockerfile` (production node_modules only, user `node`),
 `deploy/web.Dockerfile` (Next.js standalone; `API_URL` and `NEXT_PUBLIC_*` are build args). Run
 `make docker-build` to build all three.
 
 **TLS:** `deploy/nginx.conf` terminates HTTPS for the panel and the API. SMPP is raw TCP, so it goes
-in a `stream` block: plain 2775 and SMPP-over-TLS on 3775. Set `PUBLISH_ADDR=127.0.0.1` and
-`TRUST_PROXY=1` behind it.
+in a `stream` block: plain 2775 and SMPP-over-TLS on 3775. Keep `PUBLISH_ADDR=127.0.0.1` and
+`TRUST_PROXY=1` behind it. The api believes `X-Forwarded-For` only from `TRUSTED_PROXIES` peers
+(default loopback + private ranges) and takes the right-most hop that is not a trusted proxy, so a
+client cannot prepend a whitelisted address. If web/api are exposed directly instead, set
+`TRUST_PROXY=0`: the web forwards a client's own `X-Forwarded-For` to the api. nginx's access log
+redacts the query string of any request carrying `api_key`.
 
 ## Architecture
 
@@ -282,7 +297,11 @@ it every 6h. Without compose, add a cron line:
   guarded by `synced_at`, and dispatch uses consumer groups. Note:
   - Every instance binds every upstream connection's `sessions`, so divide those counts and TPS
     across instances or the upstream sees N× the binds.
-  - Client SMPP sessions are per instance. Front them with a TCP load balancer.
+  - Client SMPP sessions are per instance. Front them with a TCP load balancer. A client's binds
+    may land on different instances: multipart parts are reassembled in Redis (`cc:*`), and
+    delivery receipts are handed to the instance that holds the client's RX/TRX session (receiver
+    registry `smpp:rx:<system_id>`, per-instance stream `q:dlr-out:i:<instance>`; the stream of an
+    instance that stops heart-beating is moved back to `q:dlr-out` after ~2 minutes).
 - *Redis:* must stay a single primary, not Redis Cluster, because the rate-limit script uses keys
   without a shared hash tag. Scale it vertically, and use Sentinel or a managed replica for
   failover.

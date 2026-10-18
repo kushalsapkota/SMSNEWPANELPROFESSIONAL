@@ -73,6 +73,10 @@ type Config struct {
 	MsgStateTTL         time.Duration // ENGINE_MSG_STATE_TTL (msg:/dlrmap: keys), default 72h
 	WebhookTimeout      time.Duration // ENGINE_WEBHOOK_TIMEOUT, default 10s
 	WebhookWorkers      int           // ENGINE_WEBHOOK_WORKERS, default 16
+	// WebhookAllowPrivate (WEBHOOK_ALLOW_PRIVATE_TARGETS=1, same name as the
+	// api) lets webhooks reach loopback / private / reserved addresses. Dev and
+	// tests only; off = SSRF guard on (webhook.Options.BlockPrivate).
+	WebhookAllowPrivate bool
 	CDRFlushInterval    time.Duration // ENGINE_CDR_FLUSH_INTERVAL, default 250ms
 	CDRBatchSize        int           // ENGINE_CDR_BATCH_SIZE, default 500
 
@@ -139,6 +143,7 @@ func LoadFrom(getenv Getenv) (*Config, error) {
 		MsgStateTTL:         l.dur("ENGINE_MSG_STATE_TTL", 72*time.Hour, time.Minute),
 		WebhookTimeout:      l.dur("ENGINE_WEBHOOK_TIMEOUT", 10*time.Second, time.Millisecond),
 		WebhookWorkers:      l.int("ENGINE_WEBHOOK_WORKERS", 16, 1, 1024),
+		WebhookAllowPrivate: truthy(l.str("WEBHOOK_ALLOW_PRIVATE_TARGETS", "")),
 		CDRFlushInterval:    l.dur("ENGINE_CDR_FLUSH_INTERVAL", 250*time.Millisecond, time.Millisecond),
 		CDRBatchSize:        l.int("ENGINE_CDR_BATCH_SIZE", 500, 1, 100000),
 
@@ -309,4 +314,13 @@ func (l *loader) dur(name string, def, min time.Duration) time.Duration {
 		return def
 	}
 	return d
+}
+
+// truthy: "1" / "true" / "yes" / "on" (case-insensitive).
+func truthy(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }

@@ -10,6 +10,7 @@ import { DbService } from '../db/db.service';
 import type { Webhook } from '../db/types';
 import { InvalidationService } from '../redis/redis.module';
 import { ScopeService } from '../tenancy/scope.service';
+import { BlockedTargetError, EgressPolicy, assertWebhookTarget, postWebhook } from './egress';
 
 export interface WebhookInput {
   url: string;
@@ -35,6 +36,8 @@ export function signWebhook(secret: string, body: string, timestamp = Math.floor
 
 @Injectable()
 export class WebhooksService {
+  private readonly egress: EgressPolicy;
+
   constructor(
     private readonly db: DbService,
     private readonly scope: ScopeService,
@@ -42,7 +45,9 @@ export class WebhooksService {
     private readonly audit: AuditService,
     private readonly invalidation: InvalidationService,
     @Inject(APP_CONFIG) private readonly config: AppConfig,
-  ) {}
+  ) {
+    this.egress = { allowPrivate: config.WEBHOOK_ALLOW_PRIVATE_TARGETS };
+  }
 
   async list(q: Pagination & { org_id?: string }) {
     const org = await this.scope.resolve(q.org_id, 'read');
@@ -57,6 +62,7 @@ export class WebhooksService {
   async create(orgIdParam: string | undefined, input: WebhookInput) {
     const org = await this.scope.resolve(orgIdParam, 'write');
     if (org.role === 'SUPER_ADMIN') throw AppError.invalid('Webhooks belong to resellers and clients');
+    await assertWebhookTarget(input.url, this.egress);
     const secret = this.crypto.generateWebhookSecret();
     return this.db.tenant(async (trx) => {
       const row = await trx
@@ -76,6 +82,7 @@ export class WebhooksService {
     const secret = rotate_secret ? this.crypto.generateWebhookSecret() : null;
     return this.db.tenant(async (trx) => {
       const before = await this.load(id, 'write');
+      if (fields.url !== undefined) await assertWebhookTarget(fields.url, this.egress);
       const after = await trx
         .updateTable('webhooks')
         .set({ ...fields, ...(secret ? { secret_enc: this.crypto.encrypt(secret) } : {}), ...(fields.enabled ? { failure_count: 0 } : {}) })
@@ -108,7 +115,9 @@ export class WebhooksService {
   /**
    * Sends a signed sample DLR (CONTRACTS §9 payload, plus `"test": true`) from the api and
    * logs it in webhook_deliveries. Runs without a request transaction so no DB connection is
-   * held while waiting on the remote endpoint.
+   * held while waiting on the remote endpoint. SSRF guard: the target is re-validated and the
+   * connected address must be public (egress.ts); only the status code is reported back
+   * (`response_body` is always null — the api never relays what a target answered).
    */
   async test(id: string) {
     const hook = await this.db.tenant(() => this.load(id, 'write'));
@@ -132,21 +141,25 @@ export class WebhooksService {
     const started = Date.now();
     let statusCode: number | null = null;
     let error: string | null = null;
-    let responseBody: string | null = null;
     try {
-      const res = await fetch(hook.url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'User-Agent': 'smsgw-webhook/1.0', ...signWebhook(secret, body) },
+      await assertWebhookTarget(hook.url, this.egress);
+      const res = await postWebhook(
+        hook.url,
+        { 'Content-Type': 'application/json', 'User-Agent': 'smsgw-webhook/1.0', ...signWebhook(secret, body) },
         body,
-        redirect: 'manual',
-        signal: AbortSignal.timeout(this.config.WEBHOOK_TEST_TIMEOUT_MS),
-      });
+        this.config.WEBHOOK_TEST_TIMEOUT_MS,
+        this.egress,
+      );
       statusCode = res.status;
-      responseBody = (await res.text()).slice(0, 1024);
       if (res.status < 200 || res.status >= 300) error = `HTTP ${res.status}`;
     } catch (e) {
-      const err = e as Error & { cause?: { code?: string; message?: string } };
-      error = err.name === 'TimeoutError' ? `timeout after ${this.config.WEBHOOK_TEST_TIMEOUT_MS}ms` : err.cause?.code ?? err.cause?.message ?? err.message;
+      if (e instanceof AppError) error = e.message;
+      else if (e instanceof BlockedTargetError) error = 'target address is not allowed (private, loopback or reserved)';
+      else {
+        const err = e as Error & { code?: string };
+        // Coarse error classes only: no internal details for a client-chosen target.
+        error = err.name === 'TimeoutError' ? `timeout after ${this.config.WEBHOOK_TEST_TIMEOUT_MS}ms` : err.code ?? 'connection failed';
+      }
     }
     const durationMs = Date.now() - started;
     const delivery = await this.db.tenant((trx) =>
@@ -156,7 +169,7 @@ export class WebhooksService {
         .returningAll()
         .executeTakeFirstOrThrow(),
     );
-    return { ok: error === null, status_code: statusCode, duration_ms: durationMs, error, response_body: responseBody, delivery_id: delivery.id, payload };
+    return { ok: error === null, status_code: statusCode, duration_ms: durationMs, error, response_body: null, delivery_id: delivery.id, payload };
   }
 
   async deliveries(id: string, q: Pagination) {

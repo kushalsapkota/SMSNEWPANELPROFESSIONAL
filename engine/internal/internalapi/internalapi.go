@@ -61,6 +61,12 @@ type Snapshotter interface {
 	Current() *store.Snapshot
 }
 
+// Reloader is implemented by *store.Store: a synchronous full config reload.
+// POST /internal/v1/config/reload uses it when Deps.Store provides it.
+type Reloader interface {
+	Load(ctx context.Context) error
+}
+
 // Rates reports engine throughput for GET /internal/v1/stats.
 type Rates interface {
 	TPSIn() float64
@@ -112,6 +118,7 @@ func New(d Deps) *API {
 	a.mux.HandleFunc("GET /internal/v1/connections/status", a.connStatus)
 	a.mux.HandleFunc("GET /internal/v1/smpp/sessions", a.sessions)
 	a.mux.HandleFunc("POST /internal/v1/smpp/sessions/kick", a.kick)
+	a.mux.HandleFunc("POST /internal/v1/config/reload", a.reload)
 	a.mux.HandleFunc("POST /internal/v1/balance/credit", a.credit)
 	a.mux.HandleFunc("GET /internal/v1/balance/{org_id}", a.balance)
 	a.mux.HandleFunc("GET /internal/v1/health", a.health)
@@ -207,6 +214,10 @@ type submitBody struct {
 	CampaignID  *string `json:"campaign_id"`
 	RouteID     *string `json:"route_id"`
 	Test        bool    `json:"test"`
+	// MessageID (optional, a UUID chosen by the api) makes the submit
+	// idempotent: a repeat with the same id is answered from the first
+	// attempt (debit.lua DUPLICATE) instead of being charged / sent again.
+	MessageID *string `json:"message_id"`
 }
 
 func deref(s *string) string {
@@ -224,9 +235,18 @@ func (b *submitBody) request() (pipeline.Request, error) {
 	if b.OrgID == "" {
 		return pipeline.Request{}, policy.New(policy.CodeInvalidRequest, "org_id is required")
 	}
+	msgID := ""
+	if b.MessageID != nil {
+		id, err := uuid.Parse(*b.MessageID)
+		if err != nil || id.Version() != 7 {
+			return pipeline.Request{}, policy.New(policy.CodeInvalidRequest, "message_id must be a UUIDv7")
+		}
+		msgID = id.String()
+	}
 	return pipeline.Request{
 		OrgID: b.OrgID, Channel: ch, Source: b.Source, Destination: b.Destination, Text: b.Text,
 		ClientRef: deref(b.ClientRef), CampaignID: deref(b.CampaignID), RouteID: deref(b.RouteID), Test: b.Test,
+		MessageID: msgID,
 	}, nil
 }
 
@@ -357,6 +377,30 @@ func (a *API) sessions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"sessions": out})
+}
+
+// reload applies committed config changes synchronously (the cfg:invalidate
+// pubsub path is debounced). The api calls it after org state changes
+// (suspend / activate / channels) so they are enforced as soon as its response
+// is sent, e.g. a suspended org cannot re-bind SMPP in the debounce window.
+func (a *API) reload(w http.ResponseWriter, r *http.Request) {
+	rl, ok := a.d.Store.(Reloader)
+	if !ok {
+		writeError(w, policy.New(policy.CodeInternal, "config reload not supported"))
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	if err := rl.Load(ctx); err != nil {
+		a.log.Error("synchronous config reload failed", "err", err)
+		writeError(w, policy.New(policy.CodeInternal, "config reload failed"))
+		return
+	}
+	var version uint64
+	if snap := a.d.Store.Current(); snap != nil {
+		version = snap.Version
+	}
+	writeJSON(w, http.StatusOK, map[string]uint64{"version": version})
 }
 
 func (a *API) kick(w http.ResponseWriter, r *http.Request) {

@@ -50,7 +50,11 @@ export class TemplatesService {
     if (auth.role === 'CLIENT') return this.effectiveForClient(auth.orgId, q);
 
     return this.db.tenant(async (trx) => {
-      let base = trx.selectFrom('route_templates as t').innerJoin('routes as r', 'r.id', 't.route_id');
+      let base = trx
+        .selectFrom('route_templates as t')
+        .innerJoin('routes as r', 'r.id', 't.route_id')
+        // org_name of a per-client override (RLS: admin sees all, a reseller its clients)
+        .leftJoin('organizations as o', 'o.id', 't.org_id');
       if (auth.role === 'RESELLER') {
         // Route-wide defaults of the reseller's own routes, plus overrides of its clients (RLS).
         base = base.where((eb) =>
@@ -71,7 +75,7 @@ export class TemplatesService {
       const [{ total }] = await base.select((eb) => eb.fn.countAll<number>().as('total')).execute();
       const rows = await base
         .selectAll('t')
-        .select('r.name as route_name')
+        .select(['r.name as route_name', 'o.name as org_name'])
         .orderBy('r.name')
         .orderBy(sql`t.org_id nulls first`)
         .orderBy('t.created_at', 'desc')

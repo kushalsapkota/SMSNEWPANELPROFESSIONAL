@@ -130,6 +130,16 @@ func alphabet(dc uint8) uint8 {
 	return dc
 }
 
+// TextDataCoding reports whether data_coding is a plain text alphabet the
+// gateway can carry as text: the SMSC-specific values 0x00-0x0F except the
+// binary ones (2 and 4). Binary data (WAP push, vCard, OTA), message classes
+// (e.g. flash, 0x10-0x1F / 0xF0-0xF7), compressed text and message-waiting
+// indications (0x10-0xFF) cannot survive being decoded to text and
+// re-encoded, so callers should reject them (ESME_RINVDCS).
+func TextDataCoding(dc uint8) bool {
+	return dc <= 0x0F && dc != DCBinary && dc != 0x04
+}
+
 // Decode converts short_message bytes to text according to data_coding:
 //
 //	0  GSM 03.38 unpacked (if the bytes contain octets ≥ 0x80 that form valid

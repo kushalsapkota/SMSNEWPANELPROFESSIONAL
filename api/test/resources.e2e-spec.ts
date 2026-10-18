@@ -69,7 +69,9 @@ describe('scoped resources', () => {
       expect(rs.body.status).toBe('PENDING');
       expect((await as(ctx, admin).post(`/api/sender-ids/${rs.body.id}/approve`)).body.status).toBe('APPROVED');
       await waitFor(() => ctx.invalidations.some((m) => m.entity === 'sender_ids' && m.id === rs.body.id));
-      expect((await as(ctx, client).delete(`/api/sender-ids/${req.body.id}`)).status).toBe(200);
+      // approved by the parent: only the parent may remove it (parent-controls.e2e-spec.ts)
+      expect((await as(ctx, client).delete(`/api/sender-ids/${req.body.id}`)).status).toBe(403);
+      expect((await as(ctx, reseller).delete(`/api/sender-ids/${req.body.id}`)).status).toBe(200);
     });
   });
 
@@ -97,7 +99,9 @@ describe('scoped resources', () => {
       const patch = await as(ctx, reseller).patch(`/api/smpp-accounts/${res.body.id}`, { enabled: false, allowed_bind_types: ['TX', 'RX'], max_tps: null });
       expect(patch.body).toMatchObject({ enabled: false, allowed_bind_types: ['TX', 'RX'], max_tps: null });
       expect(ctx.engine.calls('/internal/v1/smpp/sessions/kick')).toHaveLength(2);
-      expect((await as(ctx, client).delete(`/api/smpp-accounts/${res.body.id}`)).status).toBe(200);
+      // the reseller's update locked the account: the client can't delete it, the reseller can
+      expect((await as(ctx, client).delete(`/api/smpp-accounts/${res.body.id}`)).status).toBe(403);
+      expect((await as(ctx, reseller).delete(`/api/smpp-accounts/${res.body.id}`)).status).toBe(200);
       expect(ctx.engine.calls('/internal/v1/smpp/sessions/kick')).toHaveLength(3);
       await waitFor(() => ctx.invalidations.filter((m) => m.entity === 'smpp_accounts' && m.id === res.body.id).length >= 4);
       const audits = await ctx.db.selectFrom('audit_logs').select(['action', 'before', 'after']).where('entity_id', '=', res.body.id).execute();
@@ -165,7 +169,8 @@ describe('scoped resources', () => {
       received = [];
       const t = await as(ctx, client).post(`/api/webhooks/${res.body.id}/test`);
       expect(t.status).toBe(200);
-      expect(t.body).toMatchObject({ ok: true, status_code: 200, error: null, response_body: 'thanks' });
+      // the target's answer is never relayed (SSRF: webhook-ssrf.e2e-spec.ts)
+      expect(t.body).toMatchObject({ ok: true, status_code: 200, error: null, response_body: null });
       expect(received).toHaveLength(1);
       const { headers, body } = received[0];
       const ts = headers['x-webhook-timestamp'] as string;
@@ -280,6 +285,10 @@ describe('scoped resources', () => {
       expect((await as(ctx, admin).patch(`/api/templates/${ov.body.id}`, { name: 'admin edit' })).status).toBe(403);
       const rl = await as(ctx, reseller).get(`/api/templates?route_id=${routeId}`);
       expect(rl.body.items.map((t: { id: string }) => t.id).sort()).toEqual([wide.body.id, ov.body.id].sort());
+      // overrides carry the client's name (route-wide rows: null)
+      const clientName = (await ctx.db.selectFrom('organizations').select('name').where('id', '=', client.orgId).executeTakeFirstOrThrow()).name;
+      expect(rl.body.items.find((t: { id: string }) => t.id === ov.body.id).org_name).toBe(clientName);
+      expect(rl.body.items.find((t: { id: string }) => t.id === wide.body.id).org_name).toBeNull();
 
       const patched = await as(ctx, reseller).patch(`/api/templates/${ov.body.id}`, { brand: 'ClientCo' });
       expect(patched.body.brand).toBe('ClientCo');

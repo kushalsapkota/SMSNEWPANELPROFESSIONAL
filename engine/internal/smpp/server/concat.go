@@ -51,6 +51,10 @@ func newReassembler(s *Server) *reassembler {
 }
 
 func (r *reassembler) add(c *conn, in *inbound, m *Message, p *partInfo) {
+	if r.srv.cfg.ConcatStore != nil {
+		r.addShared(c, in, m, p)
+		return
+	}
 	key := concatKey{systemID: m.Session.SystemID, src: m.SourceAddr, dst: m.DestAddr, kind: p.kind, ref: p.ref, total: p.total}
 	h := r.srv.cfg.Handler
 	idx := int(p.seq) - 1
@@ -124,7 +128,42 @@ func (r *reassembler) add(c *conn, in *inbound, m *Message, p *partInfo) {
 	full.Multipart = p.kind
 	full.ReceivedAt = set.firstSeen
 	st := r.srv.handleMessage(full)
+	if st != pdu.ESME_ROK {
+		// The earlier parts were already acknowledged with ESME_ROK, so a
+		// compliant ESME resubmits only this (completing) part — e.g. after
+		// ESME_RTHROTTLED. Keep the other parts so that retry completes the
+		// message again instead of starting a new 1-of-N set that expires.
+		r.rearm(set, idx)
+	}
 	c.reply(in, partID, st)
+}
+
+// rearm puts a set whose completed message was rejected back into the
+// table without its completing part. The retry gets a fresh message id:
+// the rejected attempt may have been recorded under the old one.
+func (r *reassembler) rearm(set *concatSet, idx int) {
+	h := r.srv.cfg.Handler
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.stopped || r.sets[set.key] != nil {
+		return // shutting down, or a new set with this key already started
+	}
+	set.have[idx] = false
+	set.parts[idx] = nil
+	set.received--
+	// The handler has the completed Message; never mutate it again.
+	tmpl := *set.first
+	set.first = &tmpl
+	old := set.id
+	set.id = h.NewMessageID()
+	for i, id := range set.partIDs {
+		if i == idx || id == old && !set.have[i] {
+			set.partIDs[i] = ""
+		}
+	}
+	r.sets[set.key] = set
+	r.perSys[set.key.systemID]++
+	set.timer = time.AfterFunc(r.srv.cfg.ConcatTimeout, func() { r.expire(set) })
 }
 
 func (r *reassembler) removeLocked(set *concatSet) {

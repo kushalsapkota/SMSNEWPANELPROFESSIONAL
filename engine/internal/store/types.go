@@ -140,19 +140,36 @@ type Connection struct {
 	Rates []*Rate
 }
 
-// SessionConfigEqual reports whether two connections would bind identically
-// (everything that requires a rebind; ignores notes, rates, timestamps).
+// SessionConfigEqual reports whether two connections would bind identically:
+// only the fields that require the sessions to be rebound (address, TLS,
+// credentials, bind parameters, session count and timers, enabled). Fields
+// read per message from the snapshot (name, request_dlr, multipart_mode,
+// default_data_coding) or applied in place (max_tps) are not compared, so
+// editing them never unbinds the SMSC sessions.
 func (c *Connection) SessionConfigEqual(o *Connection) bool {
 	if c == nil || o == nil {
 		return c == o
 	}
-	return c.Name == o.Name && c.Host == o.Host && c.Port == o.Port && c.UseTLS == o.UseTLS &&
+	return c.Host == o.Host && c.Port == o.Port && c.UseTLS == o.UseTLS &&
 		c.SystemID == o.SystemID && c.Password == o.Password && (c.PasswordErr == nil) == (o.PasswordErr == nil) &&
 		c.SystemType == o.SystemType && c.BindType == o.BindType && c.Sessions == o.Sessions &&
-		c.MaxTPS == o.MaxTPS && c.WindowSize == o.WindowSize && c.EnquireLinkInterval == o.EnquireLinkInterval &&
+		c.WindowSize == o.WindowSize && c.EnquireLinkInterval == o.EnquireLinkInterval &&
 		c.ReconnectMin == o.ReconnectMin && c.ReconnectMax == o.ReconnectMax && c.SubmitTimeout == o.SubmitTimeout &&
-		c.RequestDLR == o.RequestDLR && c.MultipartMode == o.MultipartMode &&
-		c.DefaultDataCoding == o.DefaultDataCoding && c.Enabled == o.Enabled
+		c.Enabled == o.Enabled
+}
+
+// ConfigEqual reports whether every operational field is equal (session
+// fields plus name, max_tps, request_dlr, multipart_mode and
+// default_data_coding; notes, rates and timestamps are ignored).
+func (c *Connection) ConfigEqual(o *Connection) bool {
+	if !c.SessionConfigEqual(o) {
+		return false
+	}
+	if c == nil {
+		return true
+	}
+	return c.Name == o.Name && c.MaxTPS == o.MaxTPS && c.RequestDLR == o.RequestDLR &&
+		c.MultipartMode == o.MultipartMode && c.DefaultDataCoding == o.DefaultDataCoding
 }
 
 // RouteConnection is a route_connections row joined to its connection

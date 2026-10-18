@@ -131,11 +131,15 @@ describe('campaigns', () => {
       expect(out.find((o) => o.campaignId === id)).toMatchObject({ submitted: 2, failed: 0, status: 'COMPLETED' });
       expect(batchItems()).toEqual([
         [
-          { org_id: client.orgId, channel: 'WEB', source: 'ACME', destination: '447700900001', text: 'Hi Ann: X,1', campaign_id: id },
-          { org_id: client.orgId, channel: 'WEB', source: 'ACME', destination: '447700900002', text: 'Hi Bo: Y', campaign_id: id },
+          { message_id: expect.any(String), org_id: client.orgId, channel: 'WEB', source: 'ACME', destination: '447700900001', text: 'Hi Ann: X,1', campaign_id: id },
+          { message_id: expect.any(String), org_id: client.orgId, channel: 'WEB', source: 'ACME', destination: '447700900002', text: 'Hi Bo: Y', campaign_id: id },
         ],
       ]);
-      expect((await recipients(id)).every((r) => r.message_id && !r.error_code)).toBe(true);
+      const recs = await recipients(id);
+      expect(recs.every((r) => r.message_id && !r.error_code && r.attempt_message_id === null)).toBe(true);
+      // the api chose the ids (UUIDv7) and sent them to the engine
+      expect(recs.map((r) => r.message_id)).toEqual(batchItems()[0].map((i) => i.message_id));
+      expect(recs[0].message_id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
       const c = await as(ctx, client).get(`/api/campaigns/${id}`);
       expect(c.body).toMatchObject({ status: 'COMPLETED', submitted: 2, failed: 0, pending: 0 });
       expect(c.body.finished_at).not.toBeNull();
@@ -236,6 +240,61 @@ describe('campaigns', () => {
       ctx.engine.down = false;
       expect((await worker.tick()).find((o) => o.campaignId === id)).toMatchObject({ submitted: 2, status: 'COMPLETED' });
       expect(await campaign(id)).toMatchObject({ submitted: 2, failed: 0 });
+    });
+
+    it('engine cut off mid-chunk (timeout / 5xx): the retry reuses the message ids, nobody is sent or charged twice', async () => {
+      const id = await createJson(4);
+      await as(ctx, client).post(`/api/campaigns/${id}/start`).expect(200);
+      ctx.engine.batchFailAfter = 2; // the engine accepts 2 of 4, then the api sees a 503
+      expect((await worker.tick()).find((o) => o.campaignId === id)).toMatchObject({ submitted: 0, deferred: 4, status: 'RUNNING' });
+      expect(ctx.engine.sends).toBe(2);
+      const pending = await recipients(id);
+      expect(pending.every((r) => r.message_id === null && r.attempt_message_id !== null)).toBe(true);
+      const firstIds = batchItems()[0].map((i) => i.message_id);
+      expect(pending.map((r) => r.attempt_message_id)).toEqual(firstIds);
+
+      ctx.engine.batchFailAfter = null;
+      expect((await worker.tick()).find((o) => o.campaignId === id)).toMatchObject({ submitted: 4, status: 'COMPLETED' });
+      expect(batchItems()[1].map((i) => i.message_id)).toEqual(firstIds); // same ids resubmitted
+      expect(ctx.engine.sends).toBe(4); // 2 replays + 2 new, not 6
+      const done = await recipients(id);
+      expect(done.map((r) => r.message_id)).toEqual(firstIds);
+      expect(done.every((r) => r.attempt_message_id === null)).toBe(true);
+      expect(await campaign(id)).toMatchObject({ submitted: 4, failed: 0, status: 'COMPLETED' });
+    });
+
+    it('ids of recipients the engine definitively rejected for now (RATE_LIMITED) are not reused', async () => {
+      const id = await createJson(2);
+      await as(ctx, client).post(`/api/campaigns/${id}/start`).expect(200);
+      ctx.engine.rejectAll = { status: 429, error_code: 'RATE_LIMITED', message: 'slow down' };
+      expect((await worker.tick()).find((o) => o.campaignId === id)).toMatchObject({ deferred: 2 });
+      expect((await recipients(id)).every((r) => r.attempt_message_id === null)).toBe(true);
+      ctx.engine.rejectAll = null;
+      expect((await worker.tick()).find((o) => o.campaignId === id)).toMatchObject({ submitted: 2, status: 'COMPLETED' });
+      const [first, second] = batchItems();
+      expect(second.map((i) => i.message_id)).not.toEqual(first.map((i) => i.message_id));
+    });
+
+    it('pacing counts from the END of a chunk: a slow chunk is not followed immediately by the next one', async () => {
+      await as(ctx, reseller).patch(`/api/orgs/${client.orgId}`, { max_tps: 2 }).expect(200);
+      worker.paceMs = 1000;
+      try {
+        const id = await createJson(4);
+        await as(ctx, client).post(`/api/campaigns/${id}/start`).expect(200);
+        ctx.engine.batchDelayMs = 1300; // the chunk's engine call takes longer than the pace
+        expect((await worker.tick()).find((o) => o.campaignId === id)).toMatchObject({ submitted: 2 });
+        ctx.engine.batchDelayMs = 0;
+        // updated_at (transaction start) is already > 1s old, but the chunk only just finished
+        expect((await worker.tick()).find((o) => o.campaignId === id)).toBeUndefined();
+        const c = await campaign(id);
+        expect(c.last_chunk_at!.getTime()).toBeGreaterThan(c.updated_at.getTime() + 1000);
+        await new Promise((r) => setTimeout(r, 1050));
+        expect((await worker.tick()).find((o) => o.campaignId === id)).toMatchObject({ submitted: 2 });
+        expect(await campaign(id)).toMatchObject({ submitted: 4 });
+      } finally {
+        worker.paceMs = 0;
+        await as(ctx, reseller).patch(`/api/orgs/${client.orgId}`, { max_tps: 10 }).expect(200);
+      }
     });
 
     it('suspended org: the campaign is paused without calling the engine', async () => {

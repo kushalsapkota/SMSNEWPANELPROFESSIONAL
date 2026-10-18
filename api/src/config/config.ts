@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { DEFAULT_TRUSTED_PROXIES, parseTrustedProxies } from '../common/request.util';
 
 const bool = z
   .string()
@@ -52,7 +53,20 @@ export const envSchema = z.object({
   JWT_SECRET: z.string({ required_error: 'is required' }).min(32, 'must be at least 32 characters'),
 
   PORT: intWithDefault(3000, 1),
+  /** Believe X-Forwarded-For at all (only from TRUSTED_PROXIES peers; see request.util clientIp). */
   TRUST_PROXY: bool,
+  /** Peers allowed to set X-Forwarded-For: CIDRs, IPs, or loopback / linklocal / uniquelocal. */
+  TRUSTED_PROXIES: z
+    .string()
+    .optional()
+    .transform((v, ctx) => {
+      try {
+        return parseTrustedProxies(v && v.trim() !== '' ? v : DEFAULT_TRUSTED_PROXIES);
+      } catch (e) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: (e as Error).message });
+        return z.NEVER;
+      }
+    }),
   ENGINE_TIMEOUT_MS: intWithDefault(5000, 100),
   TOTP_ISSUER: z.string().optional().default('SMS Gateway'),
   REFRESH_TOKEN_TTL_DAYS: intWithDefault(30, 1),
@@ -60,6 +74,11 @@ export const envSchema = z.object({
   DB_POOL_MAX: intWithDefault(20, 1),
   CFG_INVALIDATE_CHANNEL: z.string().optional().default('cfg:invalidate'),
   WEBHOOK_TEST_TIMEOUT_MS: intWithDefault(10000, 100),
+  /**
+   * Allow webhook URLs on loopback / private / link-local / reserved addresses (SSRF guard off).
+   * Dev and tests only (local receivers); keep it off in production.
+   */
+  WEBHOOK_ALLOW_PRIVATE_TARGETS: bool,
 
   // Public /v1 API (CONTRACTS §11)
   /** Requests per second per API key (fixed 1s window in Redis). */

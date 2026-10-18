@@ -29,9 +29,24 @@ import (
 	"smsgw/engine/internal/policy"
 )
 
-// checkSrc: KEYS tps, day, month; ARGV tpsLimit, dayLimit, monthLimit (0 =
-// unlimited), n, tpsTTL, dayTTL, monthTTL.
+// checkSrc: KEYS tps, day, month[, once]; ARGV tpsLimit, dayLimit,
+// monthLimit (0 = unlimited), n, tpsTTL, dayTTL, monthTTL.
+//
+// The optional 4th key (rl:once:<token>) makes a check idempotent: go-redis
+// re-sends a script after a read timeout, and without it a retry of a check
+// that already ran would count the message twice. The first run stores its
+// reply there for 60s and a replay returns it unchanged.
 const checkSrc = `
+local once = KEYS[4]
+if once then
+  local prev = redis.call('GET', once)
+  if prev then
+    local r = {}
+    for v in string.gmatch(prev, '[^|]+') do r[#r + 1] = v end
+    if r[1] == 'OK' then return {1, 'OK', tonumber(r[2]), tonumber(r[3]), tonumber(r[4]), 1} end
+    return {0, r[1], tonumber(r[2])}
+  end
+end
 local n = tonumber(ARGV[4])
 local lim = {tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])}
 local codes = {'RATE_LIMITED', 'DAILY_LIMIT', 'MONTHLY_LIMIT'}
@@ -39,6 +54,7 @@ local cur = {}
 for i = 1, 3 do
   cur[i] = tonumber(redis.call('GET', KEYS[i]) or '0')
   if lim[i] > 0 and cur[i] + n > lim[i] then
+    if once then redis.call('SET', once, codes[i] .. '|' .. cur[i], 'EX', 60) end
     return {0, codes[i], cur[i]}
   end
 end
@@ -49,6 +65,7 @@ for i = 1, 3 do
     redis.call('EXPIRE', KEYS[i], ARGV[4 + i])
   end
 end
+if once then redis.call('SET', once, 'OK|' .. res[3] .. '|' .. res[4] .. '|' .. res[5], 'EX', 60) end
 return res`
 
 // releaseSrc undoes a successful Check (e.g. the debit failed afterwards).
@@ -77,12 +94,19 @@ type Request struct {
 	MonthlyLimit int
 	Timezone     string // IANA, "" = UTC
 	N            int    // default 1
+	// Token (optional, e.g. the message id) makes Check idempotent for 60s:
+	// a repeated Check with the same token returns the first result without
+	// counting again.
+	Token string
 }
 
 // Counts are the counter values after a successful Check.
 type Counts struct {
 	Second, Day, Month int64
 	At                 time.Time // the instant the windows were computed for (pass to Release)
+	// Replayed: the token's first Check already counted this message;
+	// nothing was incremented now (so a Release must not decrement either).
+	Replayed bool
 }
 
 // Limiter is safe for concurrent use.
@@ -151,7 +175,11 @@ func (l *Limiter) Check(ctx context.Context, r Request) (Counts, error) {
 	now := l.now()
 	k1, k2, k3 := l.Keys(r.OrgID, r.Timezone, now)
 	dayTTL, monthTTL := l.ttls(r.Timezone, now)
-	raw, err := checkScript.Run(ctx, l.rdb, []string{k1, k2, k3},
+	keys := []string{k1, k2, k3}
+	if r.Token != "" {
+		keys = append(keys, "rl:once:"+r.Token)
+	}
+	raw, err := checkScript.Run(ctx, l.rdb, keys,
 		max(r.TPS, 0), max(r.DailyLimit, 0), max(r.MonthlyLimit, 0), n, 2, dayTTL, monthTTL).Slice()
 	if err != nil {
 		return Counts{}, fmt.Errorf("ratelimit: %w", err)
@@ -162,10 +190,10 @@ func (l *Limiter) Check(ctx context.Context, r Request) (Counts, error) {
 	status, _ := raw[1].(string)
 	switch status {
 	case "OK":
-		if len(raw) != 5 {
+		if len(raw) != 5 && len(raw) != 6 {
 			return Counts{}, fmt.Errorf("ratelimit: unexpected reply %v", raw)
 		}
-		c := Counts{At: now}
+		c := Counts{At: now, Replayed: len(raw) == 6}
 		c.Second, _ = raw[2].(int64)
 		c.Day, _ = raw[3].(int64)
 		c.Month, _ = raw[4].(int64)

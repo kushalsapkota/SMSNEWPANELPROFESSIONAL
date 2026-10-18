@@ -131,6 +131,10 @@ describe('analytics, dashboard, tester', () => {
       const yStr = new Date(today0 - D).toISOString().slice(0, 10);
       const local = (await as(ctx, cA1).get(`/api/analytics/timeseries?granularity=day&${range}`)).body;
       expect(local.timezone).toBe('Asia/Kolkata');
+      // hourly rollups + a +05:30 zone: the response states the approximation
+      expect(local.day_boundary_shift_minutes).toBe(30);
+      expect((await as(ctx, cA1).get(`/api/analytics/timeseries?granularity=day&tz=Asia/Kathmandu&${range}`)).body.day_boundary_shift_minutes).toBe(45);
+      expect((await as(ctx, cA1).get(`/api/analytics/timeseries?granularity=day&tz=Europe/Berlin&${range}`)).body.day_boundary_shift_minutes).toBe(0);
       const byDate = (b: { points: { date: string; messages: number }[] }) => Object.fromEntries(b.points.map((p) => [p.date, p.messages]));
       expect(byDate(local)[todayStr]).toBe(10); // h1 (20:00Z yesterday) is 01:30 today in Kolkata
       expect(byDate(local)[yStr] ?? 0).toBe(0);
@@ -138,6 +142,7 @@ describe('analytics, dashboard, tester', () => {
       expect(new Date(kolkataMidnight).toISOString()).toBe(new Date(today0 - 5.5 * H).toISOString());
       const utc = (await as(ctx, cA1).get(`/api/analytics/timeseries?granularity=day&tz=UTC&${range}`)).body;
       expect(byDate(utc)[yStr]).toBe(10);
+      expect(utc.day_boundary_shift_minutes).toBe(0);
       expect(byDate(utc)[todayStr] ?? 0).toBe(0);
       expect(local.points[0].spend_micros).toBeDefined();
       expect((await as(ctx, cA1).get('/api/analytics/timeseries?tz=Mars/Base')).status).toBe(400);

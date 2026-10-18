@@ -351,3 +351,247 @@ All items are backward compatible additions. No other component's code was chang
    `submit date:2610180858 done date:2610181058` for a message delivered within a second. Docker
    images run in UTC, so production containers are unaffected. A native deploy on a non-UTC host
    should set `TZ=UTC` for the engine, or the engine should use one zone for both fields.
+8. **dev-up ports are overridable** (defaults unchanged, CONTRACTS §1). `DEV_PORT_OFFSET=<n>` adds
+   `n` to every dev port, and `DEV_API_PORT`, `DEV_WEB_PORT`, `DEV_ENGINE_HTTP_PORT`,
+   `DEV_SMPP_PORT`, `DEV_METRICS_PORT`, `DEV_SIM_PORT` and `DEV_SIM_HTTP_PORT` set single ports. The
+   values used are written to `deploy/.run/ports.env`, and `deploy/dev-demo.sh` reads that file. The
+   engine's Redis pub/sub channel `cfg:invalidate` has no env setting (only the in-process
+   `app.Overrides.InvalidateChannel` used by tests), and pub/sub
+   ignores the Redis DB index, so stacks sharing one Redis server see each other's invalidations.
+   That only causes extra full reloads from each engine's own DB. A configurable engine channel,
+   matching the api's `CFG_INVALIDATE_CHANNEL`, would be a small engine follow-up.
+9. **`make test-deploy`** (`deploy/validate.py`) also runs shellcheck on the deploy scripts when
+   `shellcheck` is on PATH or `SHELLCHECK=/path` is set. `deploy/e2e.sh` belongs to the integration
+   suite: it is only syntax-checked (`bash -n`, executable bit), with no style rules.
+10. **`make test-migrate`** also runs db-init's other two steps on its throwaway DB. First
+    `deploy/init/init-roles.sh` runs twice (create, then password rotation), with role names
+    `sms_migratetest_api` / `sms_migratetest_engine` (`ROLES_TEST_API` / `ROLES_TEST_ENGINE`). These
+    are separate from the shared dev roles because roles are cluster-wide, and they are dropped
+    afterwards. Then `deploy/init/maintenance.sh` runs with `MAINT_PARTITION_MONTHS=6`. The test
+    checks RLS / BYPASSRLS membership, that the old password is rejected, and that the
+    6-months-ahead partition exists.
+
+## integration (deploy/e2e.sh, deploy/e2e/; fixes found by the live end-to-end run)
+
+All items are backward compatible additions.
+
+1. **smsc-sim `-accept-all` / `SMSC_SIM_ACCEPT_ALL=1`**: disables the `…1111` → `ESME_RSUBMITFAIL`
+   rule (that destination is delivered normally). The e2e stack runs a second simulator with it, so
+   failover from a rejecting first-priority connection to a *succeeding* second one is tested live.
+   Default behaviour is unchanged.
+2. **New engine endpoint `POST /internal/v1/config/reload`** (X-Internal-Token, empty body) →
+   `200 {"version": n}`; a synchronous full config reload (`store.Load`). `500 INTERNAL` if the reload
+   fails (the previous snapshot keeps serving). The api calls it (best effort, after commit, before
+   any kick) on every org state change: `POST /api/orgs/:id/suspend|activate` and
+   `PATCH /api/orgs/:id/channels`. Reason: `cfg:invalidate` is debounced (engine-core #8), and the e2e
+   run showed a suspended client could still bind SMPP and get a submit_sm accepted (and billed) in
+   that window, and a re-enabled client got `SENDING_DISABLED` for a moment. With several engine
+   instances only the one behind `ENGINE_URL` reloads synchronously; the others still apply the
+   change on the pub/sub reload.
+3. **`PATCH /api/orgs/:id/channels` with `sending_enabled: false`** now kicks the org's SMPP sessions
+   too (previously only `smpp_enabled: false`). A bind needs `can_send` (CONTRACTS §4:
+   SENDING_DISABLED → `ESME_RINVSYSID` at bind), so sessions must not stay bound until the engine's
+   ~5 s sweeper (engine-flow #10) catches them.
+4. **smpp-cli `-exit-on-unbind`**: while waiting for a receipt, stop as soon as the gateway closes the
+   session; the JSON result then has `"unbound": true` and `error` set. Without the flag the client
+   keeps reconnecting until `-wait` expires (unchanged).
+5. **Config propagation is eventually consistent** for everything else (routes, assignments, rates,
+   templates, credentials): the engine applies it within the debounce (~200 ms + reload time) after
+   the api response. `deploy/e2e.sh` waits for upstream binds (`GET /api/monitor/connections`) before
+   sending. Org state is the exception (item 2).
+
+## db fixer: RLS hardening (migration 006_rls_hardening.sql)
+
+- `refresh_tokens` now has RLS for `sms_api`: a row is visible only when its user is visible (`app.can_see_org(users.org_id)`). `sms_api` loses INSERT/DELETE on it and SELECT on `token_hash`. It keeps SELECT on every other column and UPDATE on `(revoked_at, revoked_reason)`, which is what the tenant-pool session revocation in orgs.service needs. Auth flows already use the privileged pool, so nothing else changes.
+- `message_logs` partitions, including `message_logs_default`, now have RLS enabled with no policy, and `sms_api` has no grants on them. Tenant queries must go through the parent `message_logs`, which already worked that way. `sms_engine` (BYPASSRLS) keeps its grants. `app.ensure_message_log_partitions` locks every new partition in the same way through the new owner-only `app.lock_message_log_partition(regclass)`.
+- EXECUTE on `app.ensure_message_log_partitions`, `app.drop_message_log_partitions` and `app.lock_message_log_partition` is revoked from PUBLIC, `sms_api` and `sms_engine`. Only the schema owner runs them (deploy/init/maintenance.sh already connects as the owner).
+
+## deploy fixer: client IP behind proxies, API keys in nginx logs
+
+- **CONTRACTS §11 "client IP from `X-Forwarded-For` first hop if `TRUST_PROXY=1`" is tightened.** With `TRUST_PROXY=1` the api now believes `X-Forwarded-For` only when the socket peer is in the new `TRUSTED_PROXIES` (CIDRs, IPs, or `loopback`/`linklocal`/`uniquelocal`; default `loopback,linklocal,uniquelocal`). It walks the chain `[XFF hops..., peer]` from the right and uses the first address that is not a trusted proxy (a malformed hop stops the walk). Before, `X-Forwarded-For: 127.0.0.1, 8.8.8.8` sent by 8.8.8.8 passed a 127.0.0.1/32 PANEL or API whitelist. Behind a single nginx that replaces the header, the result is the same as before. `TRUST_PROXY=0` is unchanged (peer only). Express `trust proxy` uses the same set, so `req.ip` agrees. (api/src/common/request.util.ts, api/src/config/config.ts)
+- **deploy defaults:** web 3001 and api 3000 are now published on `PUBLISH_ADDR` default `127.0.0.1` (was `0.0.0.0`), and in `.env.example`. SMPP 2775 has its own `SMPP_PUBLISH_ADDR` (default `0.0.0.0`, as before), so SMPP stays public and the engine still sees real peers. The api service gets `TRUSTED_PROXIES`. If you previously relied on `PUBLISH_ADDR=0.0.0.0` for SMPP behind nginx's stream block, set `SMPP_PUBLISH_ADDR=127.0.0.1` instead.
+- **nginx access log:** `log_format main` logs `$request_log`, which is `$request` with the query string replaced by `[redacted]` whenever it contains `api_key` (any case, or percent-encoded `api%5Fkey`), so legacy `GET /v1/sms/send?api_key=...` keys are not written to disk. `deploy/validate.py` runs `nginx -t` on a copy and a live nginx to verify this.
+
+## api fixer: review findings (auth, parent controls, SSRF, idempotent sends, display fields)
+
+Migration `db/migrations/006_api_security_fixes.sql` (additive columns only, with backfill):
+`blocked_numbers/blocked_keywords/ip_whitelists.created_by_org_id`, `smpp_accounts.locked_by_parent`,
+`users.totp_last_step`, `campaign_recipients.attempt_message_id`, `campaigns.last_chunk_at`.
+
+1. **Sessions are re-validated on every request AND on refresh** (supersedes api part 1 #2 "org active
+   unless impersonating"). The user's REAL org must be active also while impersonating, the
+   impersonation must still be allowed (target is a direct child of the real org), and the client IP
+   must pass the real org's `PANEL`/`ALL` whitelist (previously login only). Failures: `403
+   ACCOUNT_SUSPENDED`, `403 IP_NOT_ALLOWED`, `401` for an impersonation that is no longer allowed. A
+   refresh refused for the IP (or a no-longer-allowed impersonation) revokes the token family.
+   Suspending an org revokes its users' impersonation refresh tokens. This also covers
+   `POST /api/messages/send` (WEB channel). While impersonating, the impersonator's (real org's) IP
+   rules apply, not the client's.
+2. **`POST /api/auth/impersonate`: SUPER_ADMIN → its RESELLERs only** (was: also any CLIENT; api part 1 #3).
+   The admin reaches a client by impersonating its reseller. A real org that is suspended can't
+   impersonate.
+3. **2FA / password re-checks count toward the lockout**: wrong codes on `POST /api/auth/totp/disable`
+   and wrong `current_password` on `POST /api/auth/password` increment `failed_login_count` (5 → 15 min
+   lock, `401` with `details.locked_until`); a locked account is refused there too. Each TOTP time step is
+   accepted once (`users.totp_last_step`): a code can't be replayed, nor an older step used after a newer one.
+4. **User management is parent-only**: `POST /api/orgs/:id/users/:uid/reset-password` and
+   `PATCH /api/orgs/:id/users/:uid {is_active}` need the direct parent (directly or while impersonating
+   the org) → `403` for the org itself. `full_name` stays editable by the org. Self-service password
+   change is `POST /api/auth/password`.
+5. **Controls the parent sets on a child can't be undone by the child** ("parent" = the direct parent,
+   also while impersonating the child):
+   - sender IDs: the org may delete only its own `PENDING` requests; reviewed (approved / rejected) or
+     parent-created rows → `403` (any row makes the org sender-restricted in the engine). A sender ID the
+     parent creates while impersonating is `APPROVED` like a direct parent create.
+   - blocklist numbers / keywords and IP whitelist rules record `created_by_org_id` (the creator's real
+     org); a row the parent added to the org can only be removed by the parent (`403`).
+   - IP whitelist: while the parent has rules covering a scope (`X` or `ALL`; any scope for an `ALL` rule)
+     the org can't add its own rules for it (`403`; adding a rule would widen the allow-list).
+   - SMPP accounts: created / updated by the parent → `locked_by_parent: true` (new response field). The
+     org may then only tighten it (disable, lower `max_binds`/`max_tps`, fewer bind types; else `403`
+     with `details.fields`) and can't delete it.
+   The web shows these as API errors; no web change is required.
+6. **Webhook SSRF guard** (api and engine, env `WEBHOOK_ALLOW_PRIVATE_TARGETS`, default off = guard on):
+   webhook URLs must resolve only to public unicast addresses (loopback, RFC 1918, CGNAT, link-local,
+   unique-local, multicast, reserved, documentation, and IPv4 embedded in mapped/NAT64/6to4 IPv6 are
+   refused), no credentials in the URL. Checked on create/update (`400`, `details.field: "url"`) and
+   again on the address actually connected to (api test sender: custom DNS lookup; engine
+   `webhook.Options.BlockPrivate`: `net.Dialer.Control`), which defeats DNS rebinding. The engine's guarded
+   client uses no HTTP proxy. **`POST /api/webhooks/:id/test` no longer relays the target's answer:
+   `response_body` is always `null`** (status code and a coarse error only). Set
+   `WEBHOOK_ALLOW_PRIVATE_TARGETS=1` for dev/test receivers on localhost (deploy/e2e/stack.sh,
+   engine e2e and api tests do).
+7. **Idempotent submits (internal API addition, CONTRACTS §5):** `POST /internal/v1/submit` and batch
+   items accept an optional `"message_id": "<UUIDv7>"` (other UUIDs → `400`). The engine uses it as the
+   message id; a repeat of an id an earlier attempt queued returns the original acceptance (same
+   `message_id`, cost, parts) without debiting, storing, rate-limiting or queuing again. A repeat whose
+   first attempt was debited but not queued: refunded → `500 INTERNAL`; still in flight → `409 CONFLICT`
+   (retry later with the same id). Without `message_id` nothing changes. Old engines ignore the field.
+8. **Campaigns**: every recipient is submitted with an api-chosen `message_id`, stored in
+   `campaign_recipients.attempt_message_id` before the engine call and committed also when the call times
+   out / fails with 5xx; the retry reuses it, so the engine never charges or sends a recipient twice.
+   An engine timeout is treated as "outcome unknown", not "nothing recorded". `CONFLICT` results are
+   retried. Pacing uses `campaigns.last_chunk_at` (clock time at the END of the chunk), so a chunk that
+   takes > 1 s is no longer followed immediately by the next one.
+9. **`Idempotency-Key` header** on `POST /v1/sms/send` and `POST /api/messages/send` (1-255 visible ASCII
+   chars, kept 24 h per org in Redis `idem:send:<org_id>:<sha256(key)>`): a repeat returns the original
+   result and never sends or charges twice; the same key with a different request → `409 CONFLICT`.
+   An engine timeout / 5xx now returns `502 INTERNAL` with `details: {outcome: "unknown", retry_safe}`.
+10. **`GET /v1/sms/:id`**: `cost_micros` is `0` when the message was fully refunded, plus a new
+    `refunded: boolean` (partial refunds were already reflected in `client_cost_micros`).
+11. **`GET /api/analytics/timeseries`** adds `day_boundary_shift_minutes`: daily buckets come from whole-UTC-hour
+    rollups, so in a zone with a non-whole-hour offset (Asia/Kolkata → 30, Asia/Kathmandu → 45) up to that many
+    minutes of traffic per day are counted on the previous date. `0` = exact. Documented approximation;
+    exact local-day figures come from the message log / export.
+12. **Whitelabel**: `GET /api/auth/me` adds top-level `brand_name` (own `brand_name`, else the client's
+    reseller's; web part 1 #1). New public `GET /api/branding?host=<host>` (default: the request's Host):
+    `{host, brand_name, reseller}` for an ACTIVE reseller whose `whitelabel_domain` matches
+    (case-insensitive, port ignored; `brand_name` falls back to the reseller's name), else `brand_name: null`.
+13. **Display fields**: `GET /api/audit-logs` items add `actor_email`, `impersonator_email`, `actor_org_name`,
+    `target_org_name` (privileged lookup limited to ids on rows the caller can see). `GET /api/templates`
+    items add `org_name` (null for route-wide templates).
+14. **api tests** honour `TEST_DB_NAME` / `TEST_REDIS_DB` (defaults `sms_api2` / `5`).
+
+## engine fixer: review findings (SMPP, dispatch, DLR, billing)
+
+All backward compatible for the api and web; behaviour changes are listed so other components and
+operators know them.
+
+1. **Submit outcomes (CONTRACTS §8/§9 dispatcher).** Failover (and, after it, FAILED + refund) now
+   happens only when a submit_sm was definitely not accepted: an error `command_status` /
+   `generic_nack`, or nothing was written (no bound session, shutdown before the write).
+   - `ESME_RTHROTTLED` / `ESME_RMSGQFUL`: the same PDU is resubmitted on the same connection with
+     backoff (200 ms doubling to 5 s, for up to 60 s), and the connection's rate is halved for a
+     cool-down. Only after that does it count as a rejection.
+   - Unknown outcome (`submit_sm_resp` timeout, session lost after the write, shutdown mid-wait):
+     the message is **not resent and not refunded**. The part is recorded as `UNKNOWN`, so a
+     single-part message ends `UNKNOWN` with `error_code` `SUBMIT_TIMEOUT` / `SUBMIT_UNKNOWN` (the CDR
+     carries the connection; no receipt can match it).
+   - `msg:<id>` gets `submitting_ms` (+ `connection_id`, `pdus`) before the first PDU is written. A
+     reclaimed entry with that marker but no `submitted_ms` (crashed instance) is finalized as
+     `UNKNOWN` (`SUBMIT_INTERRUPTED`) instead of being sent again.
+2. **dlrmap (§7).** Each part's entry is written as soon as its `submit_sm_resp` arrives (and again
+   after the last part). Parts that got the same SMSC id share one entry. The value's part field may
+   be a comma list: `<message_id>|<p1>,<p2>,...|<created_ms>`. One part keeps the old format exactly.
+   `msg:<id>.pdus` is set before sending.
+3. **Receipt matching.** The exact id is preferred. The lookup waits only for the connection's
+   known id form; hex/decimal variants are tried once at the end and the converted form is learned
+   per connection. The `message_logs` fallback orders exact-id rows first. A receipt that matches
+   nothing is answered `ESME_RX_T_APPN` up to 3 times per id (counter `dlrunm:<conn>:<id>`, 1 h),
+   then `ESME_ROK`.
+4. **Final-status recording is replay-safe.** `msg:<id>` gets `fin_tok`, `fin_at`, `fin_e` and
+   `emitted`. A go-redis retry of the record script, or a redelivered receipt after a failed
+   finalize, re-emits the final status instead of losing it.
+5. **`done_at`** (webhook §9 and the forwarded SMPP receipt's `done date`) is the engine's receive
+   time, the same instant as `dlr_received_at`. It is no longer the upstream SMSC's local,
+   zone-less `done date`.
+6. **Parts (§3).** Parts = the number of segments actually sent (`len(coding.Split)`), not
+   `ceil(units/153|67)`. They differ by +1 when an escape or surrogate pair straddles a segment
+   boundary. Billing, MaxParts (`MESSAGE_TOO_LONG` above 10 segments), the CDR, template preview
+   and the dispatcher all use it.
+7. **Text validation:** text containing U+0000 is rejected with `INVALID_REQUEST`, as are source or
+   client_ref values containing NUL or invalid UTF-8. The CDR writer also strips NUL, replaces invalid
+   UTF-8, and truncates `varchar(n)` fields by characters, so a row is never dropped.
+8. **Billing.**
+   - A debit that fails with a transport error is refunded immediately (`refund.lua` answers
+     `NO_TXN` if it never ran).
+   - `refunded=true` is written only when the refund was applied. A refund that fails is queued in
+     Redis list `refund:pending` (in memory if Redis is down) and retried every 10 s by every engine
+     (per-message lock `refund:lock:<msg>`). When it succeeds, the CDR is updated (refunded flag or
+     reduced partial-refund costs).
+   - An enqueue error after MULTI/EXEC actually ran is detected (`msg:<id>.created_at_ms` exists) and
+     the message is kept. A message that really was not queued is marked `done` before the refund, so
+     a late stream entry is never dispatched.
+   - `RefundUnloaded` (refund.lua `NOT_LOADED`) follows the lock-then-credit protocol: it locks
+     `accounts_balance` FOR UPDATE, retries refund.lua under the lock, credits still-missing legs in
+     the ledger and loaded legs via credit.lua, and advances the txn's refunded counters. The ledger
+     idempotency key is `refund:<msg>:<org>`, with `:<refunded_before>` appended when non-zero.
+   - Rate-limit checks pass the message id as a token (`rl:once:<id>`, 60 s), so a retried check
+     never counts twice and returns `Replayed`.
+9. **Credit limit / billing mode (§6).** After every config reload the engine pushes changed
+   `billing_mode` / `credit_limit_micros` into loaded Redis balances (`limit` field). On startup it
+   pushes all of them. `GET /internal/v1/balance` therefore reports the new limit about 0.2–1 s after
+   `cfg:invalidate accounts_balance`.
+10. **Upstream connection edits.** Changing `max_tps` applies in place, as do `name`,
+    `request_dlr`, `multipart_mode` and `default_data_coding`, which are read per message. None of
+    them rebinds the sessions any more. Host, port, TLS, credentials, system_type, bind_type,
+    sessions, window, timers and enabled still rebind.
+11. **Upstream sessions.**
+    - The reconnect backoff resets only after a session stayed bound for 30 s. Before, an SMSC that
+      drops sessions right after the bind was redialled about once a second.
+    - While 64 receipt handlers are busy, further `deliver_sm` get `ESME_RX_T_APPN` instead of
+      stalling the socket, so `submit_sm_resp` and keepalives keep being read.
+12. **Client SMPP server (§4).**
+    - `bind_resp` carries `sc_interface_version` only for `interface_version >= 0x34`.
+    - Brute-force protection:
+      - The IP whitelist is checked before the password, and gives `ESME_RBINDFAIL` without revealing
+        whether the password was right.
+      - A remote IP gets 20 failed binds and a system_id 30 per 5 minutes before further attempts get
+        `ESME_RBINDFAIL` without an argon2 check. Credentials verified in the last 10 minutes still
+        bind.
+      - A connection is closed after 3 failed binds.
+    - Unsupported content is rejected rather than re-encoded as text: `data_coding` 2/4 or ≥ 0x10
+      (binary, message class/flash, compressed, MWI) → `ESME_RINVDCS` (0x104, SMPP v5.0 value);
+      UDH elements other than concatenation (port addressing, etc.) → `ESME_RINVESMCLASS`.
+    - When a multipart message is rejected on its completing part (e.g. `ESME_RTHROTTLED`), the
+      acknowledged parts are kept, so the ESME's retry of that part completes it, under a fresh
+      message id.
+    - On an inbound unbind, running submit handlers finish and send their `submit_sm_resp` (≤ 5 s)
+      before `unbind_resp`. Requests after the unbind get `ESME_RINVBNDSTS`.
+13. **Multi-instance.**
+    - Client multipart sets live in Redis (`cc:<system_id>:<hash>`, TTL = concat timeout), so parts
+      sent on binds held by different instances join. Expired sets just expire, without the
+      in-process `OnIncomplete` callback, and the per-system pending limit applies only in-process.
+    - SMPP receipts are delivered only to sessions of the message's organization. A receipt for a
+      system_id that was deleted, or now belongs to another org, is dropped.
+    - Each instance advertises its RX/TRX receivers in `smpp:rx:<system_id>` (hash instance →
+      `org|valid_until_ms`). A receipt read by an instance without the session is handed to
+      `q:dlr-out:i:<instance>` of the one that holds it, with webhooks not re-enqueued.
+    - Instance heartbeats are kept in `q:dlr-out:instances`. Streams of instances silent for more than
+      2 minutes are moved back to `q:dlr-out`.
+    - Pending receipts for offline clients are retried by a separate reclaim loop (≤ 1000 per pass),
+      so they never delay new receipts.
+    - `ENGINE_INSTANCE_ID` must be unique per running instance, as before.
+14. **SMPP account passwords: not changed here.** The api still allows 1-character SMPP passwords
+    (`smpp-accounts.controller.ts` `min(1)`; its tests rely on short ones). The engine-side limits in
+    #12 bound guessing, but a minimum length (6–8) should be set by the api owner.

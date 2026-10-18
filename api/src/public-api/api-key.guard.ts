@@ -6,7 +6,7 @@ import { APP_CONFIG } from '../config/config.module';
 import type { AppConfig } from '../config/config';
 import { AuthedRequest } from '../common/decorators';
 import { AppError } from '../common/errors';
-import { clientIp } from '../common/request.util';
+import { clientIp, proxyTrustOf } from '../common/request.util';
 import { CryptoService } from '../crypto/crypto.service';
 import { DbService } from '../db/db.service';
 import { ApiRateLimiter } from './rate-limiter.service';
@@ -71,7 +71,7 @@ export class ApiKeyGuard implements CanActivate {
     if (!key) throw AppError.unauthorized('Missing API key: use "Authorization: Bearer sk_live_…" or the X-API-Key header');
     if (!KEY_RE.test(key)) throw AppError.unauthorized('Invalid API key');
 
-    const ip = clientIp(req, this.config.TRUST_PROXY);
+    const ip = clientIp(req, proxyTrustOf(this.config));
     const row = await this.db.privileged
       .selectFrom('api_keys as k')
       .innerJoin('app.org_effective_state as s', 's.id', 'k.org_id')

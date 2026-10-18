@@ -9,6 +9,13 @@ export interface EngineSubmitRequest {
   campaign_id?: string;
   route_id?: string;
   test?: boolean;
+  /**
+   * Message id chosen by the api (UUIDv7) so a retry of a submit whose outcome is unknown
+   * (timeout / 5xx) is idempotent: the engine debits per message id (debit.lua DUPLICATE) and
+   * answers a repeat with the original acceptance instead of sending again
+   * (CONTRACTS-CHANGES "api fixes"). Engines that predate it ignore the field.
+   */
+  message_id?: string;
 }
 
 export interface EngineSubmitOk {

@@ -215,14 +215,42 @@ SELECT pg_temp.ok(
   app.ensure_message_log_partitions((current_date + interval '6 months')::date, 1) = 1,
   'ensure_message_log_partitions creates a new month');
 
+-- Sessions for RLS tests: one user + refresh token per client.
+INSERT INTO users (id, org_id, email, password_hash) VALUES
+  ('00000000-0000-0000-0000-0000000000f1', '00000000-0000-0000-0000-0000000000c1', 'c1@example.com', 'x'),
+  ('00000000-0000-0000-0000-0000000000f2', '00000000-0000-0000-0000-0000000000c2', 'c2@example.com', 'x');
+INSERT INTO refresh_tokens (user_id, family_id, token_hash, expires_at) VALUES
+  ('00000000-0000-0000-0000-0000000000f1', gen_random_uuid(), '\x01', now() + interval '1 day'),
+  ('00000000-0000-0000-0000-0000000000f2', gen_random_uuid(), '\x02', now() + interval '1 day');
+
 -- 8. RLS ---------------------------------------------------------------------------
 SET LOCAL ROLE sms_api;
 
 SELECT pg_temp.ok((SELECT count(*) = 0 FROM organizations), 'no tenant context = sees nothing');
+SELECT pg_temp.ok((SELECT count(*) = 0 FROM refresh_tokens), 'no tenant context = sees no refresh tokens');
+
+-- Partitions are reachable only through the RLS-filtered parent.
+SELECT pg_temp.expect_error(
+  format('SELECT count(*) FROM %I', 'message_logs_' || to_char(now(), 'YYYY_MM')),
+  'permission denied');
+SELECT pg_temp.expect_error($$SELECT count(*) FROM message_logs_default$$, 'permission denied');
+SELECT pg_temp.expect_error(
+  format('SELECT count(*) FROM %I', 'message_logs_' || to_char(current_date + interval '6 months', 'YYYY_MM')),
+  'permission denied');
+SELECT pg_temp.expect_error(
+  $$SELECT app.ensure_message_log_partitions((current_date + interval '9 months')::date, 1)$$,
+  'permission denied');
 
 SELECT set_config('app.org_id', '00000000-0000-0000-0000-0000000000c1', true), set_config('app.role', 'CLIENT', true);
 SELECT pg_temp.ok((SELECT count(*) = 1 FROM organizations), 'client sees only itself');
 SELECT pg_temp.ok((SELECT count(*) = 1 FROM message_logs), 'client sees only its messages');
+SELECT pg_temp.ok((SELECT count(*) = 1 FROM refresh_tokens), 'client sees only its own sessions');
+SELECT pg_temp.expect_error($$SELECT token_hash FROM refresh_tokens$$, 'permission denied');
+SELECT pg_temp.expect_error(
+  $$INSERT INTO refresh_tokens (user_id, family_id, token_hash, expires_at)
+    VALUES ('00000000-0000-0000-0000-0000000000f1', gen_random_uuid(), '\x03', now())$$,
+  'permission denied');
+SELECT pg_temp.expect_error($$DELETE FROM refresh_tokens$$, 'permission denied');
 SELECT pg_temp.ok((SELECT count(*) = 0 FROM upstream_connections), 'client cannot see upstream credentials');
 SELECT pg_temp.ok((SELECT array_agg(name) = ARRAY['OTP-Premium'] FROM routes), 'client sees only assigned routes');
 SELECT pg_temp.ok((SELECT count(*) = 1 FROM route_templates WHERE org_id IS NULL), 'client can read route-wide template');
@@ -241,6 +269,7 @@ SELECT pg_temp.ok(
   (SELECT array_agg(name ORDER BY name) = ARRAY['Client 1', 'Reseller 1'] FROM organizations),
   'reseller sees itself and its clients only');
 SELECT pg_temp.ok((SELECT count(*) = 1 FROM message_logs), 'reseller sees its clients'' messages only');
+UPDATE refresh_tokens SET revoked_at = now(), revoked_reason = 'user_disabled' WHERE revoked_at IS NULL;
 SELECT pg_temp.ok((SELECT count(*) = 2 FROM ip_whitelists), 'reseller sees its clients'' whitelists');
 UPDATE organizations SET sending_enabled = false WHERE id = '00000000-0000-0000-0000-0000000000c2';
 SELECT pg_temp.ok(true, 'reseller update on foreign client is a no-op (checked as superuser below)');
@@ -262,6 +291,17 @@ SELECT pg_temp.ok(
 SELECT pg_temp.ok(
   (SELECT smpp_enabled FROM organizations WHERE id = '00000000-0000-0000-0000-0000000000c1'),
   'reseller 1 could toggle its own client''s SMPP');
+SELECT pg_temp.ok(
+  (SELECT revoked_at IS NOT NULL FROM refresh_tokens WHERE user_id = '00000000-0000-0000-0000-0000000000f1'),
+  'reseller could revoke its client''s sessions');
+SELECT pg_temp.ok(
+  (SELECT revoked_at IS NULL FROM refresh_tokens WHERE user_id = '00000000-0000-0000-0000-0000000000f2'),
+  'reseller could not revoke another reseller''s client sessions');
+SELECT pg_temp.ok(
+  (SELECT bool_and(c.relrowsecurity AND NOT has_table_privilege('sms_api', c.oid, 'SELECT'))
+     FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+    WHERE i.inhparent = 'message_logs'::regclass),
+  'every message_logs partition has RLS and no sms_api grant');
 
 \echo 'ALL SCHEMA TESTS PASSED'
 ROLLBACK;

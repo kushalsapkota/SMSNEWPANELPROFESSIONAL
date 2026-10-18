@@ -14,13 +14,22 @@
 # the round trip, so this script also works as a smoke test: exit 0 means the message was DELIVERED.
 #
 # Env: ADMIN_EMAIL / ADMIN_PASSWORD (as for dev-up), API (default http://127.0.0.1:3000),
+#      ENGINE (default http://127.0.0.1:8081), SMPP_ADDR (default 127.0.0.1:2775); these defaults
+#      follow deploy/.run/ports.env when dev-up ran with DEV_PORT_OFFSET / DEV_*_PORT.
 #      DEMO_TO (default +919876543210; smsc-sim delivers every number except …0000/…1111/…2222)
 set -euo pipefail
 
 DEPLOY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN="$DEPLOY/.run"
-API="${API:-http://127.0.0.1:3000}"
-ENGINE="${ENGINE:-http://127.0.0.1:8081}"
+# Ports of the running dev stack (written by dev-up.sh; defaults = CONTRACTS §1).
+if [[ -s "$RUN/ports.env" ]]; then
+  # shellcheck source=/dev/null
+  source "$RUN/ports.env"
+fi
+API="${API:-http://127.0.0.1:${DEV_API_PORT:-3000}}"
+ENGINE="${ENGINE:-http://127.0.0.1:${DEV_ENGINE_HTTP_PORT:-8081}}"
+SMPP_ADDR="${SMPP_ADDR:-127.0.0.1:${DEV_SMPP_PORT:-2775}}"
+SIM_PORT="${DEV_SIM_PORT:-2776}"
 ADMIN_EMAIL="${ADMIN_EMAIL:-admin@smsgw.local}"
 ADMIN_PASSWORD="${ADMIN_PASSWORD:-Admin-Passw0rd!}"
 DEMO_TO="${DEMO_TO:-+919876543210}"
@@ -30,7 +39,7 @@ log() { printf '\033[1;36m[dev-demo]\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31m[dev-demo] ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
 [[ -s "$RUN/dev.env" ]] || die "deploy/.run/dev.env missing: start the stack with deploy/dev-up.sh"
-# shellcheck disable=SC1091
+# shellcheck source=/dev/null
 source "$RUN/dev.env"
 
 # call <METHOD> <path> <auth header value|-> [json body] → response body on stdout; dies on non-2xx.
@@ -55,7 +64,7 @@ if [[ ! -s "$DEMO_ENV" ]]; then
   admin="Bearer $(login "$ADMIN_EMAIL" "$ADMIN_PASSWORD")"
 
   conn_id="$(call POST /api/connections "$admin" '{
-    "name":"smsc-sim (dev)","host":"127.0.0.1","port":2776,"system_id":"smsgw","password":"devpass",
+    "name":"smsc-sim (dev)","host":"127.0.0.1","port":'"$SIM_PORT"',"system_id":"smsgw","password":"devpass",
     "max_tps":200,"sessions":1,"bind_type":"TRX","request_dlr":true}' | jq -er .id)"
   call PUT "/api/connections/$conn_id/rates" "$admin" '[{"prefix":"","cost_micros":2000}]' >/dev/null
   route_id="$(call POST /api/routes "$admin" '{"name":"Default via smsc-sim","description":"dev-up demo route"}' | jq -er .id)"
@@ -102,7 +111,7 @@ DEMO_SMPP_PASSWORD=$smpp_password
 EOF
   umask 022
 fi
-# shellcheck disable=SC1090
+# shellcheck source=/dev/null
 source "$DEMO_ENV"
 
 # The engine picks up the new connection on cfg:invalidate; wait until it has bound to the sim.
@@ -138,7 +147,7 @@ if [[ -x "$RUN/bin/smpp-cli" ]]; then
   log "sending a test SMS via SMPP (smpp-cli, system_id $DEMO_SMPP_SYSTEM_ID)"
   smpp_out=""
   for ((i = 0; i < 10; i++)); do   # the engine picks up the new account/channel on its next reload
-    smpp_out="$("$RUN/bin/smpp-cli" -addr 127.0.0.1:2775 -system-id "$DEMO_SMPP_SYSTEM_ID" -password "$DEMO_SMPP_PASSWORD" \
+    smpp_out="$("$RUN/bin/smpp-cli" -addr "$SMPP_ADDR" -system-id "$DEMO_SMPP_SYSTEM_ID" -password "$DEMO_SMPP_PASSWORD" \
       -from DEMO -to "$DEMO_TO" -text "SMPP dev-up check 773311" -wait 20s 2>&1 || true)"
     jq -e '.bound' <<<"$smpp_out" >/dev/null 2>&1 && break
     sleep 1

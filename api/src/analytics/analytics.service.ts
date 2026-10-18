@@ -101,6 +101,12 @@ export class AnalyticsService {
    * hour: UTC hour buckets (as stored). day: calendar days in the org's timezone (`tz` param,
    * else the filtered org's / acting org's organizations.timezone; unknown zones → UTC).
    * Gaps are filled with zero points.
+   *
+   * Day buckets are built from the whole-UTC-hour rollups (message_stats_hourly). In a zone whose
+   * UTC offset is not a whole number of hours (e.g. Asia/Kolkata +05:30, Asia/Kathmandu +05:45)
+   * the hour that contains local midnight is attributed entirely to the day it starts in, so up to
+   * `day_boundary_shift_minutes` of traffic per day lands on the previous date. The response says
+   * so (0 = exact); exact local-day figures come from the message log / CSV export.
    */
   async timeseries(q: StatsQuery & { granularity: Granularity; tz?: string }) {
     const auth = currentAuth();
@@ -141,9 +147,12 @@ export class AnalyticsService {
                   left join agg a on a.d = g.d
                  order by g.d`.execute(trx)
             ).rows;
+      const shift = q.granularity === 'day' ? await this.dayBoundaryShift(trx, tz, q.from, q.to) : 0;
       return {
         granularity: q.granularity,
         timezone: q.granularity === 'day' ? tz : 'UTC',
+        /** Max minutes of traffic per day attributed to the previous date (half-hour zones); 0 = exact. */
+        day_boundary_shift_minutes: shift,
         points: rows.map((r) => ({
           t: r.t,
           date: r.date,
@@ -255,6 +264,17 @@ export class AnalyticsService {
   }
 
   /** Requested tz if valid, else the covered org's (or acting org's) timezone, else UTC. */
+  /**
+   * Minutes past the UTC hour at which local midnight falls in `tz` during [from, to) (largest
+   * over the range, which covers DST changes): 0 for whole-hour offsets.
+   */
+  private async dayBoundaryShift(trx: Transaction<DB>, tz: string, from: Date, to: Date): Promise<number> {
+    const r = await sql<{ shift: number | null }>`
+      select max(((extract(epoch from (d at time zone ${tz}) - (d at time zone 'UTC'))::bigint / 60) % 60 + 60) % 60)::int as shift
+        from generate_series(${from}::timestamptz, ${to}::timestamptz, interval '1 day') d`.execute(trx);
+    return r.rows[0]?.shift ?? 0;
+  }
+
   private async timezone(trx: Transaction<DB>, f: OrgFilter, requested?: string): Promise<string> {
     const valid = async (tz: string | null | undefined): Promise<boolean> =>
       !!tz && (await sql<{ ok: boolean }>`select exists (select 1 from pg_timezone_names where name = ${tz}) as ok`.execute(trx)).rows[0].ok;

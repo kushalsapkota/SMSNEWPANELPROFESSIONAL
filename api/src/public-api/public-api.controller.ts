@@ -1,11 +1,11 @@
-import { Body, Controller, Get, HttpCode, Param, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Headers, HttpCode, Param, Post, Query, UseGuards } from '@nestjs/common';
 import { ApiBody, ApiHeader, ApiOkResponse, ApiOperation, ApiParam, ApiQuery, ApiResponse, ApiSecurity, ApiTags } from '@nestjs/swagger';
 import { z } from 'zod';
 import { NoRequestTransaction, Public } from '../common/decorators';
 import { UuidPipe } from '../common/uuid.pipe';
 import { senderAddress } from '../common/validation';
 import { ZodPipe } from '../common/zod.pipe';
-import { MAX_RECIPIENTS } from '../messaging/send.service';
+import { MAX_RECIPIENTS, parseIdempotencyKey } from '../messaging/send.service';
 import { ApiKeyGuard, RequireScope } from './api-key.guard';
 import { PublicApiService } from './public-api.service';
 import { ERROR_SCHEMA, MESSAGE_STATUS_SCHEMA, SEND_BODY_SCHEMA, SEND_RESPONSE_SCHEMA } from './public-api.schemas';
@@ -42,8 +42,14 @@ export class PublicApiController {
   @ApiBody({ schema: SEND_BODY_SCHEMA })
   @ApiOkResponse({ schema: SEND_RESPONSE_SCHEMA })
   @ApiResponse({ status: 422, description: 'Rejected (single recipient)', schema: ERROR_SCHEMA })
-  send(@Body(new ZodPipe(sendSchema)) body: z.infer<typeof sendSchema>) {
-    return this.api.send(body);
+  @ApiResponse({ status: 409, description: 'Idempotency-Key reused for a different request', schema: ERROR_SCHEMA })
+  @ApiHeader({
+    name: 'Idempotency-Key',
+    required: false,
+    description: 'Up to 255 visible ASCII characters. Repeating a request with the same key within 24h never sends or charges twice; it returns the original result.',
+  })
+  send(@Body(new ZodPipe(sendSchema)) body: z.infer<typeof sendSchema>, @Headers('idempotency-key') idem?: string) {
+    return this.api.send(body, parseIdempotencyKey(idem));
   }
 
   @Get('sms/send')

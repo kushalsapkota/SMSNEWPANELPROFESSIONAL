@@ -9,8 +9,11 @@
 #   data     internal (no egress, nothing published): postgres, redis, db-init, db-maint
 #   backend  internal: engine:8081 internal API, engine:9100 metrics, smsc-sim
 #   edge     normal bridge: published ports and outbound traffic (upstream SMSCs, webhooks, SMTP)
-# Published (bind address PUBLISH_ADDR, default 0.0.0.0; set 127.0.0.1 behind nginx):
-#   web 3001, api 3000, client SMPP 2775. Nothing else is published.
+# Published: web 3001 and api 3000 on PUBLISH_ADDR (default 127.0.0.1: only nginx on this host
+# reaches them, see nginx.conf), client SMPP 2775 on SMPP_PUBLISH_ADDR (default 0.0.0.0: SMPP has
+# no X-Forwarded-For and the engine needs the real peer for SMPP IP whitelists). Nothing else is
+# published. Do NOT publish web/api on a public address with TRUST_PROXY=1: the web forwards the
+# client's own X-Forwarded-For to the api, so panel/API IP whitelists could be spoofed.
 #
 # Compose resolves paths in this file relative to deploy/, and the build context is the repo
 # root (..).
@@ -166,7 +169,7 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-info}
       LOG_FORMAT: json
     ports:
-      - "${PUBLISH_ADDR:-0.0.0.0}:${SMPP_PUBLIC_PORT:-2775}:2775"
+      - "${SMPP_PUBLISH_ADDR:-0.0.0.0}:${SMPP_PUBLIC_PORT:-2775}:2775"
     ulimits:
       nofile:
         soft: 65536
@@ -205,6 +208,7 @@ services:
       APP_ENC_KEY: ${APP_ENC_KEY:?set APP_ENC_KEY}
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in deploy/.env}
       TRUST_PROXY: ${TRUST_PROXY:-1}
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-loopback,linklocal,uniquelocal}
       TOTP_ISSUER: ${TOTP_ISSUER:-SMS Gateway}
       DB_POOL_MAX: ${API_DB_POOL_MAX:-20}
       PUBLIC_API_RATE_LIMIT: ${PUBLIC_API_RATE_LIMIT:-100}
@@ -220,7 +224,7 @@ services:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       SWAGGER_ENABLED: ${SWAGGER_ENABLED:-1}
     ports:
-      - "${PUBLISH_ADDR:-0.0.0.0}:${API_PUBLIC_PORT:-3000}:3000"
+      - "${PUBLISH_ADDR:-127.0.0.1}:${API_PUBLIC_PORT:-3000}:3000"
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
       interval: 10s
@@ -232,8 +236,10 @@ services:
         condition: service_completed_successfully
       redis:
         condition: service_healthy
+      # Not required for the api to run (its /api/health treats the engine as informational),
+      # but waiting avoids 502s on the first sends after a cold start.
       engine:
-        condition: service_started
+        condition: service_healthy
     networks: [data, backend, edge]
     stop_grace_period: 20s
     logging: *logging
@@ -272,7 +278,7 @@ services:
       PORT: "3001"
       HOSTNAME: 0.0.0.0
     ports:
-      - "${PUBLISH_ADDR:-0.0.0.0}:${WEB_PUBLIC_PORT:-3001}:3001"
+      - "${PUBLISH_ADDR:-127.0.0.1}:${WEB_PUBLIC_PORT:-3001}:3001"
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/login').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
       interval: 10s
@@ -281,7 +287,7 @@ services:
       start_period: 30s
     depends_on:
       api:
-        condition: service_started
+        condition: service_healthy
     networks: [edge]
     stop_grace_period: 15s
     logging: *logging

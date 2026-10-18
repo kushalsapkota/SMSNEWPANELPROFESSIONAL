@@ -77,6 +77,26 @@ export class EngineClient {
     }
   }
 
+  /**
+   * Synchronous engine config reload (CONTRACTS-CHANGES integration #2). cfg:invalidate is
+   * debounced on the engine side; org state changes call this after commit so they are
+   * enforced (SMPP binds, submits) by the time the management response is sent.
+   */
+  async reloadConfig(): Promise<number> {
+    const r = await this.request<{ version: number }>('POST', '/internal/v1/config/reload');
+    return r.version;
+  }
+
+  /** Best-effort reload; the pubsub invalidation still applies the change if this fails. */
+  async reloadConfigQuietly(): Promise<number | null> {
+    try {
+      return await this.reloadConfig();
+    } catch (e) {
+      this.logger.warn(`engine config reload failed: ${(e as Error).message}`);
+      return null;
+    }
+  }
+
   creditBalance(orgId: string, deltaMicros: number, idempotencyKey: string): Promise<EngineCreditResponse> {
     return this.request('POST', '/internal/v1/balance/credit', {
       org_id: orgId,

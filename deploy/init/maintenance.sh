@@ -13,7 +13,9 @@ set -euo pipefail
 
 months="${MAINT_PARTITION_MONTHS:-3}"
 retention="${MESSAGE_LOG_RETENTION:-}"
-[[ "$months" =~ ^[0-9]+$ ]] && ((months >= 1 && months <= 36)) || { echo "maintenance: MAINT_PARTITION_MONTHS must be 1-36" >&2; exit 2; }
+if ! [[ "$months" =~ ^[0-9]+$ ]] || ((months < 1 || months > 36)); then
+  echo "maintenance: MAINT_PARTITION_MONTHS must be 1-36" >&2; exit 2
+fi
 if [[ -n "$retention" && ! "$retention" =~ ^[0-9]+\ (month|months|year|years|day|days)$ ]]; then
   echo "maintenance: MESSAGE_LOG_RETENTION must look like '13 months' (got '$retention')" >&2; exit 2
 fi

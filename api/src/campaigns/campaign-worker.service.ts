@@ -7,12 +7,16 @@ import type { DB } from '../db/types';
 import { EngineClient, EngineUnavailableError } from '../engine/engine-client.service';
 import type { EngineBatchResult, EngineSubmitRequest } from '../engine/engine.types';
 import { ENGINE_BATCH_MAX, isSubmitOk } from '../messaging/send.service';
+import { newUuidV7 } from '../messaging/uuidv7';
 import { renderBody } from './recipients';
 
 /** Rejections that concern the whole org, not the recipient: keep the recipient pending and pause. */
 const ORG_LEVEL = new Set(['INSUFFICIENT_FUNDS', 'ACCOUNT_SUSPENDED', 'SENDING_DISABLED', 'CHANNEL_DISABLED', 'DAILY_LIMIT', 'MONTHLY_LIMIT']);
-/** Transient: keep pending, retry on a later tick. */
-const RETRYABLE = new Set(['RATE_LIMITED']);
+/**
+ * Transient: keep pending, retry on a later tick. CONFLICT = the engine is still processing an
+ * earlier attempt with the same message id (outcome unknown to us): retry with the same id.
+ */
+const RETRYABLE = new Set(['RATE_LIMITED', 'CONFLICT']);
 
 /** Max campaigns handled per tick (each gets at most one chunk). */
 const CAMPAIGNS_PER_TICK = 50;
@@ -34,12 +38,23 @@ export interface ChunkOutcome {
  * time and pause/cancel (conditional UPDATEs) serialise behind the in-flight chunk.
  *
  * Pacing: a chunk is at most the org's effective_max_tps recipients (≤1000) and a campaign is
- * picked only when its updated_at (= start of its previous chunk's transaction, set by the
- * touch trigger) is ≥ 1s old, which bounds every campaign to ~max_tps messages/s across all
- * instances. The engine's per-org limiter still has the final word (RATE_LIMITED → retried).
+ * picked only when its previous chunk FINISHED (campaigns.last_chunk_at = clock time at the end
+ * of the chunk, not updated_at, which the touch trigger sets to the transaction start) ≥ 1s ago.
+ * A slow chunk therefore never lets the next one start right behind it, so every campaign stays
+ * at or below ~max_tps messages/s across all instances. The engine's per-org limiter still has
+ * the final word (RATE_LIMITED → retried).
  *
- * Delivery guarantee: at-least-once per chunk. If the process dies after the engine accepted a
- * chunk but before its transaction commits, that chunk is submitted again.
+ * No double sends on engine timeouts / 5xx: every recipient is submitted with a message id the
+ * api chose (UUIDv7, `message_id`). It is stored in campaign_recipients.attempt_message_id in the
+ * chunk's transaction, which commits also when the engine call fails, and the retry reuses it.
+ * The engine debits per message id (debit.lua answers DUPLICATE) and returns the original
+ * acceptance for a repeated id, so recipients the engine already accepted before the api gave up
+ * are neither charged nor sent again. An id stays attached to a recipient until its outcome is
+ * known; ids of recipients the engine definitively did not accept are dropped, so a later retry
+ * gets a fresh, current id.
+ *
+ * Remaining gap: if the process dies after the engine accepted a chunk but before the chunk's
+ * transaction commits, the attempt ids are lost with it and that chunk is submitted again.
  */
 @Injectable()
 export class CampaignWorker implements OnModuleInit, OnModuleDestroy {
@@ -107,9 +122,9 @@ export class CampaignWorker implements OnModuleInit, OnModuleDestroy {
       .selectFrom('campaigns')
       .select(['id', 'org_id', 'source_addr', 'body', 'total', 'submitted', 'failed'])
       .where('status', '=', 'RUNNING')
-      .where('updated_at', '<=', sql<Date>`now() - make_interval(secs => ${this.paceMs / 1000})`);
+      .where(sql<boolean>`coalesce(last_chunk_at, '-infinity'::timestamptz) <= clock_timestamp() - make_interval(secs => ${this.paceMs / 1000})`);
     if (exclude.length > 0) q = q.where('id', 'not in', exclude);
-    const c = await q.orderBy('updated_at').limit(1).forUpdate().skipLocked().executeTakeFirst();
+    const c = await q.orderBy(sql`coalesce(last_chunk_at, '-infinity'::timestamptz)`).limit(1).forUpdate().skipLocked().executeTakeFirst();
     if (!c) return null;
 
     const state = await trx
@@ -126,7 +141,7 @@ export class CampaignWorker implements OnModuleInit, OnModuleDestroy {
     const chunk = Math.max(1, Math.min(state.effective_max_tps, ENGINE_BATCH_MAX));
     const recips = await trx
       .selectFrom('campaign_recipients')
-      .select(['seq', 'destination', 'vars'])
+      .select(['seq', 'destination', 'vars', 'attempt_message_id'])
       .where('campaign_id', '=', c.id)
       .where('message_id', 'is', null)
       .where('error_code', 'is', null)
@@ -138,7 +153,20 @@ export class CampaignWorker implements OnModuleInit, OnModuleDestroy {
       return { campaignId: c.id, submitted: 0, failed: 0, deferred: 0, status };
     }
 
-    const items: EngineSubmitRequest[] = recips.map((r) => ({
+    // Ids carried over from an attempt with an unknown outcome are reused (idempotent submit).
+    const carried = new Set(recips.filter((r) => r.attempt_message_id !== null).map((r) => r.seq));
+    const ids = recips.map((r) => r.attempt_message_id ?? newUuidV7());
+    const fresh = recips.map((r, i) => ({ seq: r.seq, id: ids[i] })).filter((x) => !carried.has(x.seq));
+    if (fresh.length > 0) {
+      const values = sql.join(fresh.map((x) => sql`(${x.seq}::int, ${x.id}::uuid)`));
+      await sql`
+        update campaign_recipients r set attempt_message_id = v.id
+          from (values ${values}) as v(seq, id)
+         where r.campaign_id = ${c.id}::uuid and r.seq = v.seq`.execute(trx);
+    }
+
+    const items: EngineSubmitRequest[] = recips.map((r, i) => ({
+      message_id: ids[i],
       org_id: c.org_id,
       channel: 'WEB',
       source: c.source_addr,
@@ -152,15 +180,19 @@ export class CampaignWorker implements OnModuleInit, OnModuleDestroy {
       results = await this.engine.submitBatch(items);
     } catch (e) {
       if (e instanceof EngineUnavailableError) {
-        // Nothing was recorded; bump updated_at so the retry is paced like a chunk.
-        this.logger.warn(`campaign ${c.id}: engine unavailable, will retry: ${e.message}`);
-        await trx.updateTable('campaigns').set({ updated_at: sql<Date>`now()` }).where('id', '=', c.id).execute();
+        // Outcome UNKNOWN: the engine may have accepted (and charged) part of the chunk before
+        // the timeout / 5xx. The attempt ids are committed with this transaction, so the retry
+        // (paced like a chunk) resubmits the same ids and the engine deduplicates them.
+        this.logger.warn(`campaign ${c.id}: engine unavailable, outcome unknown; will retry the same message ids: ${e.message}`);
+        await trx.updateTable('campaigns').set({ last_chunk_at: sql<Date>`clock_timestamp()` }).where('id', '=', c.id).execute();
         return { campaignId: c.id, submitted: 0, failed: 0, deferred: recips.length, status: 'RUNNING' };
       }
       throw e;
     }
 
     const updates: { seq: number; message_id: string | null; error_code: string | null }[] = [];
+    /** Deferred recipients the engine definitively did not accept: their attempt id is dropped. */
+    const dropIds: number[] = [];
     let submitted = 0;
     let failed = 0;
     let deferred = 0;
@@ -173,11 +205,12 @@ export class CampaignWorker implements OnModuleInit, OnModuleDestroy {
         return;
       }
       const code = (res as { error_code?: string } | undefined)?.error_code ?? 'INTERNAL';
-      if (ORG_LEVEL.has(code)) {
-        pauseReason ??= code;
+      if (ORG_LEVEL.has(code) || RETRYABLE.has(code)) {
+        if (ORG_LEVEL.has(code)) pauseReason ??= code;
         deferred += 1;
-      } else if (RETRYABLE.has(code)) {
-        deferred += 1;
+        // A fresh id was certainly not accepted. A carried one (earlier outcome unknown) may
+        // have been: keep it so the next retry is still deduplicated by the engine.
+        if (!carried.has(r.seq)) dropIds.push(r.seq);
       } else {
         updates.push({ seq: r.seq, message_id: null, error_code: code });
         failed += 1;
@@ -188,13 +221,20 @@ export class CampaignWorker implements OnModuleInit, OnModuleDestroy {
       const values = sql.join(updates.map((u) => sql`(${u.seq}::int, ${u.message_id}::uuid, ${u.error_code}::text)`));
       await sql`
         update campaign_recipients r
-           set message_id = v.message_id, error_code = v.error_code
+           set message_id = v.message_id, error_code = v.error_code, attempt_message_id = null
           from (values ${values}) as v(seq, message_id, error_code)
          where r.campaign_id = ${c.id}::uuid and r.seq = v.seq`.execute(trx);
     }
+    if (dropIds.length > 0) {
+      await trx.updateTable('campaign_recipients').set({ attempt_message_id: null }).where('campaign_id', '=', c.id).where('seq', 'in', dropIds).execute();
+    }
     await trx
       .updateTable('campaigns')
-      .set({ submitted: sql<number>`submitted + ${submitted}`, failed: sql<number>`failed + ${failed}`, updated_at: sql<Date>`now()` })
+      .set({
+        submitted: sql<number>`submitted + ${submitted}`,
+        failed: sql<number>`failed + ${failed}`,
+        last_chunk_at: sql<Date>`clock_timestamp()`,
+      })
       .where('id', '=', c.id)
       .execute();
 

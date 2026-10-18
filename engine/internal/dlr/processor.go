@@ -6,10 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
@@ -39,6 +43,9 @@ type Event struct {
 	SubmittedAt  *time.Time `json:"submitted_at"`
 	DoneAt       time.Time  `json:"done_at"`
 	EnqueuedAt   time.Time  `json:"enqueued_at"`
+	// SkipWebhook: webhooks were already enqueued (event handed over to
+	// another instance for SMPP delivery).
+	SkipWebhook bool `json:"skip_wh,omitempty"`
 }
 
 // EventField is the q:dlr-out entry field.
@@ -48,9 +55,12 @@ const EventField = "e"
 type Options struct {
 	Stream     string        // client DLR stream; default pipeline.DLROutStream
 	LookupWait time.Duration // wait for a dlrmap entry racing the submit_sm_resp; default 3s
-	Logger     *slog.Logger
-	Metrics    *metrics.Engine
-	Now        func() time.Time
+	// UnmatchedRetries: a receipt matching no message is answered
+	// ESME_RX_T_APPN this many times before it is acknowledged; default 3.
+	UnmatchedRetries int
+	Logger           *slog.Logger
+	Metrics          *metrics.Engine
+	Now              func() time.Time
 }
 
 // Processor handles upstream receipts and dispatcher outcomes. It implements
@@ -62,6 +72,8 @@ type Processor struct {
 	opts Options
 	log  *slog.Logger
 	m    *metrics.Engine
+
+	forms sync.Map // connection id -> idForm its receipts use
 }
 
 // NewProcessor creates a Processor. db (optional) enables the
@@ -72,6 +84,9 @@ func NewProcessor(rdb redis.UniversalClient, sink pipeline.CDRSink, db *pgxpool.
 	}
 	if o.LookupWait <= 0 {
 		o.LookupWait = 3 * time.Second
+	}
+	if o.UnmatchedRetries == 0 {
+		o.UnmatchedRetries = 3
 	}
 	if o.Logger == nil {
 		o.Logger = slog.Default()
@@ -109,93 +124,180 @@ func (p *Processor) HandleDeliver(connID string, d *pdu.DeliverSM) pdu.CommandSt
 	ctx, cancel := context.WithTimeout(context.Background(), p.opts.LookupWait+10*time.Second)
 	defer cancel()
 
-	msgID, part, createdMS, found, err := p.lookup(ctx, connID, r.ID)
+	msgID, parts, createdMS, found, err := p.lookup(ctx, connID, r.ID)
 	if err != nil {
 		p.log.Warn("dlrmap lookup failed", "connection_id", connID, "smsc_id", r.ID, "err", err)
 		return pdu.ESME_RX_T_APPN
 	}
 	stat := truncate(r.Stat, 7)
 	errCode := normalizeErr(r.Err)
-	doneAt := r.DoneDate
-	if doneAt.IsZero() {
-		doneAt = p.opts.Now().UTC()
-	}
+	// The receipt's "done date" is in the SMSC's local zone with minute
+	// precision and no zone marker; the client sees our own receive time
+	// (the same instant recorded as dlr_received_at).
+	doneAt := p.opts.Now().UTC()
 	if !found {
 		return p.fallback(ctx, connID, r.ID, status, stat, errCode)
 	}
-	o, err := RecordPart(ctx, p.rdb, msgID, part, status, stat, errCode)
-	if err != nil {
-		p.log.Warn("record DLR failed", "message_id", msgID, "err", err)
-		return pdu.ESME_RX_T_APPN
-	}
-	switch o.Kind {
-	case OutcomeFinal:
-		if err := p.finalize(ctx, msgID, createdMS, o.Status, o.DLRStat, o.DLRErr, doneAt); err != nil {
-			p.log.Error("finalize DLR failed", "message_id", msgID, "err", err)
+	token := uuid.NewString()
+	for _, part := range parts {
+		o, err := recordPart(ctx, p.rdb, msgID, part, status, stat, errCode, token, p.opts.Now())
+		if err != nil {
+			p.log.Warn("record DLR failed", "message_id", msgID, "err", err)
 			return pdu.ESME_RX_T_APPN
 		}
-	case OutcomeNoMsg:
-		// Message state expired: update the CDR as a single final outcome.
-		p.updateCDR(ctx, msgID, time.UnixMilli(createdMS).UTC(), status, stat, errCode)
+		switch o.Kind {
+		case OutcomeFinal:
+			if err := p.finalize(ctx, msgID, createdMS, o.Status, o.DLRStat, o.DLRErr, doneAt); err != nil {
+				p.log.Error("finalize DLR failed", "message_id", msgID, "err", err)
+				if rerr := ReleaseFinal(ctx, p.rdb, msgID); rerr != nil {
+					p.log.Warn("release final claim failed", "message_id", msgID, "err", rerr)
+				}
+				return pdu.ESME_RX_T_APPN
+			}
+			return pdu.ESME_ROK
+		case OutcomeNoMsg:
+			// Message state expired: update the CDR as a single final outcome.
+			p.updateCDR(ctx, msgID, time.UnixMilli(createdMS).UTC(), status, stat, errCode)
+			return pdu.ESME_ROK
+		case OutcomeDone:
+			return pdu.ESME_ROK
+		}
 	}
 	return pdu.ESME_ROK
 }
 
-// lookup resolves an SMSC id through dlrmap, waiting a little for an entry
-// whose submit_sm_resp is still being recorded.
-func (p *Processor) lookup(ctx context.Context, connID, smscID string) (msgID string, part int, createdMS int64, found bool, err error) {
-	variants := pdu.MessageIDVariants(smscID)
-	keys := make([]string, 0, len(variants))
-	for _, v := range variants {
-		if v != "" {
-			keys = append(keys, pipeline.DLRMapKey(connID, v))
+// idForm names how a receipt id relates to the id stored from
+// submit_sm_resp on a connection.
+type idForm string
+
+const (
+	formExact   idForm = "exact"
+	formDec2Hex idForm = "dec2hex" // receipt decimal, submit_sm_resp hex
+	formHex2Dec idForm = "hex2dec" // receipt hex, submit_sm_resp decimal
+)
+
+// idForms returns the normalized key candidates of a receipt id by form.
+func idForms(smscID string) map[idForm]string {
+	v := pdu.MessageIDVariants(smscID)
+	out := map[idForm]string{}
+	if len(v) == 0 || v[0] == "" {
+		return out
+	}
+	n := v[0]
+	out[formExact] = n
+	isDec := true
+	for i := 0; i < len(n); i++ {
+		if n[i] < '0' || n[i] > '9' {
+			isDec = false
+			break
 		}
 	}
-	if len(keys) == 0 {
-		return "", 0, 0, false, nil
+	if b, ok := new(big.Int).SetString(n, 10); ok && isDec {
+		if h := b.Text(16); h != n {
+			out[formDec2Hex] = h
+		}
 	}
+	if b, ok := new(big.Int).SetString(n, 16); ok {
+		if d := b.Text(10); d != n {
+			out[formHex2Dec] = d
+		}
+	}
+	return out
+}
+
+// lookup resolves an SMSC id through dlrmap. It waits (up to LookupWait)
+// only for the key in the connection's known id form — the exact id unless
+// receipts on this connection were seen to use a converted (hex/decimal)
+// form — and tries the other forms once at the end. Polling every variant at
+// once would match another message whose id happens to equal this one's
+// conversion while this receipt's own entry is still being written.
+func (p *Processor) lookup(ctx context.Context, connID, smscID string) (msgID string, parts []int, createdMS int64, found bool, err error) {
+	forms := idForms(smscID)
+	if len(forms) == 0 {
+		return "", nil, 0, false, nil
+	}
+	primary := formExact
+	if f, ok := p.forms.Load(connID); ok {
+		if _, has := forms[f.(idForm)]; has {
+			primary = f.(idForm)
+		}
+	}
+	parse := func(v string) (string, []int, int64, bool) {
+		id, parts, created, perr := pipeline.ParseDLRMapParts(v)
+		if perr != nil {
+			p.log.Warn("bad dlrmap value", "value", v)
+			return "", nil, 0, false
+		}
+		return id, parts, created, true
+	}
+	key := pipeline.DLRMapKey(connID, forms[primary])
 	deadline := time.Now().Add(p.opts.LookupWait)
 	delay := 20 * time.Millisecond
 	for {
-		vals, err := p.rdb.MGet(ctx, keys...).Result()
-		if err != nil {
-			return "", 0, 0, false, err
+		v, err := p.rdb.Get(ctx, key).Result()
+		if err == nil {
+			if id, parts, created, ok := parse(v); ok {
+				return id, parts, created, true, nil
+			}
+			break
 		}
-		for _, v := range vals {
-			s, ok := v.(string)
-			if !ok {
-				continue
-			}
-			id, part, created, perr := pipeline.ParseDLRMapValue(s)
-			if perr != nil {
-				p.log.Warn("bad dlrmap value", "value", s)
-				continue
-			}
-			return id, part, created, true, nil
+		if !errors.Is(err, redis.Nil) {
+			return "", nil, 0, false, err
 		}
 		if time.Now().Add(delay).After(deadline) {
-			return "", 0, 0, false, nil
+			break
 		}
 		select {
 		case <-time.After(delay):
 		case <-ctx.Done():
-			return "", 0, 0, false, ctx.Err()
+			return "", nil, 0, false, ctx.Err()
 		}
 		delay = min(delay*2, 500*time.Millisecond)
 	}
+	// Other forms, once (exact first).
+	for _, f := range []idForm{formExact, formDec2Hex, formHex2Dec} {
+		id, ok := forms[f]
+		if !ok || f == primary {
+			continue
+		}
+		v, err := p.rdb.Get(ctx, pipeline.DLRMapKey(connID, id)).Result()
+		if errors.Is(err, redis.Nil) {
+			continue
+		}
+		if err != nil {
+			return "", nil, 0, false, err
+		}
+		if id, parts, created, ok := parse(v); ok {
+			if f != formExact {
+				p.forms.Store(connID, f) // this connection converts ids
+			} else {
+				p.forms.Delete(connID)
+			}
+			return id, parts, created, true, nil
+		}
+	}
+	return "", nil, 0, false, nil
 }
 
 // fallback matches a receipt whose dlrmap entry is gone against
-// message_logs.smsc_msg_ids (GIN index) for the last 35 days.
+// message_logs.smsc_msg_ids (GIN index) for the last 35 days, preferring a
+// row whose stored id is the receipt id itself over a hex/decimal variant.
+// A receipt that matches nothing is answered ESME_RX_T_APPN a few times
+// (UnmatchedRetries; its submit may still be in flight) before it is
+// acknowledged and dropped.
 func (p *Processor) fallback(ctx context.Context, connID, smscID, status, stat, errCode string) pdu.CommandStatus {
 	if p.db == nil {
-		p.m.DLRReceived.With("unmatched").Inc()
-		p.log.Warn("unmatched delivery receipt", "connection_id", connID, "smsc_id", smscID)
-		return pdu.ESME_ROK
+		return p.unmatched(ctx, connID, smscID)
 	}
-	cands := []string{strings.TrimSpace(smscID)}
-	for _, v := range pdu.MessageIDVariants(smscID) {
+	raw := strings.TrimSpace(smscID)
+	exact := []string{raw, strings.ToLower(raw), strings.ToUpper(raw)}
+	forms := idForms(smscID)
+	cands := append([]string(nil), exact...)
+	for _, v := range forms {
 		cands = append(cands, v, strings.ToUpper(v))
+	}
+	if n, ok := forms[formExact]; ok {
+		exact = append(exact, n, strings.ToUpper(n))
 	}
 	var id string
 	var created time.Time
@@ -203,17 +305,34 @@ func (p *Processor) fallback(ctx context.Context, connID, smscID, status, stat, 
 		SELECT id::text, created_at FROM message_logs
 		 WHERE smsc_msg_ids && $1::text[] AND connection_id = $2
 		   AND created_at > now() - interval '35 days'
-		 ORDER BY created_at DESC LIMIT 1`, cands, connID).Scan(&id, &created)
+		 ORDER BY (smsc_msg_ids && $3::text[]) DESC, created_at DESC LIMIT 1`, cands, connID, exact).Scan(&id, &created)
 	if errors.Is(err, pgx.ErrNoRows) {
-		p.m.DLRReceived.With("unmatched").Inc()
-		p.log.Warn("unmatched delivery receipt", "connection_id", connID, "smsc_id", smscID)
-		return pdu.ESME_ROK
+		return p.unmatched(ctx, connID, smscID)
 	}
 	if err != nil {
 		p.log.Warn("DLR fallback lookup failed", "err", err)
 		return pdu.ESME_RX_T_APPN
 	}
 	p.updateCDR(ctx, id, created, status, stat, errCode)
+	return pdu.ESME_ROK
+}
+
+// unmatched answers ESME_RX_T_APPN for the first UnmatchedRetries
+// deliveries of a receipt nobody knows (counted in Redis for an hour), then
+// ESME_ROK so the SMSC stops redelivering it.
+func (p *Processor) unmatched(ctx context.Context, connID, smscID string) pdu.CommandStatus {
+	key := "dlrunm:" + connID + ":" + pdu.NormalizeMessageID(smscID)
+	n, err := p.rdb.Incr(ctx, key).Result()
+	if err == nil && n == 1 {
+		p.rdb.Expire(ctx, key, time.Hour)
+	}
+	if err == nil && n <= int64(p.opts.UnmatchedRetries) {
+		p.m.DLRReceived.With("unmatched_retry").Inc()
+		p.log.Info("unmatched delivery receipt; asking the SMSC to redeliver", "connection_id", connID, "smsc_id", smscID, "attempt", n)
+		return pdu.ESME_RX_T_APPN
+	}
+	p.m.DLRReceived.With("unmatched").Inc()
+	p.log.Warn("unmatched delivery receipt", "connection_id", connID, "smsc_id", smscID)
 	return pdu.ESME_ROK
 }
 
@@ -224,11 +343,15 @@ func (p *Processor) updateCDR(ctx context.Context, msgID string, created time.Ti
 	}
 }
 
+// truncate cuts s to at most n bytes without splitting a UTF-8 sequence.
 func truncate(s string, n int) string {
-	if len(s) > n {
-		return s[:n]
+	if len(s) <= n {
+		return s
 	}
-	return s
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
 
 // finalize writes the final CDR status and emits the client event.
@@ -250,7 +373,8 @@ func (p *Processor) finalize(ctx context.Context, msgID string, createdMS int64,
 	return p.emit(ctx, msgID, status, stat, e, doneAt)
 }
 
-// emit appends the client event for msgID to the DLR stream.
+// emit appends the client event for msgID to the DLR stream and marks the
+// message emitted.
 func (p *Processor) emit(ctx context.Context, msgID, status, stat, errCode string, doneAt time.Time) error {
 	h, err := p.rdb.HGetAll(ctx, pipeline.MsgKey(msgID)).Result()
 	if err != nil {
@@ -282,6 +406,9 @@ func (p *Processor) emit(ctx context.Context, msgID, status, stat, errCode strin
 	if err := p.rdb.XAdd(ctx, &redis.XAddArgs{Stream: p.opts.Stream, Values: []any{EventField, string(b)}}).Err(); err != nil {
 		return fmt.Errorf("dlr: xadd %s: %w", p.opts.Stream, err)
 	}
+	if err := MarkEmitted(ctx, p.rdb, msgID); err != nil {
+		p.log.Warn("could not mark DLR emitted", "message_id", msgID, "err", err)
+	}
 	return nil
 }
 
@@ -310,16 +437,31 @@ func (p *Processor) MessageFailed(ctx context.Context, job *pipeline.DispatchJob
 
 // PartsFailed implements dispatch.Finalizer for parts rejected upstream.
 func (p *Processor) PartsFailed(ctx context.Context, job *pipeline.DispatchJob, parts []int, errorCode string) error {
+	return p.recordParts(ctx, job, parts, cdr.StatusFailed, errorCode)
+}
+
+// PartsUnknown implements dispatch.Finalizer for parts whose submission
+// outcome is unknown (they may have been accepted; no receipt can match).
+func (p *Processor) PartsUnknown(ctx context.Context, job *pipeline.DispatchJob, parts []int, errorCode string) error {
+	return p.recordParts(ctx, job, parts, cdr.StatusUnknown, errorCode)
+}
+
+func (p *Processor) recordParts(ctx context.Context, job *pipeline.DispatchJob, parts []int, status, errorCode string) error {
 	if err := p.sink.Update(ctx, cdr.Update{ID: job.ID, CreatedAt: job.CreatedAt(), ErrorCode: &errorCode}); err != nil {
 		p.log.Error("cdr update failed", "message_id", job.ID, "err", err)
 	}
+	token := uuid.NewString()
 	for _, idx := range parts {
-		o, err := RecordPart(ctx, p.rdb, job.ID, idx, cdr.StatusFailed, "", "000")
+		o, err := recordPart(ctx, p.rdb, job.ID, idx, status, "", "000", token, p.opts.Now())
 		if err != nil {
 			return err
 		}
 		if o.Kind == OutcomeFinal {
-			return p.finalize(ctx, job.ID, job.CreatedMS, o.Status, o.DLRStat, o.DLRErr, p.opts.Now())
+			if err := p.finalize(ctx, job.ID, job.CreatedMS, o.Status, o.DLRStat, o.DLRErr, p.opts.Now()); err != nil {
+				_ = ReleaseFinal(ctx, p.rdb, job.ID)
+				return err
+			}
+			return nil
 		}
 	}
 	return nil

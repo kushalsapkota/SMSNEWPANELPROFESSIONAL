@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"strconv"
@@ -40,6 +41,12 @@ type upConn struct {
 	failed    atomic.Uint64
 	meter     *metrics.RateMeter
 
+	// Adaptive slow-down after ESME_RTHROTTLED / ESME_RMSGQFUL.
+	tmu          sync.Mutex
+	baseTPS      int       // configured max_tps
+	coolUntil    time.Time // limit is not raised again before this
+	lastThrottle time.Time
+
 	closeOnce sync.Once
 }
 
@@ -60,6 +67,7 @@ func newUpConn(c *store.Connection, onDeliver DeliverFunc, tlsCfg func(*store.Co
 		limiter: rate.NewLimiter(rate.Limit(max(c.MaxTPS, 1)), bucketBurst(c.MaxTPS)),
 		log:     log.With("connection_id", c.ID, "connection", c.Name),
 		meter:   metrics.NewRateMeter(nil),
+		baseTPS: max(c.MaxTPS, 1),
 	}
 	if !c.Enabled || c.PasswordErr != nil {
 		return u, nil
@@ -175,17 +183,79 @@ func (u *upConn) pickClient(exclude map[*client.Client]bool) *client.Client {
 	return best
 }
 
+// setMaxTPS applies a new max_tps in place (no rebind).
+func (u *upConn) setMaxTPS(tps int) {
+	tps = max(tps, 1)
+	u.tmu.Lock()
+	defer u.tmu.Unlock()
+	if u.baseTPS == tps {
+		return
+	}
+	u.baseTPS = tps
+	u.coolUntil = time.Time{}
+	u.limiter.SetLimit(rate.Limit(tps))
+	u.limiter.SetBurst(bucketBurst(tps))
+	u.log.Info("upstream max_tps changed", "max_tps", tps)
+}
+
+// throttled halves the submit rate (at most once a second, never below 1/s)
+// after the SMSC answered ESME_RTHROTTLED / ESME_RMSGQFUL, and holds it for
+// a cool-down before it is raised again.
+func (u *upConn) throttled() {
+	u.tmu.Lock()
+	defer u.tmu.Unlock()
+	now := time.Now()
+	u.coolUntil = now.Add(10 * time.Second)
+	if now.Sub(u.lastThrottle) < time.Second {
+		return
+	}
+	u.lastThrottle = now
+	cur := u.limiter.Limit()
+	next := cur / 2
+	if next < 1 {
+		next = 1
+	}
+	if next < cur {
+		u.limiter.SetLimit(next)
+		u.log.Warn("upstream is throttling; slowing down", "tps", float64(next), "max_tps", u.baseTPS)
+	}
+}
+
+// recovered raises a throttled rate back towards max_tps (doubling every
+// 5s once the cool-down is over) after successful submits.
+func (u *upConn) recovered() {
+	if u.limiter.Limit() >= rate.Limit(u.baseTPSValue()) {
+		return
+	}
+	u.tmu.Lock()
+	defer u.tmu.Unlock()
+	now := time.Now()
+	if now.Before(u.coolUntil) {
+		return
+	}
+	next := min(u.limiter.Limit()*2, rate.Limit(u.baseTPS))
+	u.limiter.SetLimit(next)
+	u.coolUntil = now.Add(5 * time.Second)
+}
+
+func (u *upConn) baseTPSValue() int {
+	u.tmu.Lock()
+	defer u.tmu.Unlock()
+	return u.baseTPS
+}
+
 // errNoSession means no bound transmitter was available on the connection.
 var errNoSession = errors.New("dispatch: no bound transmitter session")
 
 // submit sends one PDU, waiting for a token first. A session that turns out
-// not to be bound is skipped in favour of another one.
+// not to be bound is skipped in favour of another one. Errors before the PDU
+// was written wrap session.ErrNotSent (or are errNoSession).
 func (u *upConn) submit(ctx context.Context, sm *pdu.SubmitSM, m *metrics.Engine) (*pdu.SubmitSMResp, error) {
 	u.waiting.Add(1)
 	err := u.limiter.Wait(ctx)
 	u.waiting.Add(-1)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: rate limiter: %w", session.ErrNotSent, err)
 	}
 	tried := map[*client.Client]bool{}
 	for {
@@ -196,8 +266,9 @@ func (u *upConn) submit(ctx context.Context, sm *pdu.SubmitSM, m *metrics.Engine
 		tried[c] = true
 		start := time.Now()
 		resp, err := c.Submit(ctx, sm)
-		if errors.Is(err, client.ErrNotBound) || errors.Is(err, client.ErrNotTransmitter) {
-			continue // lost the bind between pick and submit: try another session
+		if errors.Is(err, client.ErrNotBound) || errors.Is(err, client.ErrNotTransmitter) ||
+			errors.Is(err, session.ErrNotSent) && errors.Is(err, session.ErrClosed) {
+			continue // lost the bind between pick and submit (nothing written): try another session
 		}
 		if m != nil {
 			m.UpstreamLatency.Observe(time.Since(start).Seconds())
@@ -224,6 +295,34 @@ func (u *upConn) submit(ctx context.Context, sm *pdu.SubmitSM, m *metrics.Engine
 
 func isTimeout(err error) bool {
 	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, session.ErrTimeout)
+}
+
+// submitClass is what a submit_sm result means for the message.
+type submitClass int
+
+const (
+	classAccepted  submitClass = iota
+	classRejected              // definitely not accepted: safe to fail over
+	classThrottled             // ESME_RTHROTTLED / ESME_RMSGQFUL: back off, resubmit on this connection
+	classUnknown               // written but no answer (timeout, session lost): the SMSC may have it
+)
+
+func classify(err error) submitClass {
+	if err == nil {
+		return classAccepted
+	}
+	var se *pdu.StatusError
+	if errors.As(err, &se) {
+		if se.Status == pdu.ESME_RTHROTTLED || se.Status == pdu.ESME_RMSGQFUL {
+			return classThrottled
+		}
+		return classRejected
+	}
+	if errors.Is(err, session.ErrNotSent) || errors.Is(err, errNoSession) ||
+		errors.Is(err, client.ErrNotBound) || errors.Is(err, client.ErrNotTransmitter) {
+		return classRejected
+	}
+	return classUnknown
 }
 
 // SessionStatus is one session in GET /internal/v1/connections/status.

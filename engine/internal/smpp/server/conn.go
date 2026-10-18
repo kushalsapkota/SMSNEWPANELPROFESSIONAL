@@ -26,11 +26,12 @@ type conn struct {
 	ident    *Identity
 	bindType pdu.BindType
 
-	mu         sync.Mutex
-	binding    bool
-	bound      bool
-	boundSince time.Time
-	limiter    *tokenBucket
+	mu           sync.Mutex
+	binding      bool
+	bindFailures int
+	bound        bool
+	boundSince   time.Time
+	limiter      *tokenBucket
 
 	ready     atomic.Bool // bind_resp sent: may receive deliver_sm
 	kicked    atomic.Bool
@@ -91,10 +92,23 @@ func (c *conn) respond(p pdu.PDU) {
 func (c *conn) handleBind(p *pdu.Bind) {
 	resp := pdu.NewResponse(p, pdu.ESME_ROK).(*pdu.BindResp)
 	resp.SystemID = c.srv.cfg.SystemID
-	resp.TLVs.Set(pdu.TagSCInterfaceVersion, []byte{pdu.InterfaceVersion34})
+	// v3.3 ESMEs do not expect optional parameters (SMPP 3.4 §5.3.2.25).
+	if p.InterfaceVersion >= pdu.InterfaceVersion34 {
+		resp.TLVs.Set(pdu.TagSCInterfaceVersion, []byte{pdu.InterfaceVersion34})
+	}
 	fail := func(st pdu.CommandStatus) {
 		resp.Status = st
+		resp.TLVs = nil
 		c.respond(resp)
+		c.mu.Lock()
+		c.bindFailures++
+		tooMany := c.bindFailures >= c.srv.cfg.MaxBindFailures && !c.bound
+		c.mu.Unlock()
+		if tooMany {
+			// Don't let one connection keep guessing passwords.
+			c.srv.log.Info("smpp server: closing connection after repeated bind failures", "remote", c.remote.String(), "failures", c.srv.cfg.MaxBindFailures)
+			c.sess.Close()
+		}
 	}
 
 	c.mu.Lock()
@@ -237,16 +251,29 @@ func (c *conn) process(in *inbound) {
 		Parts:                1,
 	}
 
+	// Only text is carried: the pipeline re-encodes m.Text, so binary
+	// payloads, message classes (flash) and UDH elements other than
+	// concatenation would be delivered as garbage. Refuse them instead.
+	if !coding.TextDataCoding(in.sm.DataCoding) {
+		c.reply(in, "", pdu.ESME_RINVDCS)
+		return
+	}
 	var part *partInfo
 	data := in.payload
 	if in.sm.ESMClass&pdu.ESMClassUDHI != 0 {
-		cc, rest, ok, err := coding.ParseConcat(data)
+		ies, rest, err := coding.ParseUDH(data)
 		if err != nil {
 			c.reply(in, "", pdu.ESME_RINVESMCLASS)
 			return
 		}
+		for _, ie := range ies {
+			if ie.ID != coding.IEConcat8 && ie.ID != coding.IEConcat16 {
+				c.reply(in, "", pdu.ESME_RINVESMCLASS)
+				return
+			}
+		}
 		data = rest
-		if ok {
+		if cc, ok := coding.FindConcat(ies); ok {
 			kind := MultipartUDH8
 			if cc.Ref16 {
 				kind = MultipartUDH16

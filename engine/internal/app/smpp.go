@@ -23,9 +23,17 @@ import (
 // sending stopped / SMPP disabled / account disabled → ESME_RINVSYSID;
 // bind type not allowed → ESME_RBINDFAIL; IP not whitelisted (scope SMPP)
 // → ESME_RBINDFAIL. max_binds is enforced by the server via Identity.
+//
+// Brute-force protection: the IP whitelist is checked BEFORE the password
+// (callers outside it learn nothing about the password and cost no
+// argon2), and a remote IP or system_id with too many recent failures is
+// refused (ESME_RBINDFAIL) without running argon2, unless the exact
+// credentials verified recently. The server also closes a connection after
+// a few failed binds.
 type authenticator struct {
 	store       pipeline.Snapshotter
 	cache       *crypto.BindCache
+	guard       *bindGuard
 	db          *pgxpool.Pool
 	log         *slog.Logger
 	sem         chan struct{} // bounds concurrent argon2 evaluations (~19 MiB each)
@@ -42,27 +50,50 @@ func (a *authenticator) Authenticate(ctx context.Context, req *server.BindReques
 		a.log.Warn("SMPP bind rejected: server session limit reached", "system_id", req.SystemID, "limit", a.maxSessions)
 		return nil, pdu.ESME_RBINDFAIL
 	}
+	ip := remoteIP(req.RemoteAddr)
+	ipKey := ip.String()
 	acct := snap.SMPPAccount(req.SystemID)
 	if acct == nil {
+		if a.guard != nil {
+			if a.guard.blocked(ipKey, "") {
+				return nil, pdu.ESME_RBINDFAIL
+			}
+			a.guard.fail(ipKey, "")
+		}
 		return nil, pdu.ESME_RINVSYSID
 	}
-	select {
-	case a.sem <- struct{}{}:
-	case <-ctx.Done():
-		return nil, pdu.ESME_RSYSERR
+	if err := policy.CheckIP(snap, acct.OrgID, ip, store.ScopeSMPP); err != nil {
+		a.log.Info("SMPP bind rejected", "system_id", req.SystemID, "ip", ipKey, "reason", err.Error())
+		if a.guard != nil {
+			a.guard.fail(ipKey, "")
+		}
+		return nil, pdu.CommandStatus(policy.SMPPBindStatus(policy.CodeOf(err)))
 	}
-	ok, err := a.cache.Verify(req.SystemID, req.Password, acct.PasswordHash)
-	<-a.sem
-	if err != nil {
-		a.log.Error("SMPP account has an unusable password hash", "system_id", req.SystemID, "err", err)
-		return nil, pdu.ESME_RINVPASWD
+	if !a.cache.Cached(req.SystemID, req.Password, acct.PasswordHash) {
+		if a.guard != nil && a.guard.blocked(ipKey, req.SystemID) {
+			a.log.Warn("SMPP bind refused: too many failed attempts", "system_id", req.SystemID, "ip", ipKey)
+			return nil, pdu.ESME_RBINDFAIL
+		}
+		select {
+		case a.sem <- struct{}{}:
+		case <-ctx.Done():
+			return nil, pdu.ESME_RSYSERR
+		}
+		ok, err := a.cache.Verify(req.SystemID, req.Password, acct.PasswordHash)
+		<-a.sem
+		if err != nil {
+			a.log.Error("SMPP account has an unusable password hash", "system_id", req.SystemID, "err", err)
+			return nil, pdu.ESME_RINVPASWD
+		}
+		if !ok {
+			if a.guard != nil {
+				a.guard.fail(ipKey, req.SystemID)
+			}
+			return nil, pdu.ESME_RINVPASWD
+		}
 	}
-	if !ok {
-		return nil, pdu.ESME_RINVPASWD
-	}
-	ip := remoteIP(req.RemoteAddr)
 	if err := policy.CheckBind(snap, acct, req.BindType.String(), ip); err != nil {
-		a.log.Info("SMPP bind rejected", "system_id", req.SystemID, "ip", ip.String(), "reason", err.Error())
+		a.log.Info("SMPP bind rejected", "system_id", req.SystemID, "ip", ipKey, "reason", err.Error())
 		return nil, pdu.CommandStatus(policy.SMPPBindStatus(policy.CodeOf(err)))
 	}
 	org := snap.Org(acct.OrgID)

@@ -26,6 +26,7 @@ import (
 
 	"smsgw/engine/internal/billing"
 	"smsgw/engine/internal/cdr"
+	"smsgw/engine/internal/concatstore"
 	"smsgw/engine/internal/config"
 	"smsgw/engine/internal/crypto"
 	"smsgw/engine/internal/dispatch"
@@ -76,6 +77,7 @@ type App struct {
 	Forwarder *dlr.Forwarder
 	Webhooks  *webhook.Queue
 	SMPP      *server.Server
+	Refunder  *pipeline.Refunder
 
 	syncer     *billing.Syncer
 	httpSrv    *http.Server
@@ -149,18 +151,22 @@ func New(ctx context.Context, cfg *config.Config, log *slog.Logger, ov Overrides
 		DirtyKey: ov.BalanceDirtyKey, Logger: log})
 	a.syncer = billing.NewSyncer(a.Biller, billing.SyncerOptions{Interval: cfg.BalanceSyncInterval, FullEvery: cfg.BalanceFullSyncEach})
 	a.CDR = cdr.New(a.pool, cdr.Options{FlushInterval: cfg.CDRFlushInterval, BatchSize: cfg.CDRBatchSize, Logger: log, Metrics: a.Metrics})
+	a.Refunder = pipeline.NewRefunder(a.Biller, a.rdb, a.CDR, pipeline.RefunderOptions{MaxAge: cfg.DebitTxnTTL, Logger: log, Metrics: a.Metrics})
 	a.Pipeline = pipeline.New(pipeline.Deps{
 		Store: a.Store, Biller: a.Biller, Limiter: ratelimit.New(a.rdb), CDR: a.CDR, Redis: a.rdb, DB: a.pool,
-		Metrics: a.Metrics, Logger: log, MsgStateTTL: cfg.MsgStateTTL,
+		Metrics: a.Metrics, Logger: log, MsgStateTTL: cfg.MsgStateTTL, Refunder: a.Refunder,
 	})
 	a.Webhooks = webhook.New(a.rdb, a.pool, a.Store, webhook.Options{
 		KeyPrefix: ov.WebhookKeyPrefix, Workers: cfg.WebhookWorkers, Timeout: cfg.WebhookTimeout,
 		BaseBackoff: ov.WebhookBaseBackoff, PollInterval: ov.WebhookPollInterval, Logger: log, Metrics: a.Metrics,
+		BlockPrivate: !cfg.WebhookAllowPrivate, // SSRF guard (webhook/egress.go)
 	})
 	a.DLR = dlr.NewProcessor(a.rdb, a.CDR, a.pool, dlr.Options{Stream: ov.DLROutStream, LookupWait: ov.DLRLookupWait, Logger: log, Metrics: a.Metrics})
 
 	auth := &authenticator{store: a.Store, cache: crypto.NewBindCache(cfg.BindCacheTTL, 0), db: a.pool, log: log.With("component", "smpp-auth"),
-		sem: make(chan struct{}, 4), maxSessions: cfg.SMPPMaxSessions}
+		sem: make(chan struct{}, 4), maxSessions: cfg.SMPPMaxSessions,
+		// 20 failed binds per remote IP / 30 per system_id in 5 minutes.
+		guard: newBindGuard(5*time.Minute, 20, 30)}
 	a.SMPP, err = server.New(server.Config{
 		Authenticator:       auth,
 		Handler:             &smppHandler{p: a.Pipeline, log: log.With("component", "smpp-server")},
@@ -169,7 +175,10 @@ func New(ctx context.Context, cfg *config.Config, log *slog.Logger, ov Overrides
 		WindowSize:          cfg.SMPPDeliverWindow,
 		RequestTimeout:      cfg.SMPPDeliverTimeout,
 		EnquireLinkInterval: max(cfg.SMPPEnquireTimeout/3, time.Second),
-		Logger:              log.With("component", "smpp-server"),
+		// Multipart sets live in Redis: parts sent on binds held by
+		// different engine instances join, and restarts keep acked parts.
+		ConcatStore: concatstore.New(a.rdb, ""),
+		Logger:      log.With("component", "smpp-server"),
 		OnIncomplete: func(m server.IncompleteMessage) {
 			log.Warn("client multipart message expired incomplete", "system_id", m.Session.SystemID, "received", m.Received, "total", m.Total)
 		},
@@ -187,7 +196,7 @@ func New(ctx context.Context, cfg *config.Config, log *slog.Logger, ov Overrides
 		InstanceID: cfg.InstanceID, Batch: cfg.DispatchBatch, Block: cfg.DispatchBlock, MaxFailover: maxFailover,
 		ClaimIdle: cfg.DispatchClaimIdle, MsgStateTTL: cfg.MsgStateTTL, MaxQueueAge: ov.DispatchMaxQueueAge, ScanInterval: ov.DispatchScanInterval,
 		DrainTimeout: cfg.ShutdownTimeout / 2, OnDeliver: a.DLR.HandleDeliver, TLSConfig: ov.UpstreamTLS,
-		Logger: log, Metrics: a.Metrics,
+		Refunder: a.Refunder, Logger: log, Metrics: a.Metrics,
 	})
 	a.Forwarder = dlr.NewForwarder(a.rdb, a.Store, a.SMPP, a.Webhooks, dlr.ForwarderOptions{
 		Stream: ov.DLROutStream, Consumer: cfg.InstanceID, RetryIdle: ov.DLRRetryIdle,
@@ -301,6 +310,8 @@ func (a *App) Run(ctx context.Context) error {
 	dispatchC := start("dispatch", a.Dispatch.Run)
 	fwdC := start("dlr-forwarder", a.Forwarder.Run)
 	whC := start("webhooks", a.Webhooks.Run)
+	refundC := start("refund-retrier", func(ctx context.Context) { a.Refunder.Run(ctx, 10*time.Second) })
+	limitsC := start("credit-limit-sync", func(ctx context.Context) { syncLimits(ctx, a.Store, a.Biller, a.log) })
 	sweepC := start("session-sweeper", func(ctx context.Context) {
 		every := a.ov.SessionSweep
 		if every <= 0 {
@@ -366,6 +377,8 @@ func (a *App) Run(ctx context.Context) error {
 	// 3. Client notifications.
 	stop(fwdC)
 	stop(whC)
+	stop(refundC)
+	stop(limitsC)
 	// 4. Persist CDRs and balances.
 	if err := a.CDR.Close(sctx); err != nil {
 		a.log.Error("CDR flush incomplete at shutdown", "err", err)

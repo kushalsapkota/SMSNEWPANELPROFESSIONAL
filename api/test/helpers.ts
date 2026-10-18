@@ -115,6 +115,17 @@ export function totpNow(secret: string): string {
   return authenticator.generate(secret);
 }
 
+/** TOTP code for the step `offset` steps (30s) from now (the api accepts -1..+1, each step once). */
+export function totpAt(secret: string, offset: number): string {
+  return authenticator.clone({ epoch: Date.now() + offset * 30_000 }).generate(secret);
+}
+
+/** Waits until at least `minLeftMs` remain in the current 30s TOTP step (keeps step offsets stable). */
+export async function waitForFreshTotpStep(minLeftMs = 12_000): Promise<void> {
+  const left = 30_000 - (Date.now() % 30_000);
+  if (left < minLeftMs) await new Promise((r) => setTimeout(r, left + 50));
+}
+
 export async function waitFor(cond: () => boolean, ms = 2000): Promise<void> {
   const until = Date.now() + ms;
   while (!cond()) {

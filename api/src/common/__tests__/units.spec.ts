@@ -1,4 +1,6 @@
 import { createDecipheriv } from 'node:crypto';
+import type { Request } from 'express';
+import { clientIp, normalizeIp, parseTrustedProxies } from '../request.util';
 import { CryptoService } from '../../crypto/crypto.service';
 import { loadConfig, envSchema } from '../../config/config';
 import { parseCidr, cidrContains } from '../../ip-whitelist/cidr';
@@ -105,5 +107,48 @@ describe('authorization rules (CONTRACTS §10)', () => {
     expect(isParentOf(admin, C)).toBe(false);
     expect(isParentOf(reseller, C)).toBe(true);
     expect(isParentOf(client, C)).toBe(false);
+  });
+});
+
+describe('client IP / trusted proxies (X-Forwarded-For)', () => {
+  const req = (peer: string, xff?: string | string[]) =>
+    ({ socket: { remoteAddress: peer }, headers: xff === undefined ? {} : { 'x-forwarded-for': xff } }) as unknown as Request;
+  const trust = parseTrustedProxies('loopback,uniquelocal');
+
+  it('parses CIDRs, bare IPs and named ranges; rejects junk', () => {
+    const t = parseTrustedProxies('10.1.0.0/16 192.0.2.10, 2001:db8::/32,loopback');
+    expect(t.isTrusted('10.1.200.3')).toBe(true);
+    expect(t.isTrusted('10.2.0.1')).toBe(false);
+    expect(t.isTrusted('192.0.2.10')).toBe(true);
+    expect(t.isTrusted('192.0.2.11')).toBe(false);
+    expect(t.isTrusted('2001:db8::5')).toBe(true);
+    expect(t.isTrusted('::ffff:127.0.0.1')).toBe(true);
+    expect(t.isTrusted('::1')).toBe(true);
+    for (const bad of ['10.0.0.0/33', 'nope', '1.2.3.4/x', '1.2.3.4/8/1']) expect(() => parseTrustedProxies(bad)).toThrow(/invalid trusted proxy/);
+    expect(() => loadConfig({ ...process.env, TRUSTED_PROXIES: 'bogus' })).toThrow(/TRUSTED_PROXIES/);
+    expect(loadConfig({ ...process.env, TRUSTED_PROXIES: '' }).TRUSTED_PROXIES.isTrusted('172.18.0.4')).toBe(true);
+  });
+
+  it('normalizes mapped, bracketed and ported forms', () => {
+    expect(normalizeIp('::ffff:1.2.3.4')).toBe('1.2.3.4');
+    expect(normalizeIp('[2001:db8::1]:443')).toBe('2001:db8::1');
+    expect(normalizeIp('1.2.3.4:5678')).toBe('1.2.3.4');
+    expect(normalizeIp('unknown')).toBeNull();
+  });
+
+  it('takes the right-most untrusted hop, only when the peer is trusted', () => {
+    expect(clientIp(req('::ffff:127.0.0.1', '8.8.8.8'), null)).toBe('127.0.0.1');
+    expect(clientIp(req('127.0.0.1', '8.8.8.8'), false)).toBe('127.0.0.1');
+    expect(clientIp(req('127.0.0.1', '8.8.8.8'), trust)).toBe('8.8.8.8');
+    expect(clientIp(req('127.0.0.1', '127.0.0.1, 8.8.8.8'), trust)).toBe('8.8.8.8');
+    expect(clientIp(req('172.18.0.3', '203.0.113.7, 172.18.0.1'), trust)).toBe('203.0.113.7');
+    expect(clientIp(req('127.0.0.1', ['1.1.1.1', '9.9.9.9']), trust)).toBe('9.9.9.9');
+    expect(clientIp(req('127.0.0.1', '203.0.113.7, garbage'), trust)).toBe('127.0.0.1');
+    expect(clientIp(req('127.0.0.1', '10.0.0.1, 127.0.0.2'), trust)).toBe('10.0.0.1');
+    expect(clientIp(req('127.0.0.1'), trust)).toBe('127.0.0.1');
+    // untrusted peer: header ignored no matter what it says
+    expect(clientIp(req('198.51.100.9', '127.0.0.1'), trust)).toBe('198.51.100.9');
+    // legacy boolean = default trusted set
+    expect(clientIp(req('127.0.0.1', '127.0.0.1, 8.8.8.8'), true)).toBe('8.8.8.8');
   });
 });

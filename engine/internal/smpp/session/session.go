@@ -40,7 +40,16 @@ var (
 	// ErrUnexpectedResponse means the peer answered a request with a
 	// response of a different command type.
 	ErrUnexpectedResponse = errors.New("smpp: unexpected response type")
+	// ErrNotSent is wrapped (together with the cause: ErrClosed, a ctx
+	// error, ...) by Request errors that happened before any byte of the
+	// request was written: the peer cannot have seen it, so it is safe to
+	// send it elsewhere. Any other error after a request was written
+	// (ErrTimeout, ErrClosed, ctx) means the outcome is unknown.
+	ErrNotSent = errors.New("smpp: request not sent")
 )
+
+// notSent marks err as a failure before the request was written.
+func notSent(err error) error { return fmt.Errorf("%w: %w", ErrNotSent, err) }
 
 // RequestHandler handles an inbound request PDU (anything except responses,
 // enquire_link and unbind, which the session answers itself). It runs on its
@@ -61,8 +70,19 @@ type Config struct {
 	// WriteTimeout bounds a single PDU write. Default 10s.
 	WriteTimeout time.Duration
 	// MaxInboundConcurrency caps concurrently running Handler calls; when
-	// reached, the read loop stops reading (TCP back-pressure). Default 64.
+	// reached, the read loop stops reading (TCP back-pressure) unless
+	// BusyStatus is set. Default 64.
 	MaxInboundConcurrency int
+	// BusyStatus, when non-zero, is the command_status used to answer an
+	// inbound request immediately while MaxInboundConcurrency handlers are
+	// running (e.g. ESME_RX_T_APPN / ESME_RTHROTTLED: the peer retries
+	// later), so the read loop keeps reading responses and keepalives
+	// instead of stalling the whole socket behind slow handlers.
+	BusyStatus pdu.CommandStatus
+	// UnbindDrainTimeout bounds how long an inbound unbind waits for
+	// running handlers to send their responses before unbind_resp is sent
+	// and the connection closed. Default 5s.
+	UnbindDrainTimeout time.Duration
 	// Handler receives inbound requests. If nil, requests are answered
 	// with generic_nack / ESME_RINVCMDID responses.
 	Handler RequestHandler
@@ -90,6 +110,9 @@ func (c *Config) withDefaults() Config {
 	if out.MaxInboundConcurrency <= 0 {
 		out.MaxInboundConcurrency = 64
 	}
+	if out.UnbindDrainTimeout <= 0 {
+		out.UnbindDrainTimeout = 5 * time.Second
+	}
 	if out.Logger == nil {
 		out.Logger = slog.Default()
 	}
@@ -109,7 +132,10 @@ type Session struct {
 
 	started   atomic.Bool
 	unbinding atomic.Bool
-	seq       atomic.Uint32
+	// peerUnbound: the peer sent unbind; new requests are refused while
+	// running handlers drain.
+	peerUnbound atomic.Bool
+	seq         atomic.Uint32
 
 	wmu sync.Mutex // serializes writes
 
@@ -206,7 +232,7 @@ func (s *Session) writeBytes(b []byte) error {
 	defer s.wmu.Unlock()
 	select {
 	case <-s.done:
-		return ErrClosed
+		return notSent(ErrClosed)
 	default:
 	}
 	_ = s.conn.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout))
@@ -245,31 +271,34 @@ func (s *Session) Request(ctx context.Context, req pdu.PDU) (pdu.PDU, error) {
 
 func (s *Session) request(ctx context.Context, req pdu.PDU, windowed bool) (pdu.PDU, error) {
 	if !s.started.Load() {
-		return nil, ErrNotStarted
+		return nil, notSent(ErrNotStarted)
 	}
 	if req.CommandID().IsResponse() {
-		return nil, fmt.Errorf("smpp: Request called with response %s", req.CommandID())
+		return nil, notSent(fmt.Errorf("smpp: Request called with response %s", req.CommandID()))
 	}
 	if windowed {
 		select {
 		case s.window <- struct{}{}:
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, notSent(ctx.Err())
 		case <-s.done:
-			return nil, ErrClosed
+			return nil, notSent(ErrClosed)
 		}
 		defer func() { <-s.window }()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, notSent(err)
 	}
 	seq := s.nextSeq()
 	b, err := pdu.MarshalWith(req, pdu.ESME_ROK, seq)
 	if err != nil {
-		return nil, err
+		return nil, notSent(err)
 	}
 	ch := make(chan result, 1)
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
-		return nil, ErrClosed
+		return nil, notSent(ErrClosed)
 	}
 	s.pending[seq] = ch
 	s.mu.Unlock()
@@ -389,18 +418,35 @@ func (s *Session) readLoop() {
 			_ = s.Respond(pdu.NewResponse(p, pdu.ESME_ROK))
 			continue
 		case *pdu.Unbind:
-			_ = s.Respond(pdu.NewResponse(p, pdu.ESME_ROK))
-			s.closeWith(ErrUnbound)
-			return
+			if s.peerUnbound.CompareAndSwap(false, true) {
+				go s.drainAndUnbind(p)
+			}
+			continue
+		}
+		if s.peerUnbound.Load() {
+			// Requests after the peer's unbind are a protocol violation.
+			_ = s.Respond(pdu.NewResponse(p, pdu.ESME_RINVBNDSTS))
+			continue
 		}
 		if s.cfg.Handler == nil {
 			_ = s.Respond(pdu.NewResponse(p, pdu.ESME_RINVCMDID))
 			continue
 		}
-		select {
-		case s.inbound <- struct{}{}:
-		case <-s.done:
-			return
+		if s.cfg.BusyStatus != pdu.ESME_ROK {
+			select {
+			case s.inbound <- struct{}{}:
+			default:
+				// Every handler slot is busy: answer now and keep reading so
+				// responses and keepalives on this socket are not stalled.
+				_ = s.Respond(pdu.NewResponse(p, s.cfg.BusyStatus))
+				continue
+			}
+		} else {
+			select {
+			case s.inbound <- struct{}{}:
+			case <-s.done:
+				return
+			}
 		}
 		s.handlers.Add(1)
 		go func(p pdu.PDU) {
@@ -411,6 +457,27 @@ func (s *Session) readLoop() {
 			s.cfg.Handler(s, p)
 		}(p)
 	}
+}
+
+// drainAndUnbind answers the peer's unbind once the handlers already running
+// (e.g. submit_sm accepted and billed just before the unbind) have sent
+// their responses, bounded by UnbindDrainTimeout, then closes the session.
+// Closing immediately would drop those responses and make the peer resubmit
+// messages that were in fact accepted.
+func (s *Session) drainAndUnbind(req pdu.PDU) {
+	drained := make(chan struct{})
+	go func() { s.handlers.Wait(); close(drained) }()
+	t := time.NewTimer(s.cfg.UnbindDrainTimeout)
+	defer t.Stop()
+	select {
+	case <-drained:
+	case <-t.C:
+		s.log.Warn("smpp: unbind drain timed out; closing with handlers still running")
+	case <-s.done:
+		return
+	}
+	_ = s.Respond(pdu.NewResponse(req, pdu.ESME_ROK))
+	s.closeWith(ErrUnbound)
 }
 
 func (s *Session) onDecodeError(de *pdu.DecodeError) {

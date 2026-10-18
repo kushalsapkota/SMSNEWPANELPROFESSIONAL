@@ -8,16 +8,31 @@
 // rebound (after their in-flight submits drain), removed ones unbound.
 //
 // For every message the connection is chosen per CONTRACTS §9: lowest
-// route priority with a bound session, weighted random within a priority;
-// on a submit error or timeout the next connection is tried (at most
-// MaxFailover failovers), after which the message is FAILED and refunded.
+// route priority with a bound session, weighted random within a priority.
+// What happens after a submit_sm depends on what its result proves:
+//
+//   - explicit rejection (error status, generic_nack) or nothing written
+//     (no bound session, shutdown before the write): the next connection is
+//     tried (at most MaxFailover failovers), after which the message is
+//     FAILED and refunded;
+//   - ESME_RTHROTTLED / ESME_RMSGQFUL (SMPP flow control): the same PDU is
+//     resubmitted on the same connection with backoff while the
+//     connection's rate is halved for a cool-down — no failover, no refund
+//     (for up to ThrottleRetry, then it counts as a rejection);
+//   - unknown outcome (submit_sm_resp timeout, session lost after the
+//     write): the SMSC may have accepted it, so it is NOT resent anywhere and
+//     NOT refunded; such parts are recorded with status UNKNOWN.
+//
 // Multipart messages are sent per the connection's multipart_mode (UDH,
-// SAR or message_payload). Each submitted part gets a dlrmap entry.
+// SAR or message_payload). Each part's dlrmap entry is written as soon as
+// its submit_sm_resp arrives (a receipt may beat the remaining parts); parts
+// that share one SMSC id get a single entry listing all of them.
 //
 // Stream entries are acknowledged (XACK + XDEL) only once the message has
 // been handled; entries left pending by a crashed instance are reclaimed
 // with XAUTOCLAIM after ClaimIdle. A message already submitted (msg state
-// has submitted_ms) is never sent twice by a reclaim.
+// has submitted_ms) — or whose submission had started (submitting_ms) — is
+// never sent twice by a reclaim.
 package dispatch
 
 import (
@@ -41,6 +56,7 @@ import (
 	"smsgw/engine/internal/pipeline"
 	"smsgw/engine/internal/routing"
 	"smsgw/engine/internal/smpp/pdu"
+	"smsgw/engine/internal/smpp/session"
 	"smsgw/engine/internal/store"
 )
 
@@ -74,6 +90,10 @@ type Finalizer interface {
 	// PartsFailed: some parts of a multipart message were rejected
 	// upstream; they count as failed parts in the final DLR aggregation.
 	PartsFailed(ctx context.Context, job *pipeline.DispatchJob, parts []int, errorCode string) error
+	// PartsUnknown: the outcome of these parts is unknown (submit_sm_resp
+	// timeout / session lost after the write); they count as UNKNOWN parts
+	// in the final DLR aggregation (no refund: the SMSC may have them).
+	PartsUnknown(ctx context.Context, job *pipeline.DispatchJob, parts []int, errorCode string) error
 }
 
 // Options tune a Manager.
@@ -88,6 +108,15 @@ type Options struct {
 	WorkersPerRoute int           // concurrent messages per route; default 32
 	ScanInterval    time.Duration // discovery of orphan streams (SCAN q:dispatch:*); default 10s, negative disables
 	DrainTimeout    time.Duration // shutdown: wait for in-flight messages; default 10s
+	// ThrottleRetry bounds how long one PDU is resubmitted on the same
+	// connection while the SMSC answers ESME_RTHROTTLED / ESME_RMSGQFUL;
+	// default 60s. ThrottleBackoff is the first wait (doubling, max 5s);
+	// default 200ms.
+	ThrottleRetry   time.Duration
+	ThrottleBackoff time.Duration
+	// Refunder applies (and retries) refunds; default one built from the
+	// biller, Redis and the CDR sink.
+	Refunder *pipeline.Refunder
 
 	OnDeliver DeliverFunc                         // upstream deliver_sm (receipts)
 	TLSConfig func(*store.Connection) *tls.Config // nil: verify against the host name
@@ -172,11 +201,20 @@ func New(src ConfigSource, rdb redis.UniversalClient, biller pipeline.Biller, db
 	if o.DrainTimeout <= 0 {
 		o.DrainTimeout = 10 * time.Second
 	}
+	if o.ThrottleRetry <= 0 {
+		o.ThrottleRetry = 60 * time.Second
+	}
+	if o.ThrottleBackoff <= 0 {
+		o.ThrottleBackoff = 200 * time.Millisecond
+	}
 	if o.Logger == nil {
 		o.Logger = slog.Default()
 	}
 	if o.Metrics == nil {
 		o.Metrics = metrics.NewEngine(metrics.NewRegistry())
+	}
+	if o.Refunder == nil {
+		o.Refunder = pipeline.NewRefunder(biller, rdb, sink, pipeline.RefunderOptions{Logger: o.Logger, Metrics: o.Metrics})
 	}
 	m := &Manager{
 		src: src, rdb: rdb, biller: biller, db: db, sink: sink, fin: fin, opts: o,
@@ -255,10 +293,13 @@ func (m *Manager) reconcile(snap *store.Snapshot) {
 	m.mu.Lock()
 	var stale []*upConn
 	for id, u := range m.conns {
-		if c, ok := want[id]; !ok || !u.cfg.SessionConfigEqual(c) {
+		c, ok := want[id]
+		if !ok || !u.cfg.SessionConfigEqual(c) {
 			stale = append(stale, u)
 			delete(m.conns, id)
+			continue
 		}
+		u.setMaxTPS(c.MaxTPS) // non-session fields apply in place
 	}
 	m.mu.Unlock()
 	for _, u := range stale {
@@ -315,10 +356,17 @@ func (m *Manager) watchConfig(ctx context.Context, diffs <-chan store.ConnDiff) 
 				}
 			}
 			for _, id := range append(append([]string(nil), d.Added...), d.Updated...) {
-				if c := d.New.Connection(id); c != nil {
-					m.log.Info("upstream connection (re)configured", "connection_id", id)
-					m.start(c)
+				c := d.New.Connection(id)
+				if c == nil {
+					continue
 				}
+				if u := m.conn(id); u != nil && u.cfg.SessionConfigEqual(c) {
+					// Only per-message fields or max_tps changed: no rebind.
+					u.setMaxTPS(c.MaxTPS)
+					continue
+				}
+				m.log.Info("upstream connection (re)configured", "connection_id", id)
+				m.start(c)
 			}
 			// A merged diff can be empty while state still drifted; resync.
 			m.reconcile(m.src.Current())
@@ -661,22 +709,43 @@ func (m *Manager) ack(e entry) {
 // --- per message -------------------------------------------------------------
 
 type attemptResult struct {
-	ids     []string // smsc ids by PDU index ("" = rejected)
-	failed  []int    // PDU indexes rejected
-	pdus    int
-	errCode string
-	abort   bool // shutdown: outcome not decided, leave pending
+	ids         []string // smsc ids by PDU index ("" = rejected or unknown)
+	failed      []int    // PDU indexes rejected
+	unknown     []int    // PDU indexes whose outcome is unknown (may have been accepted)
+	pdus        int
+	errCode     string
+	unknownCode string
+	abort       bool // shutdown before anything was written: leave pending
 }
 
-func (r *attemptResult) accepted() int { return r.pdus - len(r.failed) }
+func (r *attemptResult) accepted() int { return r.pdus - len(r.failed) - len(r.unknown) }
+
+// reachedSMSC: at least one PDU was (or may have been) accepted, so the
+// message must not be sent again anywhere.
+func (r *attemptResult) reachedSMSC() bool {
+	return r.pdus > 0 && (r.accepted() > 0 || len(r.unknown) > 0)
+}
 
 // handle dispatches one message; false leaves the stream entry pending.
 func (m *Manager) handle(job *pipeline.DispatchJob) bool {
 	ctx := m.workCtx
 	key := pipeline.MsgKey(job.ID)
-	if vals, err := m.rdb.HMGet(ctx, key, pipeline.FSubmittedMS, pipeline.FDone).Result(); err == nil {
+	if vals, err := m.rdb.HMGet(ctx, key, pipeline.FSubmittedMS, pipeline.FDone, pipeline.FSubmitting, pipeline.FConnection, pipeline.FPDUs).Result(); err == nil {
 		if vals[0] != nil || vals[1] != nil {
 			m.log.Info("message already handled; skipping redelivered entry", "message_id", job.ID)
+			return true
+		}
+		if vals[2] != nil {
+			// A previous attempt (crashed instance) had started writing
+			// submit_sm: the SMSC may have the message. Never resend.
+			connID, _ := vals[3].(string)
+			pdus := job.Parts
+			if s, ok := vals[4].(string); ok {
+				if n, err := strconv.Atoi(s); err == nil && n > 0 {
+					pdus = n
+				}
+			}
+			m.interrupted(job, connID, pdus)
 			return true
 		}
 	} else if ctx.Err() != nil {
@@ -721,7 +790,7 @@ func (m *Manager) handle(job *pipeline.DispatchJob) bool {
 			if r.abort {
 				return false
 			}
-			if r.pdus > 0 && r.accepted() > 0 {
+			if r.reachedSMSC() {
 				m.succeed(job, c, r)
 				return true
 			}
@@ -755,6 +824,8 @@ func errorCode(err error) string {
 		return "SUBMIT_TIMEOUT"
 	case errors.Is(err, errNoSession):
 		return "NO_SESSION"
+	case classify(err) == classUnknown:
+		return "SUBMIT_UNKNOWN"
 	default:
 		return "SUBMIT_ERROR"
 	}
@@ -767,25 +838,121 @@ func (m *Manager) attempt(ctx context.Context, job *pipeline.DispatchJob, c *sto
 		return attemptResult{errCode: "ENCODING_ERROR"}
 	}
 	r := attemptResult{ids: make([]string, len(pdus)), pdus: len(pdus)}
+	// Before anything can reach the SMSC: the PDU count (receipts may beat
+	// the remaining parts) and the crash-recovery marker.
+	m.markSubmitting(job, c.ID, len(pdus))
+	byID := map[string][]int{}
 	for i, sm := range pdus {
-		resp, err := u.submit(ctx, sm, m.m)
-		if err != nil {
-			if ctx.Err() != nil && i == 0 {
-				return attemptResult{abort: true}
-			}
+		resp, err := m.submitPart(ctx, job, c, u, i, sm)
+		switch classify(err) {
+		case classAccepted:
+			r.ids[i] = resp.MessageID
+			m.mapPart(c.ID, job, resp.MessageID, i, byID)
+			continue
+		case classUnknown:
 			code := errorCode(err)
-			m.log.Warn("submit_sm failed", "message_id", job.ID, "connection_id", c.ID, "part", i, "err", err)
-			if i == 0 {
-				// Nothing accepted on this connection: the caller fails over.
-				return attemptResult{errCode: code}
-			}
-			r.failed = append(r.failed, i)
-			r.errCode = code
+			m.log.Warn("submit_sm outcome unknown; not resending", "message_id", job.ID, "connection_id", c.ID, "part", i, "err", err)
+			r.unknown = append(r.unknown, i)
+			r.unknownCode = code
 			continue
 		}
-		r.ids[i] = resp.MessageID
+		code := errorCode(err)
+		if i == 0 {
+			if ctx.Err() != nil {
+				// Shutdown before part 0 was written: leave it for a restart.
+				m.clearSubmitting(job)
+				return attemptResult{abort: true}
+			}
+			m.log.Warn("submit_sm rejected", "message_id", job.ID, "connection_id", c.ID, "part", i, "err", err)
+			// Nothing accepted on this connection: the caller fails over.
+			return attemptResult{errCode: code}
+		}
+		m.log.Warn("submit_sm rejected", "message_id", job.ID, "connection_id", c.ID, "part", i, "err", err)
+		r.failed = append(r.failed, i)
+		r.errCode = code
 	}
 	return r
+}
+
+// submitPart sends one PDU, resubmitting it on the same connection with
+// backoff while the SMSC answers with a flow-control status.
+func (m *Manager) submitPart(ctx context.Context, job *pipeline.DispatchJob, c *store.Connection, u *upConn, part int, sm *pdu.SubmitSM) (*pdu.SubmitSMResp, error) {
+	deadline := time.Now().Add(m.opts.ThrottleRetry)
+	delay := m.opts.ThrottleBackoff
+	for {
+		resp, err := u.submit(ctx, sm, m.m)
+		cls := classify(err)
+		if cls == classAccepted {
+			u.recovered()
+		}
+		if cls != classThrottled {
+			return resp, err
+		}
+		u.throttled()
+		if time.Now().Add(delay).After(deadline) {
+			m.log.Warn("upstream kept throttling; giving up on this connection", "message_id", job.ID, "connection_id", c.ID, "part", part, "err", err)
+			return resp, err
+		}
+		m.log.Debug("upstream throttled; resubmitting", "message_id", job.ID, "connection_id", c.ID, "part", part, "retry_in", delay)
+		sleepCtx(ctx, delay)
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("%w: %w", session.ErrNotSent, ctx.Err())
+		}
+		delay = min(2*delay, 5*time.Second)
+	}
+}
+
+func (m *Manager) markSubmitting(job *pipeline.DispatchJob, connID string, pdus int) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	key := pipeline.MsgKey(job.ID)
+	if _, err := m.rdb.TxPipelined(ctx, func(p redis.Pipeliner) error {
+		p.HSet(ctx, key, pipeline.FSubmitting, time.Now().UnixMilli(), pipeline.FConnection, connID, pipeline.FPDUs, pdus)
+		p.Expire(ctx, key, m.opts.MsgStateTTL)
+		return nil
+	}); err != nil {
+		m.log.Warn("could not record submission start", "message_id", job.ID, "err", err)
+	}
+}
+
+func (m *Manager) clearSubmitting(job *pipeline.DispatchJob) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := m.rdb.HDel(ctx, pipeline.MsgKey(job.ID), pipeline.FSubmitting).Err(); err != nil {
+		m.log.Warn("could not clear submission marker", "message_id", job.ID, "err", err)
+	}
+}
+
+// mapPart writes the dlrmap entry of a part as soon as its submit_sm_resp
+// arrives. Parts sharing one SMSC id share one entry listing all of them.
+func (m *Manager) mapPart(connID string, job *pipeline.DispatchJob, smscID string, part int, byID map[string][]int) {
+	id := pdu.NormalizeMessageID(smscID)
+	if id == "" {
+		return
+	}
+	byID[id] = append(byID[id], part)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := m.rdb.Set(ctx, pipeline.DLRMapKey(connID, id), pipeline.DLRMapValueParts(job.ID, byID[id], job.CreatedMS), m.opts.MsgStateTTL).Err(); err != nil {
+		m.log.Warn("could not record dlrmap entry; retried after the last part", "message_id", job.ID, "part", part, "err", err)
+	}
+}
+
+// groupIDs maps normalized SMSC ids to the parts that returned them.
+func groupIDs(ids []string) (map[string][]int, []string) {
+	by := map[string][]int{}
+	var order []string
+	for i, raw := range ids {
+		id := pdu.NormalizeMessageID(raw)
+		if id == "" {
+			continue
+		}
+		if _, ok := by[id]; !ok {
+			order = append(order, id)
+		}
+		by[id] = append(by[id], i)
+	}
+	return by, order
 }
 
 func (m *Manager) succeed(job *pipeline.DispatchJob, c *store.Connection, r attemptResult) {
@@ -795,20 +962,24 @@ func (m *Manager) succeed(job *pipeline.DispatchJob, c *store.Connection, r atte
 	ttl := m.opts.MsgStateTTL
 	key := pipeline.MsgKey(job.ID)
 	var smscIDs []string
-	_, err := m.rdb.TxPipelined(ctx, func(p redis.Pipeliner) error {
-		for i, id := range r.ids {
-			if id == "" {
-				continue
-			}
+	for _, id := range r.ids {
+		if id != "" {
 			smscIDs = append(smscIDs, id)
-			p.Set(ctx, pipeline.DLRMapKey(c.ID, pdu.NormalizeMessageID(id)), pipeline.DLRMapValue(job.ID, i, job.CreatedMS), ttl)
+		}
+	}
+	byID, order := groupIDs(r.ids)
+	_, err := m.rdb.TxPipelined(ctx, func(p redis.Pipeliner) error {
+		// Already written part by part; rewritten here in case one of those
+		// writes failed.
+		for _, id := range order {
+			p.Set(ctx, pipeline.DLRMapKey(c.ID, id), pipeline.DLRMapValueParts(job.ID, byID[id], job.CreatedMS), ttl)
 		}
 		p.HSet(ctx, key, pipeline.FConnection, c.ID, pipeline.FPDUs, r.pdus, pipeline.FSubmittedMS, now.UnixMilli())
 		p.Expire(ctx, key, ttl)
 		return nil
 	})
 	if err != nil {
-		m.log.Error("could not record submission state; DLRs for this message will not match", "message_id", job.ID, "err", err)
+		m.log.Error("could not record submission state; DLRs for this message may not match", "message_id", job.ID, "err", err)
 	}
 	upd := cdr.Update{ID: job.ID, CreatedAt: job.CreatedAt(), Status: cdr.StatusSubmitted, ConnectionID: c.ID,
 		SMSCMsgIDs: smscIDs, SubmittedAt: &now}
@@ -816,7 +987,12 @@ func (m *Manager) succeed(job *pipeline.DispatchJob, c *store.Connection, r atte
 		total := cost * int64(job.Parts)
 		upd.RouteCostMicros = &total
 	}
-	if len(r.failed) > 0 {
+	if len(r.unknown) > 0 {
+		code := r.unknownCode
+		upd.ErrorCode = &code
+	}
+	switch {
+	case len(r.failed) > 0:
 		m.m.DispatchTotal.With("partial").Inc()
 		// Refund the share of the rejected parts.
 		if len(job.Legs) > 0 {
@@ -824,25 +1000,66 @@ func (m *Manager) succeed(job *pipeline.DispatchJob, c *store.Connection, r atte
 			for i, l := range job.Legs {
 				amounts[i] = l.Amount * int64(len(r.failed)) / int64(r.pdus)
 			}
-			pipeline.RefundLegs(ctx, m.biller, m.db, m.log, m.m, job.ID, job.Tag, job.Legs, amounts, "partial_submit")
 			client := job.Legs[0].Amount - amounts[0]
-			upd.ClientCostMicros = &client
 			reseller := client
 			if len(job.Legs) > 1 {
 				reseller = job.Legs[1].Amount - amounts[1]
 			}
-			upd.ResellerCostMicros = &reseller
+			later := &cdr.Update{ID: job.ID, CreatedAt: job.CreatedAt(), ClientCostMicros: &client, ResellerCostMicros: &reseller}
+			if m.opts.Refunder.Refund(ctx, job.ID, job.Tag, job.Legs, amounts, "partial_submit", later) == pipeline.RefundApplied {
+				upd.ClientCostMicros = &client
+				upd.ResellerCostMicros = &reseller
+			}
 		}
-	} else {
+	case len(r.unknown) > 0:
+		m.m.DispatchTotal.With("unknown").Inc()
+	default:
 		m.m.DispatchTotal.With("submitted").Inc()
 	}
 	if err := m.sink.Update(ctx, upd); err != nil {
 		m.log.Error("cdr update failed", "message_id", job.ID, "err", err)
 	}
-	if len(r.failed) > 0 && m.fin != nil {
+	if m.fin == nil {
+		return
+	}
+	if len(r.failed) > 0 {
 		if err := m.fin.PartsFailed(ctx, job, r.failed, r.errCode); err != nil {
 			m.log.Error("record failed parts", "message_id", job.ID, "err", err)
 		}
+	}
+	if len(r.unknown) > 0 {
+		if err := m.fin.PartsUnknown(ctx, job, r.unknown, r.unknownCode); err != nil {
+			m.log.Error("record unknown parts", "message_id", job.ID, "err", err)
+		}
+	}
+}
+
+// interrupted finalizes a message whose submission had started on a crashed
+// instance: its parts may have reached the SMSC, so it is neither resent nor
+// refunded; every part counts as UNKNOWN.
+func (m *Manager) interrupted(job *pipeline.DispatchJob, connID string, pdus int) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	m.log.Warn("submission of message was interrupted; not resending (outcome unknown)", "message_id", job.ID, "connection_id", connID)
+	m.m.DispatchTotal.With("unknown").Inc()
+	code := "SUBMIT_INTERRUPTED"
+	now := time.Now().UTC()
+	upd := cdr.Update{ID: job.ID, CreatedAt: job.CreatedAt(), Status: cdr.StatusSubmitted, ConnectionID: connID, ErrorCode: &code, SubmittedAt: &now}
+	if err := m.sink.Update(ctx, upd); err != nil {
+		m.log.Error("cdr update failed", "message_id", job.ID, "err", err)
+	}
+	if err := m.rdb.HSet(ctx, pipeline.MsgKey(job.ID), pipeline.FPDUs, pdus, pipeline.FSubmittedMS, now.UnixMilli()).Err(); err != nil {
+		m.log.Warn("could not record submission state", "message_id", job.ID, "err", err)
+	}
+	if m.fin == nil {
+		return
+	}
+	parts := make([]int, pdus)
+	for i := range parts {
+		parts[i] = i
+	}
+	if err := m.fin.PartsUnknown(ctx, job, parts, code); err != nil {
+		m.log.Error("record unknown parts", "message_id", job.ID, "err", err)
 	}
 }
 
@@ -854,8 +1071,11 @@ func (m *Manager) fail(job *pipeline.DispatchJob, code string) {
 	defer cancel()
 	m.m.DispatchTotal.With("failed").Inc()
 	m.log.Warn("message failed", "message_id", job.ID, "route_id", job.RouteID, "error_code", code)
-	refunded := len(job.Legs) > 0
-	pipeline.RefundLegs(ctx, m.biller, m.db, m.log, m.m, job.ID, job.Tag, job.Legs, nil, "dispatch_failed")
+	t := true
+	// refunded is true only when the money is actually back; a refund that
+	// fails transiently is retried and then flips the CDR flag.
+	refunded := m.opts.Refunder.Refund(ctx, job.ID, job.Tag, job.Legs, nil, "dispatch_failed",
+		&cdr.Update{ID: job.ID, CreatedAt: job.CreatedAt(), Refunded: &t}) == pipeline.RefundApplied
 	if m.fin != nil {
 		if err := m.fin.MessageFailed(ctx, job, code, refunded); err != nil {
 			m.log.Error("record failure", "message_id", job.ID, "err", err)

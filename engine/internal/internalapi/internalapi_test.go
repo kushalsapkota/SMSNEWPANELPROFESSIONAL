@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -268,5 +269,51 @@ func TestBalances(t *testing.T) {
 	}
 	if st, b := do(t, a, "GET", "/internal/v1/balance/"+uuid.NewString(), "", token); st != 404 {
 		t.Fatalf("unknown org without DB: %d %v", st, b)
+	}
+}
+
+// reloadingSnap is a Snapshotter that also implements Reloader.
+type reloadingSnap struct {
+	cur   *store.Snapshot
+	err   error
+	loads int
+}
+
+func (r *reloadingSnap) Current() *store.Snapshot { return r.cur }
+func (r *reloadingSnap) Load(context.Context) error {
+	r.loads++
+	if r.err != nil {
+		return r.err
+	}
+	next := store.NewSnapshot(store.Data{})
+	next.Version = r.cur.Version + 1
+	r.cur = next
+	return nil
+}
+
+func TestConfigReload(t *testing.T) {
+	// A store without Load: the endpoint reports it cannot reload.
+	a, _, _, _ := newAPI()
+	if st, b := do(t, a, "POST", "/internal/v1/config/reload", "", token); st != 500 || b["error_code"] != "INTERNAL" {
+		t.Fatalf("%d %v", st, b)
+	}
+
+	first := store.NewSnapshot(store.Data{})
+	first.Version = 4
+	rs := &reloadingSnap{cur: first}
+	a = New(Deps{Token: token, Pipeline: &fakePipeline{}, Connections: fakeConns{}, SMPP: &fakeSMPP{}, Balances: &fakeBal{}, Store: rs})
+	if st, _ := do(t, a, "POST", "/internal/v1/config/reload", "", ""); st != 401 {
+		t.Fatalf("reload without token: %d", st)
+	}
+	st, b := do(t, a, "POST", "/internal/v1/config/reload", "", token)
+	if st != 200 || b["version"].(float64) != 5 || rs.loads != 1 {
+		t.Fatalf("%d %v loads=%d", st, b, rs.loads)
+	}
+	rs.err = errors.New("db down")
+	if st, b := do(t, a, "POST", "/internal/v1/config/reload", "", token); st != 500 || b["error_code"] != "INTERNAL" || rs.loads != 2 {
+		t.Fatalf("%d %v", st, b)
+	}
+	if rs.cur.Version != 5 {
+		t.Fatalf("failed reload replaced the snapshot: v%d", rs.cur.Version)
 	}
 }

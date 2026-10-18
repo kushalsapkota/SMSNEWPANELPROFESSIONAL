@@ -102,6 +102,12 @@ type Config struct {
 	EnquireLinkInterval time.Duration // default 30s, negative disables
 	ReconnectMin        time.Duration // default 1s
 	ReconnectMax        time.Duration // default 60s
+	// StableAfter: the reconnect backoff is reset only after a session
+	// stayed bound this long. A session that ends sooner (an SMSC that
+	// accepts the bind and then drops or unbinds it) keeps growing the
+	// backoff, so a sick or session-limited SMSC is not redialled about
+	// once a second forever. Default 30s.
+	StableAfter time.Duration
 
 	OnDeliver     DeliverFunc // nil: deliver_sm acknowledged with ESME_ROK and dropped
 	OnStateChange func(State) // called synchronously on every state change; keep it fast
@@ -138,6 +144,9 @@ func (c Config) validate() (Config, error) {
 	}
 	if c.ReconnectMax < c.ReconnectMin {
 		c.ReconnectMax = c.ReconnectMin
+	}
+	if c.StableAfter <= 0 {
+		c.StableAfter = 30 * time.Second
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
@@ -248,7 +257,9 @@ func (c *Client) setState(mut func(*State)) {
 //   - (resp, nil): accepted, resp.MessageID is the SMSC id;
 //   - (resp, *pdu.StatusError): the SMSC rejected it with resp.Status;
 //   - (nil, ErrNotBound / ErrNotTransmitter): not sent, try another session;
-//   - (nil, session.ErrTimeout / session.ErrClosed / ctx error): outcome unknown.
+//   - (nil, error wrapping session.ErrNotSent): not written, safe to resend;
+//   - (nil, session.ErrTimeout / session.ErrClosed / ctx error): outcome
+//     unknown — the SMSC may have accepted it.
 func (c *Client) Submit(ctx context.Context, p *pdu.SubmitSM) (*pdu.SubmitSMResp, error) {
 	c.mu.Lock()
 	sess := c.sess
@@ -303,7 +314,6 @@ func (c *Client) run() {
 			backoff = nextBackoff(backoff, c.cfg.ReconnectMax)
 			continue
 		}
-		backoff = c.cfg.ReconnectMin
 		now := time.Now()
 		c.mu.Lock()
 		c.sess = sess
@@ -338,13 +348,20 @@ func (c *Client) run() {
 		if reason != nil {
 			msg = reason.Error()
 		}
-		c.log.Warn("smpp client: session ended", "err", msg)
 		c.setState(func(s *State) { s.Status = StatusDown; s.LastError = msg; s.BoundSince = time.Time{} })
 		if reason == ErrClientClosed {
 			return
 		}
-		// brief pause before reconnecting so a flapping SMSC isn't hammered
-		c.sleep(jitter(c.cfg.ReconnectMin))
+		// Only a session that stayed up for StableAfter resets the backoff;
+		// one that is dropped right after the bind keeps growing it.
+		if time.Since(now) >= c.cfg.StableAfter {
+			backoff = c.cfg.ReconnectMin
+		}
+		c.log.Warn("smpp client: session ended", "err", msg, "bound_for", time.Since(now).Round(time.Millisecond), "retry_in", backoff)
+		if !c.sleep(jitter(backoff)) {
+			continue
+		}
+		backoff = nextBackoff(backoff, c.cfg.ReconnectMax)
 	}
 }
 
@@ -403,8 +420,12 @@ func (c *Client) connect() (*session.Session, string, error) {
 		WindowSize:          c.cfg.WindowSize,
 		RequestTimeout:      c.cfg.RequestTimeout,
 		EnquireLinkInterval: c.cfg.EnquireLinkInterval,
-		Handler:             c.handle,
-		Logger:              c.cfg.Logger,
+		// Slow receipt handlers must not stall submit_sm_resp / keepalive
+		// reads on a TRX socket: answer deliver_sm with "retry later" when
+		// every handler slot is busy.
+		BusyStatus: pdu.ESME_RX_T_APPN,
+		Handler:    c.handle,
+		Logger:     c.cfg.Logger,
 	})
 	sess.Start()
 	bctx, bcancel := context.WithTimeout(context.Background(), c.cfg.BindTimeout)

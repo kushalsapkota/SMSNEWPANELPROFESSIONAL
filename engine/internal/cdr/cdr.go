@@ -32,8 +32,10 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -231,7 +233,30 @@ func (w *Writer) Insert(ctx context.Context, r Record) error {
 	if r.CountryISO == "" {
 		r.CountryISO = phone.CountryCode(r.DestinationAddr)
 	}
+	// PostgreSQL text rejects NUL and invalid UTF-8 as a data error, which
+	// would make the writer drop the whole row (and every later update).
+	for _, f := range []*string{&r.ClientMsgRef, &r.SourceAddr, &r.DestinationAddr, &r.OrigText, &r.SentText,
+		&r.ErrorCode, &r.CountryISO, &r.Encoding, &r.Channel, &r.Status} {
+		*f = cleanText(*f)
+	}
 	return w.enqueue(ctx, op{ins: &r})
+}
+
+// cleanText makes s storable in a PostgreSQL text column: invalid UTF-8
+// sequences become U+FFFD and NUL characters are removed.
+func cleanText(s string) string {
+	if utf8.ValidString(s) && strings.IndexByte(s, 0) < 0 {
+		return s
+	}
+	return strings.ReplaceAll(strings.ToValidUTF8(s, "\uFFFD"), "\x00", "")
+}
+
+func cleanPtr(p *string) *string {
+	if p == nil {
+		return nil
+	}
+	c := cleanText(*p)
+	return &c
 }
 
 // Update queues a change.
@@ -241,6 +266,14 @@ func (w *Writer) Update(ctx context.Context, u Update) error {
 	}
 	if u.Status != "" && Rank(u.Status) < 0 {
 		return fmt.Errorf("cdr: update: invalid status %q", u.Status)
+	}
+	u.ErrorCode, u.DLRStat, u.DLRErr = cleanPtr(u.ErrorCode), cleanPtr(u.DLRStat), cleanPtr(u.DLRErr)
+	if u.SMSCMsgIDs != nil {
+		ids := make([]string, len(u.SMSCMsgIDs))
+		for i, id := range u.SMSCMsgIDs {
+			ids[i] = cleanText(id)
+		}
+		u.SMSCMsgIDs = ids
 	}
 	return w.enqueue(ctx, op{upd: &u})
 }
@@ -672,9 +705,19 @@ func insertArgs(r *Record) []any {
 	}
 }
 
+// truncate keeps at most n characters (varchar(n) counts characters):
+// cutting bytes could split a UTF-8 sequence, which PostgreSQL rejects as a
+// data error and the row would be dropped.
 func truncate(s string, n int) string {
-	if len(s) > n {
-		return s[:n]
+	if len(s) <= n {
+		return s
+	}
+	i := 0
+	for pos := range s {
+		if i == n {
+			return s[:pos]
+		}
+		i++
 	}
 	return s
 }

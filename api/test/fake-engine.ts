@@ -46,6 +46,22 @@ export class FakeEngine {
   rejectAll: FakeReject | null = null;
   /** cost per accepted message. */
   submitCost = 5000;
+  /**
+   * Accepted messages by id, like the engine's per-message-id debit: a submit repeating an
+   * accepted `message_id` returns the original result and is not sent / charged again.
+   */
+  accepted = new Map<string, Record<string, unknown>>();
+  /** Number of distinct messages sent (and charged) — repeats of an accepted id don't count. */
+  sends = 0;
+  /**
+   * /submit/batch processes (accepts) only the first N items, then answers 503 — the engine
+   * behaviour when the api's request is cut off mid-batch (timeout) or the engine fails.
+   */
+  batchFailAfter: number | null = null;
+  /** Artificial latency for /submit/batch (ms). */
+  batchDelayMs = 0;
+  /** /submit accepts the message, then answers 503 (outcome unknown to the api). */
+  submitFailAfterAccept = false;
   connections: unknown[] = [];
   /** Prometheus counter value served at /metrics (smsgw_submit_total). */
   metricsSubmitTotal = 0;
@@ -107,16 +123,23 @@ export class FakeEngine {
     }
     if (method === 'POST' && path === '/internal/v1/submit') {
       const r = this.submitOne(body);
+      if (this.submitFailAfterAccept) return send(503, { error_code: 'INTERNAL', message: 'timed out after accepting' });
       return isReject(r) ? send(r.status, { error_code: r.error_code, message: r.message }) : send(200, r);
     }
     if (method === 'POST' && path === '/internal/v1/submit/batch') {
-      const results = (body.items as any[]).map((item) => {
+      const items = body.items as any[];
+      const n = this.batchFailAfter ?? items.length;
+      const results = items.slice(0, n).map((item) => {
         const r = this.submitOne(item);
         return isReject(r) ? { error_code: r.error_code, message: r.message } : r;
       });
-      return send(200, { results });
+      const reply = () => (this.batchFailAfter !== null ? send(503, { error_code: 'INTERNAL', message: 'cut off mid-batch' }) : send(200, { results }));
+      if (this.batchDelayMs > 0) setTimeout(reply, this.batchDelayMs);
+      else reply();
+      return;
     }
     if (method === 'POST' && path === '/internal/v1/smpp/sessions/kick') return send(200, { kicked: 1 });
+    if (method === 'POST' && path === '/internal/v1/config/reload') return send(200, { version: this.calls(path).length });
     if (method === 'GET' && path === '/internal/v1/smpp/sessions') {
       return send(200, { sessions: this.sessions });
     }
@@ -139,10 +162,12 @@ export class FakeEngine {
   }
 
   private submitOne(item: any): FakeReject | Record<string, unknown> {
+    if (typeof item.message_id === 'string' && this.accepted.has(item.message_id)) return this.accepted.get(item.message_id)!;
     const rej = this.rejectAll ?? this.rejects.get(item.destination);
     if (rej) return rej;
-    return {
-      message_id: uuidV7(),
+    this.sends += 1;
+    const res = {
+      message_id: typeof item.message_id === 'string' ? item.message_id : uuidV7(),
       status: 'ACCEPTED',
       parts: 1,
       encoding: 'GSM7',
@@ -150,6 +175,8 @@ export class FakeEngine {
       route_id: item.route_id ?? '00000000-0000-4000-8000-000000000001',
       sent_text: item.text,
     };
+    this.accepted.set(res.message_id, res);
+    return res;
   }
 
   sessions: { session_id: string; org_id: string; system_id: string; bind_type: string; remote_addr: string; bound_since: string; tps_current: number; submitted_total: number }[] = [];
@@ -165,6 +192,11 @@ export class FakeEngine {
     this.rejects.clear();
     this.rejectAll = null;
     this.submitCost = 5000;
+    this.accepted.clear();
+    this.sends = 0;
+    this.batchFailAfter = null;
+    this.batchDelayMs = 0;
+    this.submitFailAfterAccept = false;
     this.connections = [];
     this.telegram = [];
   }

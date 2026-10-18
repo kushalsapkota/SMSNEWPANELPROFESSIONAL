@@ -100,13 +100,19 @@ func rejectSuffix(sfx string) func(*server.Message) pdu.CommandStatus {
 }
 
 func newSMSC(t *testing.T, reject func(*server.Message) pdu.CommandStatus) *fakeSMSC {
+	return newSMSCWith(t, reject, true)
+}
+
+// newSMSCWith: perPartIDs=false makes the SMSC return the same message_id
+// for every part of a multipart message.
+func newSMSCWith(t *testing.T, reject func(*server.Message) pdu.CommandStatus, perPartIDs bool) *fakeSMSC {
 	t.Helper()
 	f := &fakeSMSC{reject: reject}
 	srv, err := server.New(server.Config{
 		Authenticator: server.AuthenticatorFunc(func(_ context.Context, r *server.BindRequest) (*server.Identity, pdu.CommandStatus) {
 			return &server.Identity{OrgID: "up", SystemID: r.SystemID}, pdu.ESME_ROK
 		}),
-		Handler: f, PerPartMessageIDs: true, Logger: quiet, EnquireLinkInterval: -1,
+		Handler: f, PerPartMessageIDs: perPartIDs, Logger: quiet, EnquireLinkInterval: -1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -171,14 +177,28 @@ func (f *fakeSink) find(id, status string) *cdr.Update {
 }
 
 type fakeFin struct {
-	mu          sync.Mutex
-	failed      map[string]string
-	refunded    map[string]bool
-	partsFailed map[string][]int
+	mu           sync.Mutex
+	failed       map[string]string
+	refunded     map[string]bool
+	partsFailed  map[string][]int
+	partsUnknown map[string][]int
 }
 
 func newFin() *fakeFin {
-	return &fakeFin{failed: map[string]string{}, refunded: map[string]bool{}, partsFailed: map[string][]int{}}
+	return &fakeFin{failed: map[string]string{}, refunded: map[string]bool{}, partsFailed: map[string][]int{}, partsUnknown: map[string][]int{}}
+}
+
+func (f *fakeFin) PartsUnknown(_ context.Context, job *pipeline.DispatchJob, parts []int, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.partsUnknown[job.ID] = append(f.partsUnknown[job.ID], parts...)
+	return nil
+}
+
+func (f *fakeFin) unknown(id string) []int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int(nil), f.partsUnknown[id]...)
 }
 
 func (f *fakeFin) MessageFailed(_ context.Context, job *pipeline.DispatchJob, code string, refunded bool) error {
@@ -241,6 +261,13 @@ func snapshot(route string, conns []*store.Connection, prios []int) *store.Snaps
 
 func newEnv(t *testing.T, snap *store.Snapshot, route string, claimIdle time.Duration) *env {
 	t.Helper()
+	return newEnvWith(t, snap, route, claimIdle, nil, nil)
+}
+
+// newEnvWith lets a test adjust the Manager options and wrap the biller
+// the Manager uses (the env's own biller stays the real one).
+func newEnvWith(t *testing.T, snap *store.Snapshot, route string, claimIdle time.Duration, mut func(*env, *Options), wrap func(pipeline.Biller) pipeline.Biller) *env {
+	t.Helper()
 	e := &env{t: t, rdb: testRedis(t), src: &fakeSource{snap: snap, ch: make(chan store.ConnDiff, 1)}, sink: &fakeSink{}, fin: newFin(),
 		route: route, tag: uuid.NewString(), client: uuid.NewString()}
 	dirty := "test:dispatch:dirty:" + e.tag
@@ -248,8 +275,16 @@ func newEnv(t *testing.T, snap *store.Snapshot, route string, claimIdle time.Dur
 	ctx := context.Background()
 	e.rdb.HSet(ctx, billing.BalanceKey(e.tag, e.client), "bal", 10_000, "limit", 0)
 	e.rdb.HSet(ctx, billing.BalanceKey(e.tag, e.tag), "bal", 10_000, "limit", 0)
-	e.m = New(e.src, e.rdb, e.biller, nil, e.sink, e.fin, Options{InstanceID: "test-" + e.tag[:8], ClaimIdle: claimIdle,
-		Block: 100 * time.Millisecond, MaxQueueAge: 5 * time.Second, ScanInterval: -1, WorkersPerRoute: 4, Logger: quiet})
+	opts := Options{InstanceID: "test-" + e.tag[:8], ClaimIdle: claimIdle,
+		Block: 100 * time.Millisecond, MaxQueueAge: 5 * time.Second, ScanInterval: -1, WorkersPerRoute: 4, Logger: quiet}
+	var b pipeline.Biller = e.biller
+	if wrap != nil {
+		b = wrap(b)
+	}
+	if mut != nil {
+		mut(e, &opts)
+	}
+	e.m = New(e.src, e.rdb, b, nil, e.sink, e.fin, opts)
 	rctx, cancel := context.WithCancel(context.Background())
 	e.cancel, e.done = cancel, make(chan struct{})
 	go func() { e.m.Run(rctx); close(e.done) }()

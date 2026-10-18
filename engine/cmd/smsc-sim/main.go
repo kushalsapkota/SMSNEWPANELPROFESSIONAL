@@ -27,6 +27,7 @@
 //	-max-messages SMSC_SIM_MAX_MESSAGES (default 1000)
 //	-tps         SMSC_SIM_TPS          per-session limit, 0 = unlimited
 //	-always-dlr  SMSC_SIM_ALWAYS_DLR   ignore registered_delivery
+//	-accept-all  SMSC_SIM_ACCEPT_ALL   disable the …1111 rejection rule (failover target)
 //	-log-level   SMSC_SIM_LOG_LEVEL    debug|info|warn|error (default info)
 package main
 
@@ -89,6 +90,7 @@ func parseFlags(args []string) (Config, string, error) {
 	fs.IntVar(&c.MaxMessages, "max-messages", envInt("SMSC_SIM_MAX_MESSAGES", 1000), "messages kept for GET /messages")
 	fs.IntVar(&c.TPS, "tps", envInt("SMSC_SIM_TPS", 0), "per-session TPS limit (0 = unlimited)")
 	fs.BoolVar(&c.IgnoreRegisteredDelivery, "always-dlr", envBool("SMSC_SIM_ALWAYS_DLR", false), "send receipts even if registered_delivery is 0")
+	fs.BoolVar(&c.AcceptAll, "accept-all", envBool("SMSC_SIM_ACCEPT_ALL", false), "deliver …1111 destinations instead of rejecting them")
 	level := fs.String("log-level", envStr("SMSC_SIM_LOG_LEVEL", "info"), "log level: debug|info|warn|error")
 	if err := fs.Parse(args); err != nil {
 		return c, "", err

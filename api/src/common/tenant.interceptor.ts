@@ -6,7 +6,7 @@ import type { AppConfig } from '../config/config';
 import { DbService } from '../db/db.service';
 import { RequestStore, requestStore } from './context';
 import { AuthedRequest, NO_REQUEST_TX } from './decorators';
-import { clientIp, userAgent } from './request.util';
+import { clientIp, proxyTrustOf, userAgent } from './request.util';
 
 /**
  * Establishes the AsyncLocalStorage request context and, for authenticated requests,
@@ -26,7 +26,7 @@ export class TenantInterceptor implements NestInterceptor {
     const req = ctx.switchToHttp().getRequest<AuthedRequest>();
     const store: RequestStore = {
       auth: req.auth,
-      meta: { ip: clientIp(req, this.config.TRUST_PROXY), userAgent: userAgent(req) },
+      meta: { ip: clientIp(req, proxyTrustOf(this.config)), userAgent: userAgent(req) },
     };
     const noTx = this.reflector.getAllAndOverride<boolean>(NO_REQUEST_TX, [ctx.getHandler(), ctx.getClass()]);
     const run = (): Promise<unknown> =>

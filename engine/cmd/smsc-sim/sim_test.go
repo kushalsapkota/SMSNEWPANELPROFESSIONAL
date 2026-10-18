@@ -282,3 +282,42 @@ func TestFlagsAndEnv(t *testing.T) {
 		t.Fatal("bad id format accepted")
 	}
 }
+
+func TestAcceptAllDisablesRejectRule(t *testing.T) {
+	s := startSim(t, Config{DLRDelay: 20 * time.Millisecond, AcceptAll: true})
+	receipts := make(chan pdu.Receipt, 4)
+	c := dial(t, s, "gw", "pw", func(d *pdu.DeliverSM) pdu.CommandStatus {
+		if r, ok := pdu.ReceiptFromDeliverSM(d); ok {
+			receipts <- r
+		}
+		return pdu.ESME_ROK
+	})
+	bound(t, c)
+	resp, err := c.Submit(context.Background(), sm("919811111111", "failover target"))
+	if err != nil {
+		t.Fatalf("…1111 must be accepted with AcceptAll: %v", err)
+	}
+	select {
+	case r := <-receipts:
+		if r.Stat != "DELIVRD" || pdu.NormalizeMessageID(r.ID) != pdu.NormalizeMessageID(resp.MessageID) {
+			t.Fatalf("receipt %+v for %s", r, resp.MessageID)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no receipt")
+	}
+	if m := getMessages(t, s); len(m) != 1 || m[0].SubmitStatus != "ESME_ROK" || m[0].DLRStat != "DELIVRD" {
+		t.Fatalf("%+v", m)
+	}
+	// the other rules still apply
+	if st, stat := outcome("919800000000", true); st != pdu.ESME_ROK || stat != "UNDELIV" {
+		t.Fatalf("0000 rule: %v %q", st, stat)
+	}
+	cfg, _, err := parseFlags([]string{"-accept-all"})
+	if err != nil || !cfg.AcceptAll {
+		t.Fatalf("-accept-all flag: %+v %v", cfg, err)
+	}
+	t.Setenv("SMSC_SIM_ACCEPT_ALL", "1")
+	if cfg, _, _ := parseFlags(nil); !cfg.AcceptAll {
+		t.Fatal("SMSC_SIM_ACCEPT_ALL env not honoured")
+	}
+}

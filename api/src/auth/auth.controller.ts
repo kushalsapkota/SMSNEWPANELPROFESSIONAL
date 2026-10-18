@@ -1,4 +1,5 @@
-import { Body, Controller, Get, HttpCode, Post } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, Post, Query, Req } from '@nestjs/common';
+import type { Request } from 'express';
 import { z } from 'zod';
 import { AuthContext } from '../common/context';
 import { Auth, NoRequestTransaction, Public } from '../common/decorators';
@@ -84,5 +85,23 @@ export class AuthController {
   @HttpCode(200)
   stop(@Auth() auth: AuthContext) {
     return this.auth.stopImpersonation(auth);
+  }
+}
+
+const brandingSchema = z.object({ host: z.string().trim().max(260).optional() });
+
+/**
+ * `GET /api/branding?host=` (public): the login page's whitelabel brand for the domain it is
+ * served on (`host` param, else the request's Host). `{host, brand_name, reseller}`.
+ */
+@Controller('api/branding')
+@NoRequestTransaction()
+export class BrandingController {
+  constructor(private readonly auth: AuthService) {}
+
+  @Public()
+  @Get()
+  branding(@Query(new ZodPipe(brandingSchema)) q: z.infer<typeof brandingSchema>, @Req() req: Request) {
+    return this.auth.branding(q.host ?? req.hostname);
   }
 }

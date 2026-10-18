@@ -76,6 +76,6 @@ if ((purge)); then
   log "purging database $DEV_DB and redis db $DEV_REDIS_DB"
   su postgres -c "psql -qAt -c 'DROP DATABASE IF EXISTS \"$DEV_DB\" WITH (FORCE)'" >/dev/null
   redis-cli -p "$REDIS_PORT" -n "$DEV_REDIS_DB" FLUSHDB >/dev/null 2>&1 || true
-  rm -rf "$RUN/logs" "$RUN/demo.env" "$RUN/web-build-api-url"
+  rm -rf "$RUN/logs" "$RUN/demo.env" "$RUN/web-build-api-url" "$RUN/ports.env"
 fi
 log "stopped"

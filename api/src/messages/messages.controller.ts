@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Post, Query, Res } from '@nestjs/common';
+import { Body, Controller, Get, Headers, Param, Post, Query, Res } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import type { Response } from 'express';
 import { z } from 'zod';
@@ -9,7 +9,7 @@ import { senderAddress, uuid } from '../common/validation';
 import { ZodPipe } from '../common/zod.pipe';
 import { MSG_CHANNELS, MSG_STATUSES, MsgStatus } from '../db/types';
 import { dateParam, resolveRange } from '../messaging/dates';
-import { MAX_RECIPIENTS, SendService } from '../messaging/send.service';
+import { MAX_RECIPIENTS, SendService, parseIdempotencyKey } from '../messaging/send.service';
 import { MessageFilters, MessagesService } from './messages.service';
 
 const statusList = z
@@ -71,8 +71,16 @@ export class MessagesController {
   @Post('send')
   @Roles('RESELLER', 'CLIENT')
   @NoRequestTransaction()
-  send(@Body(new ZodPipe(sendBody)) body: z.infer<typeof sendBody>) {
-    return this.sender.send({ orgId: currentAuth().orgId, channel: 'WEB', to: body.to, from: body.from, text: body.text, routeId: body.route_id });
+  send(@Body(new ZodPipe(sendBody)) body: z.infer<typeof sendBody>, @Headers('idempotency-key') idem?: string) {
+    return this.sender.send({
+      orgId: currentAuth().orgId,
+      channel: 'WEB',
+      to: body.to,
+      from: body.from,
+      text: body.text,
+      routeId: body.route_id,
+      idempotencyKey: parseIdempotencyKey(idem),
+    });
   }
 
   @Get()

@@ -1,5 +1,5 @@
 import jwt from 'jsonwebtoken';
-import { ADMIN_EMAIL, ADMIN_PASSWORD, TestCtx, adminLogin, as, createChild, login, setup, totpNow, uniq } from './helpers';
+import { ADMIN_EMAIL, ADMIN_PASSWORD, TestCtx, adminLogin, as, createChild, login, setup, totpAt, uniq, waitForFreshTotpStep } from './helpers';
 
 describe('auth', () => {
   let ctx: TestCtx;
@@ -147,6 +147,7 @@ describe('auth', () => {
 
   describe('TOTP 2FA', () => {
     it('setup -> enable -> login requires code -> recovery code works once -> disable', async () => {
+      await waitForFreshTotpStep();
       const admin = await adminLogin(ctx);
       const u = await createChild(ctx, admin, uniq('totp'));
 
@@ -160,7 +161,7 @@ describe('auth', () => {
       expect(stored.totp_secret_enc!.toString('utf8')).not.toContain(secret);
 
       expect((await as(ctx, u).post('/api/auth/totp/enable', { code: '000000' })).status).toBe(400);
-      const en = await as(ctx, u).post('/api/auth/totp/enable', { code: totpNow(secret) });
+      const en = await as(ctx, u).post('/api/auth/totp/enable', { code: totpAt(secret, -1) });
       expect(en.status).toBe(200);
       expect(en.body.recovery_codes).toHaveLength(10);
       expect(new Set(en.body.recovery_codes).size).toBe(10);
@@ -175,7 +176,7 @@ describe('auth', () => {
       const wrong = await ctx.http().post('/api/auth/login').send({ email: u.email, password: u.password, totp_code: '123456' });
       expect(wrong.status).toBe(401);
 
-      const withCode = await login(ctx, u.email, u.password, totpNow(secret));
+      const withCode = await login(ctx, u.email, u.password, totpAt(secret, 0));
       expect(withCode.token).toBeDefined();
 
       const rc = en.body.recovery_codes[0];
@@ -183,9 +184,49 @@ describe('auth', () => {
       const again = await ctx.http().post('/api/auth/login').send({ email: u.email, password: u.password, totp_code: rc });
       expect(again.status).toBe(401);
 
-      const dis = await as(ctx, withCode).post('/api/auth/totp/disable', { code: totpNow(secret) });
+      const dis = await as(ctx, withCode).post('/api/auth/totp/disable', { code: totpAt(secret, 1) });
       expect(dis.status).toBe(200);
       await login(ctx, u.email, u.password);
+    });
+
+    it('a TOTP code is accepted only once (no replay within its window)', async () => {
+      await waitForFreshTotpStep();
+      const admin = await adminLogin(ctx);
+      const u = await createChild(ctx, admin, uniq('totp-replay'));
+      const secret: string = (await as(ctx, u).post('/api/auth/totp/setup')).body.secret;
+      await as(ctx, u).post('/api/auth/totp/enable', { code: totpAt(secret, -1) }).expect(200);
+      // the enable code can't be reused to log in
+      expect((await ctx.http().post('/api/auth/login').send({ email: u.email, password: u.password, totp_code: totpAt(secret, -1) })).status).toBe(401);
+      const code = totpAt(secret, 0);
+      await login(ctx, u.email, u.password, code);
+      const replay = await ctx.http().post('/api/auth/login').send({ email: u.email, password: u.password, totp_code: code });
+      expect(replay.status).toBe(401);
+      // an older step than the last accepted one is refused as well
+      expect((await ctx.http().post('/api/auth/login').send({ email: u.email, password: u.password, totp_code: totpAt(secret, -1) })).status).toBe(401);
+      await login(ctx, u.email, u.password, totpAt(secret, 1));
+    });
+
+    it('wrong codes on totp/disable and wrong current passwords count toward the lockout', async () => {
+      await waitForFreshTotpStep();
+      const admin = await adminLogin(ctx);
+      const u = await createChild(ctx, admin, uniq('totp-brute'));
+      const secret: string = (await as(ctx, u).post('/api/auth/totp/setup')).body.secret;
+      await as(ctx, u).post('/api/auth/totp/enable', { code: totpAt(secret, -1) }).expect(200);
+      const s = await login(ctx, u.email, u.password, totpAt(secret, 0));
+      const valid = new Set([-1, 0, 1].map((d) => totpAt(secret, d)));
+      const wrong = ['111111', '222222', '333333', '444444', '555555', '666666'].filter((c) => !valid.has(c)).slice(0, 4);
+      for (const code of wrong) expect((await as(ctx, s).post('/api/auth/totp/disable', { code })).status).toBe(400);
+      const pw = await as(ctx, s).post('/api/auth/password', { current_password: 'not-my-password', new_password: 'Another-Passw0rd' });
+      expect(pw.status).toBe(401);
+      expect(pw.body.details.locked_until).toBeDefined();
+      // locked: even the right code is refused now, and login is locked too
+      const locked = await as(ctx, s).post('/api/auth/totp/disable', { code: totpAt(secret, 1) });
+      expect(locked.status).toBe(401);
+      expect(locked.body.message).toMatch(/locked/i);
+      const row = await ctx.db.selectFrom('users').select(['totp_enabled', 'locked_until']).where('id', '=', u.userId).executeTakeFirstOrThrow();
+      expect(row.totp_enabled).toBe(true);
+      expect(row.locked_until!.getTime()).toBeGreaterThan(Date.now());
+      expect((await ctx.http().post('/api/auth/login').send({ email: u.email, password: u.password, totp_code: totpAt(secret, 1) })).body.message).toMatch(/locked/i);
     });
   });
 
@@ -229,14 +270,15 @@ describe('auth', () => {
       expect(audits.map((a) => a.action).sort()).toEqual(['auth.impersonate', 'auth.impersonate_stop']);
     });
 
-    it('admin may impersonate a client directly; reseller only its own clients; clients nobody', async () => {
+    it('admin may impersonate resellers only; reseller only its own clients; clients nobody', async () => {
       const admin = await adminLogin(ctx);
       const r1 = await createChild(ctx, admin, uniq('imp-r1'));
       const r2 = await createChild(ctx, admin, uniq('imp-r2'));
       const c1 = await createChild(ctx, r1, uniq('imp-c1'));
       const c2 = await createChild(ctx, r2, uniq('imp-c2'));
 
-      expect((await as(ctx, admin).post('/api/auth/impersonate', { org_id: c1.orgId })).status).toBe(200);
+      expect((await as(ctx, admin).post('/api/auth/impersonate', { org_id: c1.orgId })).status).toBe(403);
+      expect((await as(ctx, admin).post('/api/auth/impersonate', { org_id: r1.orgId })).status).toBe(200);
       expect((await as(ctx, r1).post('/api/auth/impersonate', { org_id: c1.orgId })).status).toBe(200);
       const foreign = await as(ctx, r1).post('/api/auth/impersonate', { org_id: c2.orgId });
       expect(foreign.status).toBe(403);

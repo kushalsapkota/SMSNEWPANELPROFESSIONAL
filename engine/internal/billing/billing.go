@@ -292,6 +292,194 @@ func (b *Biller) Refund(ctx context.Context, txnID string, legs []Leg, amounts [
 	}
 }
 
+// RefundUnloaded refunds txnID after refund.lua reported NOT_LOADED (a leg's
+// balance hash is missing even after hydration, e.g. evicted again). It
+// follows the ledger locking protocol (CONTRACTS-CHANGES engine-core #3):
+//
+//  1. every leg's accounts_balance row is locked FOR UPDATE, in leg order —
+//     hydration (Load) locks the same row, so no leg can be loaded from a
+//     pre-refund value while we work;
+//  2. refund.lua is retried (without hydrating) under the locks: a
+//     concurrent hydration may have completed in the meantime;
+//  3. if a leg is still missing, the refundable remainder of every leg is
+//     read from the txn record (debited minus already refunded, capped by
+//     amounts): loaded legs are credited in Redis (credit.lua, idempotent),
+//     missing ones in Postgres (REFUND ledger row + balance_micros);
+//  4. the txn record's refunded counters are advanced so the same money is
+//     never refunded twice.
+//
+// The ledger / credit idempotency key is refund:<txn>:<org> (plus the amount
+// already refunded before, when non-zero), so a retry after a partial
+// failure never applies twice.
+func (b *Biller) RefundUnloaded(ctx context.Context, txnID string, legs []Leg, amounts []int64) (RefundResult, error) {
+	tag, err := validateLegs(legs, false)
+	if err != nil {
+		return RefundResult{}, err
+	}
+	if amounts != nil && len(amounts) != len(legs) {
+		return RefundResult{}, fmt.Errorf("billing: %d amounts for %d legs", len(amounts), len(legs))
+	}
+	if b.pool == nil {
+		return RefundResult{}, errors.New("billing: no database for a ledger refund")
+	}
+	tx, err := b.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return RefundResult{}, fmt.Errorf("billing: ledger refund begin: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after commit
+	for _, l := range legs {
+		var one int
+		err := tx.QueryRow(ctx, `SELECT 1 FROM accounts_balance WHERE org_id = $1 FOR UPDATE`, l.OrgID).Scan(&one)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return RefundResult{}, fmt.Errorf("%w %s", ErrNoAccount, l.OrgID)
+		}
+		if err != nil {
+			return RefundResult{}, fmt.Errorf("billing: ledger refund lock %s: %w", l.OrgID, err)
+		}
+	}
+
+	keys := make([]string, 0, len(legs)+1)
+	keys = append(keys, TxnKey(tag, txnID))
+	for _, l := range legs {
+		keys = append(keys, BalanceKey(l.Tag, l.OrgID))
+	}
+	args := make([]any, 0, len(amounts))
+	for _, a := range amounts {
+		if a < 0 {
+			return RefundResult{}, errors.New("billing: negative refund amount")
+		}
+		args = append(args, a)
+	}
+	res, err := runScript(ctx, b.rdb, refundScript, keys, args)
+	if err != nil {
+		return RefundResult{}, err
+	}
+	switch res.status {
+	case StatusOK:
+		refunded, err := res.ints(len(legs))
+		if err != nil {
+			return RefundResult{}, err
+		}
+		b.markDirty(ctx, legs)
+		_ = tx.Commit(ctx)
+		return RefundResult{Status: StatusOK, Refunded: refunded}, nil
+	case StatusNothingToRefund, StatusNoTxn:
+		_ = tx.Commit(ctx)
+		return RefundResult{Status: res.status}, nil
+	case StatusNotLoaded:
+	default:
+		return RefundResult{}, res.err("refund")
+	}
+
+	// Still not loaded: compute the remainder per leg from the txn record.
+	fields := make([]string, 0, 3*len(legs)+1)
+	fields = append(fields, "n")
+	for i := range legs {
+		n := strconv.Itoa(i + 1)
+		fields = append(fields, "k"+n, "a"+n, "r"+n)
+	}
+	vals, err := b.rdb.HMGet(ctx, keys[0], fields...).Result()
+	if err != nil {
+		return RefundResult{}, fmt.Errorf("billing: read txn: %w", err)
+	}
+	if vals[0] == nil {
+		_ = tx.Commit(ctx)
+		return RefundResult{Status: StatusNoTxn}, nil
+	}
+	type share struct {
+		amount, before int64
+		loaded         bool
+	}
+	shares := make([]share, len(legs))
+	var total int64
+	for i := range legs {
+		k, _ := vals[1+3*i].(string)
+		if k != keys[i+1] {
+			return RefundResult{}, fmt.Errorf("billing: refund leg %d does not match the debit", i)
+		}
+		debited, err1 := parseInt(vals[2+3*i])
+		before, err2 := parseInt(vals[3+3*i])
+		if err1 != nil || err2 != nil {
+			return RefundResult{}, fmt.Errorf("billing: malformed txn %s", keys[0])
+		}
+		amt := debited - before
+		if amounts != nil {
+			amt = min(amt, amounts[i])
+		}
+		if amt < 0 {
+			amt = 0
+		}
+		shares[i] = share{amount: amt, before: before}
+		total += amt
+	}
+	if total == 0 {
+		_ = tx.Commit(ctx)
+		return RefundResult{Status: StatusNothingToRefund}, nil
+	}
+	exists := make([]*redis.IntCmd, len(legs))
+	if _, err := b.rdb.Pipelined(ctx, func(p redis.Pipeliner) error {
+		for i := range legs {
+			exists[i] = p.Exists(ctx, keys[i+1])
+		}
+		return nil
+	}); err != nil {
+		return RefundResult{}, fmt.Errorf("billing: exists: %w", err)
+	}
+	for i, l := range legs {
+		sh := &shares[i]
+		if sh.amount == 0 {
+			continue
+		}
+		idem := "refund:" + txnID + ":" + l.OrgID
+		if sh.before > 0 {
+			idem += ":" + strconv.FormatInt(sh.before, 10)
+		}
+		if exists[i].Val() == 1 {
+			// Loaded (the locks keep it from being evicted-and-reloaded under us).
+			cr, err := b.Credit(ctx, l.Tag, l.OrgID, sh.amount, idem)
+			if err != nil {
+				return RefundResult{}, err
+			}
+			if cr.Status != StatusNotLoaded {
+				sh.loaded = true
+				continue
+			}
+		}
+		ct, err := tx.Exec(ctx, `
+			INSERT INTO balance_transactions (org_id, type, amount_micros, idempotency_key, reference, note, applied_at)
+			VALUES ($1, 'REFUND', $2, $3, $4, 'engine refund (balance not loaded)', now())
+			ON CONFLICT (idempotency_key) DO NOTHING`, l.OrgID, sh.amount, idem, txnID)
+		if err != nil {
+			return RefundResult{}, fmt.Errorf("billing: ledger refund insert: %w", err)
+		}
+		if ct.RowsAffected() == 1 {
+			if _, err := tx.Exec(ctx, `UPDATE accounts_balance SET balance_micros = balance_micros + $2 WHERE org_id = $1`, l.OrgID, sh.amount); err != nil {
+				return RefundResult{}, fmt.Errorf("billing: ledger refund update: %w", err)
+			}
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return RefundResult{}, fmt.Errorf("billing: ledger refund commit: %w", err)
+	}
+	// Advance the txn's refunded counters (a retry after a failure here sees
+	// the same "before" and hits the idempotency keys above).
+	out := make([]int64, len(legs))
+	if _, err := b.rdb.TxPipelined(ctx, func(p redis.Pipeliner) error {
+		for i, sh := range shares {
+			out[i] = sh.amount
+			if sh.amount > 0 {
+				p.HIncrBy(ctx, keys[0], "r"+strconv.Itoa(i+1), sh.amount)
+			}
+		}
+		p.HSet(ctx, keys[0], "state", "REFUNDED_LEDGER")
+		return nil
+	}); err != nil {
+		b.log.Error("ledger refund applied but txn record not updated", "txn", txnID, "err", err)
+	}
+	b.markDirty(ctx, legs)
+	return RefundResult{Status: StatusOK, Refunded: out}, nil
+}
+
 // CreditResult is the outcome of Credit.
 type CreditResult struct {
 	Status  string // StatusOK, StatusDuplicate or StatusNotLoaded
@@ -471,6 +659,44 @@ func (b *Biller) SetLimit(ctx context.Context, tag, orgID string, limit int64) (
 		return false, fmt.Errorf("billing: set limit: %w", err)
 	}
 	return n == 1, nil
+}
+
+// LimitUpdate is one overdraft limit to apply (SetLimits).
+type LimitUpdate struct {
+	Tag, OrgID string
+	Limit      int64 // >= 0
+}
+
+// SetLimits applies many limits to loaded balances (pipelined, 500 per
+// round trip); balances that are not loaded are skipped (hydration reads
+// the limit from Postgres). Returns how many loaded balances were updated.
+func (b *Biller) SetLimits(ctx context.Context, ups []LimitUpdate) (int, error) {
+	if len(ups) == 0 {
+		return 0, nil
+	}
+	if err := setLimitScript.Load(ctx, b.rdb).Err(); err != nil {
+		return 0, fmt.Errorf("billing: load set-limit script: %w", err)
+	}
+	updated := 0
+	for start := 0; start < len(ups); start += 500 {
+		batch := ups[start:min(start+500, len(ups))]
+		cmds := make([]*redis.Cmd, len(batch))
+		_, err := b.rdb.Pipelined(ctx, func(p redis.Pipeliner) error {
+			for i, u := range batch {
+				cmds[i] = setLimitScript.EvalSha(ctx, p, []string{BalanceKey(u.Tag, u.OrgID)}, max(u.Limit, 0))
+			}
+			return nil
+		})
+		if err != nil && !errors.Is(err, redis.Nil) {
+			return updated, fmt.Errorf("billing: set limits: %w", err)
+		}
+		for _, c := range cmds {
+			if n, err := c.Int64(); err == nil && n == 1 {
+				updated++
+			}
+		}
+	}
+	return updated, nil
 }
 
 // Evict deletes a loaded balance after syncing it, forcing the next access

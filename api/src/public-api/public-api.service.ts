@@ -24,8 +24,16 @@ export class PublicApiService {
     private readonly sender: SendService,
   ) {}
 
-  send(input: PublicSendInput) {
-    return this.sender.send({ orgId: currentAuth().orgId, channel: 'HTTP', to: input.to, from: input.from, text: input.text, clientRef: input.client_ref });
+  send(input: PublicSendInput, idempotencyKey?: string) {
+    return this.sender.send({
+      orgId: currentAuth().orgId,
+      channel: 'HTTP',
+      to: input.to,
+      from: input.from,
+      text: input.text,
+      clientRef: input.client_ref,
+      idempotencyKey,
+    });
   }
 
   /** CONTRACTS §11 message status; only the key's own org's messages (not a reseller's clients'). */
@@ -35,7 +43,7 @@ export class PublicApiService {
     const row = await this.db.tenant((trx) => {
       let q = trx
         .selectFrom('message_logs')
-        .select(['id', 'destination_addr', 'source_addr', 'status', 'dlr_stat', 'parts', 'client_cost_micros', 'created_at', 'submitted_at', 'dlr_received_at', 'client_msg_ref'])
+        .select(['id', 'destination_addr', 'source_addr', 'status', 'dlr_stat', 'parts', 'client_cost_micros', 'refunded', 'created_at', 'submitted_at', 'dlr_received_at', 'client_msg_ref'])
         .where('id', '=', id)
         .where('org_id', '=', auth.orgId);
       if (win) q = q.where('created_at', '>=', win.from).where('created_at', '<', win.to);
@@ -49,7 +57,10 @@ export class PublicApiService {
       status: row.status,
       dlr_stat: row.dlr_stat,
       parts: row.parts,
-      cost_micros: row.client_cost_micros,
+      // A fully refunded message (failed before/at submission) cost nothing; partial refunds
+      // are already reflected in client_cost_micros by the engine.
+      cost_micros: row.refunded ? 0 : row.client_cost_micros,
+      refunded: row.refunded,
       created_at: row.created_at,
       submitted_at: row.submitted_at,
       done_at: row.dlr_received_at,

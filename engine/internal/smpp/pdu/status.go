@@ -59,6 +59,9 @@ const (
 	ESME_RINVOPTPARAMVAL  CommandStatus = 0x000000C4 // Invalid optional parameter value
 	ESME_RDELIVERYFAILURE CommandStatus = 0x000000FE // Delivery failure (data_sm_resp)
 	ESME_RUNKNOWNERR      CommandStatus = 0x000000FF // Unknown error
+	// ESME_RINVDCS (SMPP v5.0; widely used with v3.4 too): invalid or
+	// unsupported data_coding.
+	ESME_RINVDCS CommandStatus = 0x00000104
 )
 
 //revive:enable:var-naming
@@ -80,6 +83,7 @@ var statusNames = map[CommandStatus]string{
 	ESME_RX_R_APPN: "ESME_RX_R_APPN", ESME_RQUERYFAIL: "ESME_RQUERYFAIL", ESME_RINVOPTPARSTREAM: "ESME_RINVOPTPARSTREAM",
 	ESME_ROPTPARNOTALLWD: "ESME_ROPTPARNOTALLWD", ESME_RINVPARLEN: "ESME_RINVPARLEN", ESME_RMISSINGOPTPARAM: "ESME_RMISSINGOPTPARAM",
 	ESME_RINVOPTPARAMVAL: "ESME_RINVOPTPARAMVAL", ESME_RDELIVERYFAILURE: "ESME_RDELIVERYFAILURE", ESME_RUNKNOWNERR: "ESME_RUNKNOWNERR",
+	ESME_RINVDCS: "ESME_RINVDCS",
 }
 
 // String returns the spec name (e.g. "ESME_RTHROTTLED") or a hex value for

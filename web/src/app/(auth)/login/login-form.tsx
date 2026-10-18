@@ -14,6 +14,7 @@ import { SubmitButton, TextField } from "@/components/shared/form-fields";
 import { errorMessage, isApiError } from "@/lib/api";
 import { useAuth } from "@/lib/auth/session";
 import { formatDateTime } from "@/lib/format";
+import { safeNext } from "@/lib/safe-next";
 import { emailSchema, totpCodeSchema } from "@/lib/validation";
 
 const credentialsSchema = z.object({
@@ -23,14 +24,6 @@ const credentialsSchema = z.object({
 const totpSchema = z.object({ totp_code: totpCodeSchema });
 
 type Credentials = z.infer<typeof credentialsSchema>;
-
-/** Only allow same-site relative redirects. */
-function safeNext(next: string | null): string {
-  if (!next || !next.startsWith("/") || next.startsWith("//") || next.startsWith("/login")) {
-    return "/dashboard";
-  }
-  return next;
-}
 
 export function LoginForm() {
   const { login, status } = useAuth();

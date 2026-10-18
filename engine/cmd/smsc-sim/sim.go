@@ -31,6 +31,10 @@ type Config struct {
 	DLRRetries  int           // attempts when no receiver is bound
 	// IgnoreRegisteredDelivery sends receipts even when registered_delivery is 0.
 	IgnoreRegisteredDelivery bool
+	// AcceptAll disables the …1111 submit-failure rule (that destination is
+	// then delivered normally), so a second simulator can act as the healthy
+	// failover target in end-to-end tests.
+	AcceptAll bool
 }
 
 // Record is one received logical message, as reported by GET /messages.
@@ -192,9 +196,9 @@ func (s *Sim) NewMessageID() string {
 }
 
 // outcome applies the destination rules.
-func outcome(dest string) (status pdu.CommandStatus, stat string) {
+func outcome(dest string, acceptAll bool) (status pdu.CommandStatus, stat string) {
 	switch {
-	case strings.HasSuffix(dest, "1111"):
+	case strings.HasSuffix(dest, "1111") && !acceptAll:
 		return pdu.ESME_RSUBMITFAIL, ""
 	case strings.HasSuffix(dest, "0000"):
 		return pdu.ESME_ROK, "UNDELIV"
@@ -206,7 +210,7 @@ func outcome(dest string) (status pdu.CommandStatus, stat string) {
 
 // HandleMessage implements server.Handler.
 func (s *Sim) HandleMessage(ctx context.Context, m *server.Message) pdu.CommandStatus {
-	st, stat := outcome(m.DestAddr)
+	st, stat := outcome(m.DestAddr, s.cfg.AcceptAll)
 	rd := m.RegisteredDelivery & pdu.RegDeliveryMask
 	wantDLR := stat != "" && (s.cfg.IgnoreRegisteredDelivery || rd == pdu.RegDeliveryAlways ||
 		(rd == pdu.RegDeliveryOnFailure && stat != "DELIVRD"))

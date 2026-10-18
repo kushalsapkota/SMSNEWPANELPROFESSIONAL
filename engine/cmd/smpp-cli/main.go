@@ -17,6 +17,7 @@
 //	-multipart  udh|sar|payload (default udh) for messages longer than one segment
 //	-dlr        request a delivery receipt (registered_delivery=1, default true)
 //	-wait       how long to wait for the receipt (default 30s, 0 = do not wait)
+//	-exit-on-unbind  give up waiting as soon as the gateway closes the session ("unbound": true)
 //	-timeout    bind / submit timeout (default 10s)
 //
 // Exit status: 0 on success (submitted, and receipt received when waited
@@ -47,6 +48,7 @@ type options struct {
 	From, To, Text, Multipart      string
 	Repeat                         int
 	DLR                            bool
+	ExitOnUnbind                   bool
 	Wait, Timeout                  time.Duration
 }
 
@@ -75,6 +77,7 @@ type Result struct {
 	Encoding     string   `json:"encoding,omitempty"`
 	Parts        int      `json:"parts,omitempty"`
 	DLR          *Receipt `json:"dlr"`
+	Unbound      bool     `json:"unbound,omitempty"` // -exit-on-unbind: the session was closed while waiting
 	ElapsedMS    int64    `json:"elapsed_ms"`
 	Error        string   `json:"error,omitempty"`
 }
@@ -100,6 +103,7 @@ func parse(args []string, stderr io.Writer) (options, error) {
 	fs.IntVar(&o.Repeat, "repeat", 1, "repeat the text N times")
 	fs.StringVar(&o.Multipart, "multipart", "udh", "multipart mode: udh|sar|payload")
 	fs.BoolVar(&o.DLR, "dlr", true, "request a delivery receipt")
+	fs.BoolVar(&o.ExitOnUnbind, "exit-on-unbind", false, "stop waiting for the receipt as soon as the gateway closes the session (e.g. kicked)")
 	fs.DurationVar(&o.Wait, "wait", 30*time.Second, "wait for the delivery receipt (0 = no wait)")
 	fs.DurationVar(&o.Timeout, "timeout", 10*time.Second, "bind / submit timeout")
 	if err := fs.Parse(args); err != nil {
@@ -304,12 +308,27 @@ func run(o options) Result {
 		return res
 	}
 	deadline := time.After(o.Wait)
+	var unbound <-chan time.Time
+	if o.ExitOnUnbind {
+		tick := time.NewTicker(100 * time.Millisecond)
+		defer tick.Stop()
+		unbound = tick.C
+	}
 	for {
 		select {
 		case r := <-got:
 			if r.ID == want {
 				res.DLR = &r
 				res.OK = true
+				return res
+			}
+		case <-unbound:
+			if st := c.State(); !st.Status.Bound() {
+				res.Unbound = true
+				res.Error = "session closed by the gateway while waiting for the receipt"
+				if st.LastError != "" {
+					res.Error += ": " + st.LastError
+				}
 				return res
 			}
 		case <-deadline:

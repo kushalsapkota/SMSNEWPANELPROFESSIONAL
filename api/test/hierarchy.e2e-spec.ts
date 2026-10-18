@@ -110,6 +110,8 @@ describe('hierarchy & org management', () => {
     expect(sus.body).toMatchObject({ status: 'SUSPENDED', suspended_reason: 'unpaid invoice' });
     expect(ctx.engine.calls('/internal/v1/smpp/sessions/kick').map((c) => c.body)).toEqual([{ org_id: client.orgId }]);
     expect(ctx.engine.requests[0].token).toBe(process.env.INTERNAL_TOKEN);
+    // the engine reloads its config synchronously before the kick (no debounce window for re-binds)
+    expect(ctx.engine.requests.map((r) => r.path)).toEqual(['/internal/v1/config/reload', '/internal/v1/smpp/sessions/kick']);
 
     const loginRes = await ctx.http().post('/api/auth/login').send({ email: client.email, password: client.password });
     expect(loginRes.status).toBe(403);
@@ -120,6 +122,8 @@ describe('hierarchy & org management', () => {
 
     const act = await as(ctx, reseller).post(`/api/orgs/${client.orgId}/activate`);
     expect(act.body.status).toBe('ACTIVE');
+    expect(ctx.engine.calls('/internal/v1/config/reload')).toHaveLength(2);
+    expect(ctx.engine.calls('/internal/v1/smpp/sessions/kick')).toHaveLength(1);
     expect((await as(ctx, client).get('/api/auth/me')).status).toBe(200);
 
     const actions = await ctx.db.selectFrom('audit_logs').select(['action', 'before', 'after']).where('target_org_id', '=', client.orgId).where('action', 'in', ['client.suspend', 'client.activate']).orderBy('id').execute();
@@ -151,6 +155,12 @@ describe('hierarchy & org management', () => {
     const off = await as(ctx, reseller).patch(`/api/orgs/${client.orgId}/channels`, { smpp_enabled: false, sending_enabled: false });
     expect(off.body).toMatchObject({ smpp_enabled: false, sending_enabled: false });
     expect(ctx.engine.calls('/internal/v1/smpp/sessions/kick')).toHaveLength(1);
+    // turning sending back on does not kick; turning only sending off does (bind needs can_send)
+    await as(ctx, reseller).patch(`/api/orgs/${client.orgId}/channels`, { smpp_enabled: true, sending_enabled: true }).expect(200);
+    expect(ctx.engine.calls('/internal/v1/smpp/sessions/kick')).toHaveLength(1);
+    await as(ctx, reseller).patch(`/api/orgs/${client.orgId}/channels`, { sending_enabled: false }).expect(200);
+    expect(ctx.engine.calls('/internal/v1/smpp/sessions/kick')).toHaveLength(2);
+    expect(ctx.engine.calls('/internal/v1/config/reload')).toHaveLength(4);
     const st = await as(ctx, client).get(`/api/orgs/${client.orgId}`);
     expect(st.body.effective_state).toMatchObject({ is_active: true, can_send: false, can_smpp: false });
     // a client cannot toggle its own channels
@@ -220,6 +230,38 @@ describe('hierarchy & org management', () => {
     const off = await as(ctx, reseller).patch(`/api/orgs/${client.orgId}/users/${add.body.id}`, { is_active: false });
     expect(off.body.is_active).toBe(false);
     expect((await ctx.http().post('/api/auth/login').send({ email, password: 'Reset-Passw0rd' })).status).toBe(401);
-    expect((await as(ctx, client).patch(`/api/orgs/${client.orgId}/users/${client.userId}`, { is_active: false })).status).toBe(400);
+    expect((await as(ctx, client).patch(`/api/orgs/${client.orgId}/users/${client.userId}`, { is_active: false })).status).toBe(403);
+  });
+
+  it('users: only the parent resets passwords or (de)activates users; the org itself cannot undo it', async () => {
+    const admin = await adminLogin(ctx);
+    const reseller = await createChild(ctx, admin, uniq('up-r'));
+    const client = await createChild(ctx, reseller, uniq('up-c'));
+    const email = `${uniq('colleague')}@test.local`;
+    const add = await as(ctx, client).post(`/api/orgs/${client.orgId}/users`, { email, password: 'Second-Passw0rd' });
+    expect(add.status).toBe(201);
+
+    // Self-service reset without the current password / 2FA: refused (own user and a colleague).
+    const self = await as(ctx, client).post(`/api/orgs/${client.orgId}/users/${client.userId}/reset-password`, { new_password: 'Hijack-Passw0rd' });
+    expect(self.status).toBe(403);
+    expect((await as(ctx, client).post(`/api/orgs/${client.orgId}/users/${add.body.id}/reset-password`, { new_password: 'Hijack-Passw0rd' })).status).toBe(403);
+    expect((await ctx.http().post('/api/auth/login').send({ email: client.email, password: 'Hijack-Passw0rd' })).status).toBe(401);
+
+    // The reseller deactivates the colleague; the client can't re-activate it, but may rename it.
+    await as(ctx, reseller).patch(`/api/orgs/${client.orgId}/users/${add.body.id}`, { is_active: false }).expect(200);
+    expect((await as(ctx, client).patch(`/api/orgs/${client.orgId}/users/${add.body.id}`, { is_active: true })).status).toBe(403);
+    const renamed = await as(ctx, client).patch(`/api/orgs/${client.orgId}/users/${add.body.id}`, { full_name: 'Renamed' });
+    expect(renamed.status).toBe(200);
+    expect(renamed.body).toMatchObject({ full_name: 'Renamed', is_active: false });
+
+    // The admin is read-only on clients.
+    expect((await as(ctx, admin).post(`/api/orgs/${client.orgId}/users/${add.body.id}/reset-password`, { new_password: 'Admin-Passw0rd' })).status).toBe(403);
+
+    // The parent may also do it while impersonating the client.
+    const imp = await as(ctx, reseller).post('/api/auth/impersonate', { org_id: client.orgId });
+    const asClient = { ...reseller, token: imp.body.access_token };
+    expect((await as(ctx, asClient).patch(`/api/orgs/${client.orgId}/users/${add.body.id}`, { is_active: true })).status).toBe(200);
+    expect((await as(ctx, asClient).post(`/api/orgs/${client.orgId}/users/${add.body.id}/reset-password`, { new_password: 'Reset-Passw0rd' })).status).toBe(200);
+    await ctx.http().post('/api/auth/login').send({ email, password: 'Reset-Passw0rd' }).expect(200);
   });
 });

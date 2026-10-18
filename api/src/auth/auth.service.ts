@@ -10,6 +10,7 @@ import { CryptoService } from '../crypto/crypto.service';
 import { DbService } from '../db/db.service';
 import type { Organization, User } from '../db/types';
 import { publicOrg, publicUser } from '../orgs/org.dto';
+import { evaluateSession, mayImpersonate } from './session-check';
 import { TokenPair, TokenService } from './token.service';
 
 export const MAX_FAILED_LOGINS = 5;
@@ -17,6 +18,12 @@ export const LOCKOUT_MINUTES = 15;
 export const RECOVERY_CODE_COUNT = 10;
 
 const totp = authenticator.clone({ window: 1 });
+const TOTP_STEP_SECONDS = 30;
+
+/** Current TOTP time step (RFC 6238, T0 = 0, 30s). */
+function currentTotpStep(): number {
+  return Math.floor(Date.now() / 1000 / TOTP_STEP_SECONDS);
+}
 
 /**
  * All auth flows use the privileged pool (CONTRACTS: auth flows only): they run before a
@@ -111,12 +118,15 @@ export class AuthService {
     }
   }
 
-  /** TOTP code, or a single-use recovery code (consumed atomically). */
+  /**
+   * TOTP code (±1 step, each step accepted at most once: users.totp_last_step), or a
+   * single-use recovery code (consumed atomically).
+   */
   private async verifySecondFactor(user: User, code: string): Promise<boolean> {
     const c = code.replace(/\s+/g, '');
     if (/^[0-9]{6}$/.test(c)) {
       if (!user.totp_secret_enc) return false;
-      return totp.check(c, this.crypto.decrypt(user.totp_secret_enc));
+      return this.acceptTotp(user.id, c, this.crypto.decrypt(user.totp_secret_enc));
     }
     const h = this.crypto.hashRecoveryCode(c);
     const r = await sql<{ id: string }>`
@@ -124,6 +134,41 @@ export class AuthService {
        where id = ${user.id} and ${h} = any(totp_recovery_hashes)
    returning id`.execute(this.db.privileged);
     return r.rows.length === 1;
+  }
+
+  /**
+   * Checks a 6-digit TOTP and records its time step; a step at or before the last accepted
+   * one is refused, so an observed code can't be replayed within its validity window.
+   */
+  private async acceptTotp(userId: string, code: string, secret: string): Promise<boolean> {
+    const delta = totp.checkDelta(code, secret);
+    if (delta === null) return false;
+    const step = currentTotpStep() + delta;
+    const r = await sql<{ id: string }>`
+      update users set totp_last_step = ${step}
+       where id = ${userId} and (totp_last_step is null or totp_last_step < ${step})
+   returning id`.execute(this.db.privileged);
+    return r.rows.length === 1;
+  }
+
+  /**
+   * Current password / 2FA re-checks inside a session (password change, 2FA disable): a locked
+   * account is refused, and every failure counts toward the same lockout as login.
+   */
+  private async reverify(user: User, kind: 'password' | 'totp', check: () => Promise<boolean>): Promise<boolean> {
+    if (user.locked_until && user.locked_until.getTime() > Date.now()) {
+      throw AppError.unauthorized('Account temporarily locked after too many failed attempts', {
+        locked_until: user.locked_until.toISOString(),
+      });
+    }
+    if (await check()) {
+      if (user.failed_login_count > 0) {
+        await this.db.privileged.updateTable('users').set({ failed_login_count: 0 }).where('id', '=', user.id).execute();
+      }
+      return true;
+    }
+    await this.registerFailure(user, kind);
+    return false;
   }
 
   // -------------------------------------------------------------------------
@@ -149,9 +194,27 @@ export class AuthService {
 
       const user = await trx.selectFrom('users').selectAll().where('id', '=', row.user_id).executeTakeFirst();
       if (!user || !user.is_active) return { kind: 'invalid' as const };
-      if (!row.impersonated_org_id) {
-        const st = await trx.selectFrom('app.org_effective_state').select('is_active').where('id', '=', user.org_id).executeTakeFirst();
-        if (!st?.is_active) return { kind: 'suspended' as const };
+      // Same checks as every request (real org active, impersonation still allowed, PANEL IP).
+      const v = await evaluateSession(trx, {
+        userId: user.id,
+        actingOrgId: row.impersonated_org_id ?? user.org_id,
+        impersonating: Boolean(row.impersonated_org_id),
+        ip: meta.ip,
+      });
+      if (!v.ok) {
+        if (v.reason === 'suspended') return { kind: 'suspended' as const };
+        // A refresh from outside the whitelist, or an impersonation that is no longer allowed:
+        // the token is not usable anymore, end the whole session family.
+        if (v.reason === 'ip' || v.reason === 'impersonation') {
+          await trx
+            .updateTable('refresh_tokens')
+            .set({ revoked_at: new Date(), revoked_reason: v.reason === 'ip' ? 'ip_not_allowed' : 'impersonation_not_allowed' })
+            .where('family_id', '=', row.family_id)
+            .where('revoked_at', 'is', null)
+            .execute();
+          return { kind: v.reason };
+        }
+        return { kind: 'invalid' as const };
       }
       const next = await this.tokens.issueRefresh(trx, {
         userId: user.id,
@@ -184,6 +247,8 @@ export class AuthService {
         throw AppError.unauthorized('Refresh token expired');
       case 'suspended':
         throw AppError.suspended();
+      case 'ip':
+        throw new AppError('IP_NOT_ALLOWED', 'Panel access is not allowed from this IP address');
       default:
         throw AppError.unauthorized('Invalid refresh token');
     }
@@ -217,14 +282,44 @@ export class AuthService {
       org: publicOrg(org),
       impersonating: Boolean(auth.impersonatorUserId),
       ...(original ? { original_org: publicOrg(original) } : {}),
+      brand_name: await this.effectiveBrand(org),
     };
+  }
+
+  /**
+   * Whitelabel brand shown in the panel (CONTRACTS-CHANGES web #1): the org's own brand_name,
+   * else (a client) its reseller's. Privileged: a client can't read its reseller's row under RLS.
+   */
+  private async effectiveBrand(org: Organization): Promise<string | null> {
+    if (org.brand_name) return org.brand_name;
+    if (org.role !== 'CLIENT' || !org.parent_id) return null;
+    const parent = await this.db.privileged.selectFrom('organizations').select('brand_name').where('id', '=', org.parent_id).executeTakeFirst();
+    return parent?.brand_name ?? null;
+  }
+
+  /**
+   * Public login-page branding for a reseller's whitelabel domain (`organizations.whitelabel_domain`,
+   * case-insensitive, port ignored). Only an ACTIVE reseller's brand is revealed; anything else
+   * → `{brand_name: null}` (the default brand).
+   */
+  async branding(rawHost: string | undefined): Promise<{ host: string | null; brand_name: string | null; reseller: boolean }> {
+    const host = normalizeHost(rawHost);
+    if (!host) return { host: null, brand_name: null, reseller: false };
+    const org = await this.db.privileged
+      .selectFrom('organizations')
+      .select(['name', 'brand_name'])
+      .where('whitelabel_domain', '=', host)
+      .where('role', '=', 'RESELLER')
+      .where('status', '=', 'ACTIVE')
+      .executeTakeFirst();
+    return { host, brand_name: org ? org.brand_name ?? org.name : null, reseller: Boolean(org) };
   }
 
   /** Changing the password ends every other session (refresh tokens revoked, older access tokens rejected). */
   async changePassword(auth: AuthContext, current: string, next: string): Promise<TokenPair> {
     if (auth.impersonatorUserId) throw AppError.forbidden('Stop impersonating before changing your password');
     const user = await this.db.privileged.selectFrom('users').selectAll().where('id', '=', auth.userId).executeTakeFirstOrThrow();
-    if (!(await this.crypto.verifyPassword(user.password_hash, current))) {
+    if (!(await this.reverify(user, 'password', () => this.crypto.verifyPassword(user.password_hash, current)))) {
       throw AppError.invalid('Current password is incorrect', { field: 'current_password' });
     }
     if (current === next) throw AppError.invalid('New password must differ from the current password');
@@ -259,7 +354,7 @@ export class AuthService {
     const secret = totp.generateSecret(20);
     await this.db.privileged
       .updateTable('users')
-      .set({ totp_secret_enc: this.crypto.encryptToBytes(secret), totp_recovery_hashes: [] })
+      .set({ totp_secret_enc: this.crypto.encryptToBytes(secret), totp_recovery_hashes: [], totp_last_step: null })
       .where('id', '=', user.id)
       .execute();
     return { secret, otpauth_url: totp.keyuri(user.email, this.config.TOTP_ISSUER, secret) };
@@ -270,7 +365,7 @@ export class AuthService {
     const user = await this.db.privileged.selectFrom('users').selectAll().where('id', '=', auth.userId).executeTakeFirstOrThrow();
     if (user.totp_enabled) throw AppError.conflict('Two-factor authentication is already enabled');
     if (!user.totp_secret_enc) throw AppError.invalid('Call /api/auth/totp/setup first');
-    if (!totp.check(code.trim(), this.crypto.decrypt(user.totp_secret_enc))) throw AppError.invalid('Invalid two-factor code');
+    if (!(await this.acceptTotp(user.id, code.trim(), this.crypto.decrypt(user.totp_secret_enc)))) throw AppError.invalid('Invalid two-factor code');
     const codes = Array.from({ length: RECOVERY_CODE_COUNT }, () => this.crypto.generateRecoveryCode());
     await this.db.privileged
       .updateTable('users')
@@ -285,10 +380,10 @@ export class AuthService {
     this.denyWhileImpersonating(auth);
     const user = await this.db.privileged.selectFrom('users').selectAll().where('id', '=', auth.userId).executeTakeFirstOrThrow();
     if (!user.totp_enabled) throw AppError.invalid('Two-factor authentication is not enabled');
-    if (!(await this.verifySecondFactor(user, code))) throw AppError.invalid('Invalid two-factor code');
+    if (!(await this.reverify(user, 'totp', () => this.verifySecondFactor(user, code)))) throw AppError.invalid('Invalid two-factor code');
     await this.db.privileged
       .updateTable('users')
-      .set({ totp_enabled: false, totp_secret_enc: null, totp_recovery_hashes: [] })
+      .set({ totp_enabled: false, totp_secret_enc: null, totp_recovery_hashes: [], totp_last_step: null })
       .where('id', '=', user.id)
       .execute();
     await this.audit.recordAs({ userId: user.id, orgId: user.org_id }, { action: 'auth.totp_disable', entityType: 'user', entityId: user.id, targetOrgId: user.org_id });
@@ -298,7 +393,11 @@ export class AuthService {
   // Impersonation
   // -------------------------------------------------------------------------
 
-  /** Parent-only: admin -> reseller/client, reseller -> its clients. Decided on the user's REAL org. */
+  /**
+   * Parent-only (CONTRACTS §10): admin -> its resellers, reseller -> its clients. Decided on the
+   * user's REAL org, which must be active. The admin reaches clients only through a reseller
+   * session (SUPER_ADMIN manages resellers only).
+   */
   async impersonate(auth: AuthContext, targetOrgId: string): Promise<TokenPair> {
     const meta = currentMeta();
     const user = await this.db.privileged.selectFrom('users').selectAll().where('id', '=', auth.userId).executeTakeFirstOrThrow();
@@ -306,11 +405,10 @@ export class AuthService {
     const target = await this.db.privileged.selectFrom('organizations').selectAll().where('id', '=', targetOrgId).executeTakeFirst();
     if (!target) throw AppError.notFound('Organization');
     if (target.id === realOrg.id) throw AppError.invalid('Use /api/auth/impersonate/stop to return to your own organization');
-
-    let allowed = false;
-    if (realOrg.role === 'SUPER_ADMIN') allowed = target.role === 'RESELLER' || target.role === 'CLIENT';
-    else if (realOrg.role === 'RESELLER') allowed = target.role === 'CLIENT' && target.parent_id === realOrg.id;
-    if (!allowed) throw AppError.forbidden('You may only impersonate organizations below yours');
+    await this.assertOrgActive(realOrg.id);
+    if (!mayImpersonate(realOrg.role, realOrg.id, target)) {
+      throw AppError.forbidden('You may only impersonate organizations directly below yours (admin: resellers; reseller: its clients)');
+    }
 
     const refresh = await this.tokens.issueRefresh(this.db.privileged, {
       userId: user.id,
@@ -389,4 +487,13 @@ export class AuthService {
     const access = await this.accessFor(user, impersonatedOrgId);
     return this.tokens.pair(access, refresh.token);
   }
+}
+
+/** "Panel.Example.com:443" → "panel.example.com"; null for anything that isn't a plausible host name. */
+export function normalizeHost(raw: string | undefined | null): string | null {
+  if (!raw) return null;
+  let h = raw.trim().toLowerCase();
+  if (h.startsWith('[')) return null; // IPv6 literals never carry a whitelabel domain
+  h = h.replace(/:\d+$/, '').replace(/\.$/, '');
+  return /^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/.test(h) ? h : null;
 }

@@ -1,5 +1,5 @@
 /**
- * Hand-written Kysely table types. MUST mirror db/migrations/001-004 exactly
+ * Hand-written Kysely table types. MUST mirror db/migrations/ (001-006) exactly
  * (column names, nullability, defaults). Update this file whenever a migration
  * changes a table.
  *
@@ -123,6 +123,8 @@ export interface UsersTable {
   last_login_at: Timestamp | null;
   last_login_ip: string | null;
   password_changed_at: DefaultTimestamp;
+  /** 006: last accepted TOTP step (unix seconds / 30); a code is accepted only once. */
+  totp_last_step: number | null;
   created_at: DefaultTimestamp;
   updated_at: DefaultTimestamp;
 }
@@ -287,6 +289,8 @@ export interface SmppAccountsTable {
   enabled: ColumnType<boolean, boolean | undefined, boolean>;
   last_bind_at: Timestamp | null;
   last_bind_ip: string | null;
+  /** 006: set when the parent created/updated it; the org itself may then only tighten it. */
+  locked_by_parent: ColumnType<boolean, boolean | undefined, boolean>;
   created_at: DefaultTimestamp;
   updated_at: DefaultTimestamp;
 }
@@ -298,6 +302,8 @@ export interface IpWhitelistsTable {
   scope: ColumnType<IpScope, IpScope | undefined, IpScope>;
   note: string | null;
   created_by_user_id: string | null;
+  /** 006: real org of the creator (parent rows can't be removed by the org itself). */
+  created_by_org_id: string | null;
   created_at: DefaultTimestamp;
 }
 
@@ -401,6 +407,8 @@ export interface BlockedNumbersTable {
   org_id: string | null;
   prefix: string;
   note: string | null;
+  /** 006: real org of the creator. */
+  created_by_org_id: string | null;
   created_at: DefaultTimestamp;
 }
 
@@ -409,6 +417,8 @@ export interface BlockedKeywordsTable {
   org_id: string | null;
   pattern: string;
   note: string | null;
+  /** 006: real org of the creator. */
+  created_by_org_id: string | null;
   created_at: DefaultTimestamp;
 }
 
@@ -426,6 +436,8 @@ export interface CampaignsTable {
   submitted: ColumnType<number, number | undefined, number>;
   failed: ColumnType<number, number | undefined, number>;
   created_by_user_id: string | null;
+  /** 006: when the previous chunk finished (pacing). */
+  last_chunk_at: Timestamp | null;
   created_at: DefaultTimestamp;
   updated_at: DefaultTimestamp;
 }
@@ -437,6 +449,8 @@ export interface CampaignRecipientsTable {
   vars: DefaultJson;
   message_id: string | null;
   error_code: string | null;
+  /** 006: id sent with a submit whose outcome is unknown; reused by the retry (idempotent debit). */
+  attempt_message_id: string | null;
 }
 
 export interface NotificationSettingsTable {

@@ -15,6 +15,8 @@ PGPORT      ?= 5432
 # Test fixtures (CONTRACTS §1 defaults).
 SCHEMA_TEST_DB     ?= sms_schema_test
 MIGRATE_TEST_DB    ?= sms_migrate_test
+ROLES_TEST_API     ?= sms_migratetest_api
+ROLES_TEST_ENGINE  ?= sms_migratetest_engine
 LUA_TEST_REDIS_DB  ?= 15
 GO_TEST_DB_CORE    ?= sms_core
 GO_TEST_DB_FLOW    ?= sms_flow
@@ -91,7 +93,7 @@ test-db: ## schema assertions (db/tests/schema_test.sql) on a fresh reset-db.sh 
 	echo "$$out" | grep -q 'ALL SCHEMA TESTS PASSED' || { echo "$$out" | tail -n 20; exit 1; }; \
 	echo "$$out" | grep -c '^NOTICE:  ok' | xargs printf 'test-db: %s ok assertions, ALL SCHEMA TESTS PASSED\n'
 
-test-migrate: ## deploy/migrate.sh on an empty DB (twice: idempotent) + schema test on the result
+test-migrate: ## migrate.sh on an empty DB (twice: idempotent) + schema test + init-roles.sh + maintenance.sh
 	@su postgres -c "psql -X -qAt -c 'DROP DATABASE IF EXISTS $(MIGRATE_TEST_DB) WITH (FORCE)' -c 'CREATE DATABASE $(MIGRATE_TEST_DB)'" >/dev/null
 	@MIGRATE_AS_POSTGRES=1 PGDATABASE=$(MIGRATE_TEST_DB) deploy/migrate.sh
 	@MIGRATE_AS_POSTGRES=1 PGDATABASE=$(MIGRATE_TEST_DB) deploy/migrate.sh 2>&1 | grep -q 'up to date' \
@@ -101,8 +103,26 @@ test-migrate: ## deploy/migrate.sh on an empty DB (twice: idempotent) + schema t
 	  || { echo "test-migrate: schema_migrations has $$n rows, expected $$want"; exit 1; }
 	@su postgres -c 'psql -X -v ON_ERROR_STOP=1 -d $(MIGRATE_TEST_DB)' < db/tests/schema_test.sql 2>&1 | grep -q 'ALL SCHEMA TESTS PASSED' \
 	  || { echo "test-migrate: schema test failed on the migrate.sh-built DB"; exit 1; }
-	@su postgres -c "psql -X -qAt -c 'DROP DATABASE IF EXISTS $(MIGRATE_TEST_DB) WITH (FORCE)'" >/dev/null
-	@echo "test-migrate: migrate.sh applied $$(ls db/migrations/*.sql | wc -l) files, re-run was a no-op, schema test passed"
+	@# db-init's other steps: login roles (created, then password rotated) + partition upkeep.
+	@# Throwaway role names: roles are cluster-wide, and the shared dev roles must stay untouched.
+	@export MIGRATE_AS_POSTGRES=1 PGDATABASE=$(MIGRATE_TEST_DB) SMS_API_DB_USER=$(ROLES_TEST_API) \
+	  SMS_ENGINE_DB_USER=$(ROLES_TEST_ENGINE) SMS_API_DB_PASSWORD=api-first-0123456789 \
+	  SMS_ENGINE_DB_PASSWORD=engine-pw-0123456789; \
+	  deploy/init/init-roles.sh 2>/dev/null; \
+	  SMS_API_DB_PASSWORD=api-rotated-0123456789 deploy/init/init-roles.sh 2>/dev/null; \
+	  MAINT_PARTITION_MONTHS=6 deploy/init/maintenance.sh 2>/dev/null
+	@u="postgres://$(ROLES_TEST_API):api-rotated-0123456789@localhost:$(PGPORT)/$(MIGRATE_TEST_DB)"; \
+	  e="postgres://$(ROLES_TEST_ENGINE):engine-pw-0123456789@localhost:$(PGPORT)/$(MIGRATE_TEST_DB)"; \
+	  q="SELECT rolbypassrls::text || pg_has_role('sms_api','MEMBER')::text || pg_has_role('sms_engine','MEMBER')::text FROM pg_roles WHERE rolname = current_user"; \
+	  [[ "$$(psql "$$u" -XqAt -c "$$q")" == falsetruefalse ]] || { echo "test-migrate: api login role has the wrong attributes"; exit 1; }; \
+	  [[ "$$(psql "$$e" -XqAt -c "$$q")" == truefalsetrue ]] || { echo "test-migrate: engine login role has the wrong attributes"; exit 1; }; \
+	  ! psql "postgres://$(ROLES_TEST_API):api-first-0123456789@localhost:$(PGPORT)/$(MIGRATE_TEST_DB)" -XqAt -c 'SELECT 1' >/dev/null 2>&1 \
+	    || { echo "test-migrate: old api password still works after rotation"; exit 1; }; \
+	  n="$$(psql "$$e" -XqAt -c "SELECT count(*) FROM pg_inherits WHERE inhparent = 'message_logs'::regclass AND inhrelid::regclass::text <> 'message_logs_default' AND pg_get_expr((SELECT relpartbound FROM pg_class WHERE oid = inhrelid), inhrelid) LIKE '%' || to_char(now() + interval '6 months', 'YYYY-MM') || '%'")"; \
+	  [[ "$$n" -ge 1 ]] || { echo "test-migrate: maintenance.sh did not create the partition 6 months ahead"; exit 1; }
+	@su postgres -c "psql -X -qAt -c 'DROP DATABASE IF EXISTS $(MIGRATE_TEST_DB) WITH (FORCE)' -c 'DROP ROLE IF EXISTS $(ROLES_TEST_API)' -c 'DROP ROLE IF EXISTS $(ROLES_TEST_ENGINE)'" >/dev/null
+	@echo "test-migrate: migrate.sh applied $$(ls db/migrations/*.sql | wc -l) files, re-run was a no-op, schema test passed;" \
+	  "init-roles.sh created + rotated the login roles (RLS / BYPASSRLS ok), maintenance.sh partitions ok"
 
 test-lua: ## balance Lua scripts (flushes Redis DB $(LUA_TEST_REDIS_DB)) + engine copies identical
 	@REDIS_PORT=$(REDIS_PORT) REDIS_DB=$(LUA_TEST_REDIS_DB) redis/tests/lua_test.sh | tail -n 3

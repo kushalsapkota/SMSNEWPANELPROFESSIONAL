@@ -167,12 +167,10 @@ trap 'rm -f "$rc_file"' EXIT
     name="$(basename "$f")"
     echo "SELECT NOT EXISTS (SELECT 1 FROM public.schema_migrations WHERE filename = '$name') AS migrate_pending \\gset"
     echo "\\if :migrate_pending"
-    echo "\\echo 'migrate: applying $name'"
+    printf '%s\n' "\\echo 'migrate: applying $name'"
     emit_file "$f"
     echo
-    echo "\\else"
-    echo "\\echo 'migrate: $name already applied by a concurrent run'"
-    echo "\\endif"
+    printf '%s\n' '\else' "\\echo 'migrate: $name already applied by a concurrent run'" '\endif'
   done
   echo "SELECT pg_advisory_unlock($LOCK_KEY) \\gset lock_"
 } | { set +e; "${PSQL[@]}" 2>&1; echo "$?" >"$rc_file"; } | sed 's/^/  /' >&2

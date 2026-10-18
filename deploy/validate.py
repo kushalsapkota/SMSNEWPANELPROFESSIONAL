@@ -14,14 +14,23 @@ Checks:
     never point at profile-only services
   * build Dockerfiles exist, are multi-stage and switch to a non-root USER
   * host paths of bind mounts exist
-  * `bash -n` syntax check of every deploy shell script
+  * `bash -n` syntax check of every deploy shell script, plus shellcheck when it is installed
+  * client-IP safety: web/api publish on 127.0.0.1 by default (and in .env.example) and the api
+    gets TRUSTED_PROXIES, so X-Forwarded-For cannot be spoofed by hitting web/api directly
+  * nginx.conf (when nginx is installed): `nginx -t` on a copy with throwaway certs/paths, and a
+    live run of its access-log format proving ?api_key= values never reach the access log
 """
 from __future__ import annotations
 
 import os
 import re
+import http.client
+import shutil
+import socket
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 try:
@@ -32,6 +41,7 @@ except ImportError:  # pragma: no cover
 DEPLOY = Path(__file__).resolve().parent
 COMPOSE = DEPLOY / "docker-compose.prod.yml"
 ENV_EXAMPLE = DEPLOY / ".env.example"
+NGINX_CONF = DEPLOY / "nginx.conf"
 
 REQUIRED_SECRETS = {
     "POSTGRES_PASSWORD", "SMS_API_DB_PASSWORD", "SMS_ENGINE_DB_PASSWORD", "REDIS_PASSWORD",
@@ -40,6 +50,7 @@ REQUIRED_SECRETS = {
 EXPECTED_PUBLISHED = {"web": 3001, "api": 3000, "engine": 2775}
 DATA_STORES = {"postgres", "redis"}
 ONE_SHOT = {"db-init", "seed"}
+FOREIGN_SCRIPTS = {"e2e.sh"}
 
 failures: list[str] = []
 passes = 0
@@ -163,6 +174,18 @@ def main() -> int:
     check(published == {k: {v} for k, v in EXPECTED_PUBLISHED.items()},
           f"ports: expected only {EXPECTED_PUBLISHED}, got {published}")
 
+    # --- client IP safety: X-Forwarded-For must only come through nginx -----------------------
+    secrets_only = {v: filled[v] for v in REQUIRED_SECRETS}
+    defaults_r, errs = interpolate_tree(raw, secrets_only)
+    check(not errs, f"compose: interpolation failed with only the secrets set: {errs}")
+    for label, svcs in (("compose defaults", defaults_r["services"]), (".env.example", services_r)):
+        for name in ("web", "api"):
+            for p in svcs[name].get("ports", []) or []:
+                check(str(p).split(":")[0] == "127.0.0.1",
+                      f"{label}: {name} port {p} must bind 127.0.0.1 (TRUST_PROXY=1 + public web/api = spoofable IP whitelists)")
+        check(bool(svcs["api"]["environment"].get("TRUSTED_PROXIES")), f"{label}: api TRUSTED_PROXIES not set")
+    check(documented.get("PUBLISH_ADDR") == "127.0.0.1", ".env.example: PUBLISH_ADDR must default to 127.0.0.1")
+
     # --- services: restart, healthcheck, depends_on, profiles -------------------------------
     for name, s in services.items():
         profiled = bool(s.get("profiles"))
@@ -223,13 +246,27 @@ def main() -> int:
           "api: tenant pool must use the RLS role, privileged pool the engine role")
 
     # --- shell scripts ----------------------------------------------------------------------
-    for script in sorted(list(DEPLOY.glob("*.sh")) + list(DEPLOY.glob("init/*.sh"))):
+    # deploy/e2e.sh belongs to the integration suite: syntax-checked here, style rules not enforced.
+    all_scripts = sorted(list(DEPLOY.glob("*.sh")) + list(DEPLOY.glob("init/*.sh")))
+    scripts = [p for p in all_scripts if p.name not in FOREIGN_SCRIPTS]
+    for script in all_scripts:
         r = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)
         check(r.returncode == 0, f"{script.name}: bash -n failed: {r.stderr.strip()}")
         check(os.access(script, os.X_OK), f"{script.name}: not executable")
+    for script in scripts:
         first = script.read_text().splitlines()[0]
         check(first == "#!/usr/bin/env bash", f"{script.name}: shebang should be #!/usr/bin/env bash")
         check(re.search(r"set -E?euo pipefail", script.read_text()) is not None, f"{script.name}: missing set -euo pipefail")
+
+    # shellcheck, when available (PATH or $SHELLCHECK); skipped with a note otherwise.
+    sc = os.environ.get("SHELLCHECK") or shutil.which("shellcheck")
+    if sc:
+        r = subprocess.run([sc, "-x", *map(str, scripts)], capture_output=True, text=True, cwd=DEPLOY)
+        check(r.returncode == 0, f"shellcheck:\n{r.stdout.strip()}")
+    else:
+        print("validate: note: shellcheck not found (set SHELLCHECK=/path/to/shellcheck); skipped")
+
+    check_nginx()
 
     if failures:
         for f in failures:
@@ -238,6 +275,108 @@ def main() -> int:
         return 1
     print(f"validate: ALL DEPLOY CHECKS PASSED ({passes} assertions)")
     return 0
+
+
+def free_port() -> int:
+    with socket.socket() as sk:
+        sk.bind(("127.0.0.1", 0))
+        return sk.getsockname()[1]
+
+
+def check_nginx() -> None:
+    """nginx -t on nginx.conf, then a live run of its log_format: API keys must never be logged."""
+    nginx = os.environ.get("NGINX") or shutil.which("nginx") or ("/usr/sbin/nginx" if os.access("/usr/sbin/nginx", os.X_OK) else None)
+    if not nginx:
+        print("validate: note: nginx not found (set NGINX=/path/to/nginx); nginx checks skipped")
+        return
+    text = NGINX_CONF.read_text()
+    with tempfile.TemporaryDirectory(prefix="smsgw-nginx-") as tmp:
+        t = Path(tmp)
+        (t / "logs").mkdir()
+        crt, key = t / "c.pem", t / "k.pem"
+        r = subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=t",
+                            "-keyout", str(key), "-out", str(crt)], capture_output=True, text=True)
+        if r.returncode == 0:
+            full = re.sub(r"ssl_certificate\s+\S+;", f"ssl_certificate {crt};", text)
+            full = re.sub(r"ssl_certificate_key\s+\S+;", f"ssl_certificate_key {key};", full)
+            full = full.replace("/var/log/nginx/", f"{t}/logs/").replace("pid /run/nginx.pid;", f"pid {t}/nginx.pid;")
+            if os.geteuid() != 0:
+                full = re.sub(r"(?m)^user\s+\S+;", "", full)
+            (t / "full.conf").write_text(full)
+            # default prefix: modules-enabled/*.conf load modules by prefix-relative paths
+            r = subprocess.run([nginx, "-t", "-q", "-c", str(t / "full.conf"), "-e", f"{t}/logs/error.log"],
+                               capture_output=True, text=True)
+            ok = r.returncode == 0
+            if not ok and "unknown directive \"stream\"" in r.stderr:
+                print("validate: note: nginx has no stream module; nginx -t skipped")
+            else:
+                check(ok, f"nginx -t nginx.conf failed: {r.stderr.strip()}")
+        else:
+            print("validate: note: openssl unavailable; nginx -t skipped")
+
+        # Live log test with the exact map + log_format from nginx.conf.
+        m_map = re.search(r"(?ms)^\s*map \$request \$request_log \{.*?^\s*\}", text)
+        m_fmt = re.search(r"(?ms)^\s*log_format main .*?;\s*$", text)
+        check(m_map is not None and m_fmt is not None, "nginx.conf: map $request $request_log / log_format main not found")
+        check(re.search(r"access_log\s+\S+\s+main;", text) is not None, "nginx.conf: access_log must use format main")
+        if m_map is None or m_fmt is None:
+            return
+        check('"$request"' not in m_fmt.group(0), "nginx.conf: log_format main must not log the raw $request")
+        port = free_port()
+        log = t / "logs" / "access.log"
+        (t / "log.conf").write_text(f"""
+pid {t}/log.pid;
+error_log {t}/logs/log-error.log warn;
+events {{ worker_connections 64; }}
+http {{
+{m_map.group(0)}
+{m_fmt.group(0)}
+    access_log {log} main;
+    server {{
+        listen 127.0.0.1:{port};
+        location / {{ return 204; }}
+    }}
+}}
+""")
+        r = subprocess.run([nginx, "-c", str(t / "log.conf"), "-p", tmp, "-e", f"{t}/logs/log-error.log"],
+                           capture_output=True, text=True)
+        check(r.returncode == 0, f"nginx log test: start failed: {r.stderr.strip()}")
+        if r.returncode != 0:
+            return
+        secret = "sk_live_" + "Q" * 40
+        cases = [
+            (f"/v1/sms/send?api_key={secret}&to=919876543210&text=hi", "/v1/sms/send?[redacted]"),
+            (f"/v1/sms/send?to=919876543210&API_KEY={secret}", "/v1/sms/send?[redacted]"),
+            (f"/v1/sms/send?api%5Fkey={secret}", "/v1/sms/send?[redacted]"),
+            ("/api/messages?status=DELIVERED&limit=50", "/api/messages?status=DELIVERED&limit=50"),
+        ]
+        try:
+            for path, _ in cases:
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                c.request("GET", path)
+                c.getresponse().read()
+                c.close()
+            deadline = time.time() + 5
+            lines: list[str] = []
+            while time.time() < deadline:
+                lines = log.read_text().splitlines() if log.exists() else []
+                if len(lines) >= len(cases):
+                    break
+                time.sleep(0.05)
+        finally:
+            pid = (t / "log.pid").read_text().strip() if (t / "log.pid").exists() else ""
+            subprocess.run([nginx, "-c", str(t / "log.conf"), "-p", tmp, "-e", f"{t}/logs/log-error.log", "-s", "stop"],
+                           capture_output=True)
+            if pid:
+                for _ in range(50):
+                    if not Path(f"/proc/{pid}").exists():
+                        break
+                    time.sleep(0.05)
+        check(len(lines) == len(cases), f"nginx log test: expected {len(cases)} lines, got {lines}")
+        body = "\n".join(lines)
+        check(secret not in body and "QQQQQQQQ" not in body, f"nginx log test: API key leaked into the access log:\n{body}")
+        for (_, expect), line in zip(cases, lines):
+            check(f'"GET {expect} HTTP/1.1"' in line, f"nginx log test: expected request {expect!r} in {line!r}")
 
 
 if __name__ == "__main__":

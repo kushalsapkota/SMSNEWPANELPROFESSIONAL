@@ -50,6 +50,8 @@ type Snapshotter interface {
 type Biller interface {
 	Debit(ctx context.Context, txnID string, legs []billing.Leg) (billing.DebitResult, error)
 	Refund(ctx context.Context, txnID string, legs []billing.Leg, amounts []int64) (billing.RefundResult, error)
+	// RefundUnloaded is the locked ledger path for refund.lua NOT_LOADED.
+	RefundUnloaded(ctx context.Context, txnID string, legs []billing.Leg, amounts []int64) (billing.RefundResult, error)
 }
 
 // Limiter is the subset of *ratelimit.Limiter the pipeline uses.
@@ -71,11 +73,15 @@ type Deps struct {
 	Limiter Limiter
 	CDR     CDRSink
 	Redis   redis.UniversalClient
-	// DB (optional) records refunds in the Postgres ledger when the Redis
-	// balance is gone (refund.lua NOT_LOADED).
+	// DB is kept for callers that pass it; ledger refunds go through
+	// Biller.RefundUnloaded.
 	DB      *pgxpool.Pool
 	Metrics *metrics.Engine
 	Logger  *slog.Logger
+	// Refunder (optional) applies and retries refunds; default: one built
+	// from Biller, Redis and CDR (its retry loop is then not running — the
+	// app runs the shared Refunder).
+	Refunder *Refunder
 
 	MsgStateTTL time.Duration    // msg:<id> lifetime; default 72h
 	Now         func() time.Time // default time.Now
@@ -100,6 +106,9 @@ func New(d Deps) *Pipeline {
 	}
 	if d.Metrics == nil {
 		d.Metrics = metrics.NewEngine(metrics.NewRegistry())
+	}
+	if d.Refunder == nil {
+		d.Refunder = NewRefunder(d.Biller, d.Redis, d.CDR, RefunderOptions{Logger: d.Logger, Metrics: d.Metrics})
 	}
 	return &Pipeline{d: d, log: d.Logger.With("component", "pipeline")}
 }
@@ -233,16 +242,42 @@ func (p *Pipeline) Submit(ctx context.Context, req Request) (res *Result, err er
 		finalText = tr.Output
 	}
 
-	// 7. Encoding / parts.
-	info := coding.Analyze(finalText)
+	// 7. Encoding / parts: the number of segments actually sent (Split
+	// never breaks an escape or surrogate pair, so it can exceed the
+	// ceil(units/153) arithmetic) — billing, MaxParts, the CDR and the
+	// dispatcher all use this count.
+	info, err := MeasureText(finalText)
+	if err != nil {
+		return nil, err
+	}
 	if info.TooLong() {
 		return nil, policy.Errorf(policy.CodeMessageTooLong, "message needs %d parts (max %d)", info.Parts, coding.MaxParts)
 	}
 	parts := info.Parts
 
+	msgID := req.MessageID
+	if msgID == "" {
+		msgID = NewMessageID()
+	}
+
+	// An api retry (HTTP/WEB message_id) of a message an earlier attempt
+	// already queued: answer it again before the limiters, which would count
+	// it twice or refuse it. Races between concurrent attempts are settled by
+	// the debit below (DUPLICATE → replay).
+	if req.Channel != store.ChannelSMPP && req.MessageID != "" && p.alreadyAccepted(ctx, msgID) {
+		clientCost, resellerCost := sel.Charges(parts)
+		_, legs := billingLegs(snap, org, sel, clientCost, resellerCost)
+		billed := len(legs) > 0 && !(req.Test && org.Role == store.RoleSuperAdmin)
+		p.log.Info("idempotent replay of an accepted message", "message_id", msgID)
+		return &Result{
+			MessageID: msgID, Status: cdr.StatusAccepted, Parts: parts, Encoding: info.Encoding.String(),
+			CostMicros: clientCostOrZero(billed, clientCost), RouteID: route.ID, SentText: finalText, CreatedAt: p.d.Now().UTC(),
+		}, nil
+	}
+
 	// 8. Velocity limits.
 	rl := ratelimit.Request{OrgID: org.ID, TPS: policy.EffectiveTPS(org, acct), DailyLimit: org.DailyLimit,
-		MonthlyLimit: org.MonthlyLimit, Timezone: org.Timezone, N: 1}
+		MonthlyLimit: org.MonthlyLimit, Timezone: org.Timezone, N: 1, Token: msgID}
 	counts, err := p.d.Limiter.Check(ctx, rl)
 	if err != nil {
 		if policy.CodeOf(err) == policy.CodeInternal {
@@ -251,26 +286,44 @@ func (p *Pipeline) Submit(ctx context.Context, req Request) (res *Result, err er
 		return nil, err
 	}
 	release := func() {
+		if counts.Replayed {
+			return // this attempt counted nothing (the token's first check did)
+		}
 		if rerr := p.d.Limiter.Release(context.WithoutCancel(ctx), rl, counts.At); rerr != nil {
 			p.log.Warn("rate limit release failed", "org_id", org.ID, "err", rerr)
 		}
 	}
 
 	// 9. Debit.
-	msgID := req.MessageID
-	if msgID == "" {
-		msgID = NewMessageID()
-	}
 	clientCost, resellerCost := sel.Charges(parts)
 	tag, legs := billingLegs(snap, org, sel, clientCost, resellerCost)
 	billed := len(legs) > 0 && !(req.Test && org.Role == store.RoleSuperAdmin)
 	if billed {
-		if _, err := p.d.Biller.Debit(ctx, msgID, toBillingLegs(tag, legs)); err != nil {
+		dr, err := p.d.Biller.Debit(ctx, msgID, toBillingLegs(tag, legs))
+		if err != nil {
 			release()
 			if policy.CodeOf(err) == policy.CodeInternal {
+				// The script may have run even though we got no reply (read
+				// timeout, connection reset): undo it. refund.lua is
+				// idempotent and answers NO_TXN when nothing was debited.
+				// A caller-chosen id (api retry) may belong to a message that
+				// an earlier attempt already queued: never refund that one.
+				if !p.alreadyAccepted(ctx, msgID) {
+					p.d.Refunder.Refund(context.WithoutCancel(ctx), msgID, tag, legs, nil, "debit_error", nil)
+				}
 				return nil, policy.Wrap(policy.CodeInternal, "billing unavailable", err)
 			}
 			return nil, err
+		}
+		if dr.Status == billing.StatusDuplicate {
+			// Same message id debited before: an api retry of a submit whose
+			// outcome it never saw (timeout / 5xx). Nothing is charged, stored
+			// or queued again.
+			release()
+			return p.replay(ctx, msgID, tag, &Result{
+				MessageID: msgID, Status: cdr.StatusAccepted, Parts: parts, Encoding: info.Encoding.String(),
+				CostMicros: clientCost, RouteID: route.ID, SentText: finalText, CreatedAt: p.d.Now().UTC(),
+			})
 		}
 	} else {
 		tag, legs = "", nil
@@ -304,14 +357,16 @@ func (p *Pipeline) Submit(ctx context.Context, req Request) (res *Result, err er
 		}
 		rec.ResellerCostMicros = &rc
 	}
-	refund := func(reason string) {
+	// refund returns whether the money is back now; a refund that fails
+	// transiently is retried later and then applies onApplied to the CDR.
+	refund := func(reason string, onApplied *cdr.Update) bool {
 		if !billed {
-			return
+			return false
 		}
-		RefundLegs(context.WithoutCancel(ctx), p.d.Biller, p.d.DB, p.log, p.d.Metrics, msgID, tag, legs, nil, reason)
+		return p.d.Refunder.Refund(context.WithoutCancel(ctx), msgID, tag, legs, nil, reason, onApplied) == RefundApplied
 	}
 	if err := p.d.CDR.Insert(ctx, rec); err != nil {
-		refund("cdr_unavailable")
+		refund("cdr_unavailable", nil)
 		release()
 		return nil, policy.Wrap(policy.CodeInternal, "could not record message", err)
 	}
@@ -323,18 +378,28 @@ func (p *Pipeline) Submit(ctx context.Context, req Request) (res *Result, err er
 		ClientRate: sel.ClientRate(), ResellerRate: sel.ResellerRate(),
 	}
 	if err := p.enqueue(ctx, job, req, clientRef); err != nil {
-		refund("enqueue_failed")
-		release()
-		code := "ENQUEUE_FAILED"
-		upd := cdr.Update{ID: msgID, CreatedAt: now, Status: cdr.StatusFailed, ErrorCode: &code}
-		if billed {
+		// MULTI/EXEC may have executed even though the reply was lost: the
+		// msg state and the stream entry are written atomically, so the
+		// state's presence proves the entry landed.
+		if landed, verr := p.enqueued(ctx, msgID); verr == nil && landed {
+			p.log.Warn("enqueue reported an error but the message was queued", "message_id", msgID, "err", err)
+		} else {
+			// Not queued (or unknown): make sure a late entry is never
+			// dispatched (the dispatcher skips messages marked done), then
+			// refund.
+			p.markUndispatchable(ctx, msgID)
+			code := "ENQUEUE_FAILED"
 			t := true
-			upd.Refunded = &t
+			upd := cdr.Update{ID: msgID, CreatedAt: now, Status: cdr.StatusFailed, ErrorCode: &code}
+			if refund("enqueue_failed", &cdr.Update{ID: msgID, CreatedAt: now, Refunded: &t}) {
+				upd.Refunded = &t
+			}
+			release()
+			if uerr := p.d.CDR.Update(context.WithoutCancel(ctx), upd); uerr != nil {
+				p.log.Error("cdr update failed", "message_id", msgID, "err", uerr)
+			}
+			return nil, policy.Wrap(policy.CodeInternal, "could not queue message", err)
 		}
-		if uerr := p.d.CDR.Update(context.WithoutCancel(ctx), upd); uerr != nil {
-			p.log.Error("cdr update failed", "message_id", msgID, "err", uerr)
-		}
-		return nil, policy.Wrap(policy.CodeInternal, "could not queue message", err)
 	}
 	return &Result{
 		MessageID: msgID, Status: cdr.StatusAccepted, Parts: parts, Encoding: info.Encoding.String(),
@@ -347,6 +412,39 @@ func clientCostOrZero(billed bool, c int64) int64 {
 		return 0
 	}
 	return c
+}
+
+// alreadyAccepted reports whether a message with this id was queued: its
+// msg:<id> state carries created_at_ms, which only the enqueue transaction
+// writes (a failed enqueue leaves just done/status, see
+// markUndispatchable). Errors count as "no": callers then behave as before.
+func (p *Pipeline) alreadyAccepted(ctx context.Context, msgID string) bool {
+	if p.d.Redis == nil {
+		return false
+	}
+	ok, err := p.d.Redis.HExists(context.WithoutCancel(ctx), MsgKey(msgID), FCreatedAtMS).Result()
+	return err == nil && ok
+}
+
+// replay answers a submit whose message id was already debited (debit.lua
+// DUPLICATE): the api retried a submit it got no answer for. If the earlier
+// attempt queued the message, its acceptance is returned again (idempotent).
+// If it failed and was refunded, the retry fails too (INTERNAL, as the first
+// answer would have); if it is still between debit and enqueue, CONFLICT
+// (retry later with the same id).
+func (p *Pipeline) replay(ctx context.Context, msgID, tag string, res *Result) (*Result, error) {
+	if p.alreadyAccepted(ctx, msgID) {
+		p.log.Info("idempotent replay of an accepted message", "message_id", msgID)
+		return res, nil
+	}
+	state := ""
+	if p.d.Redis != nil {
+		state, _ = p.d.Redis.HGet(context.WithoutCancel(ctx), billing.TxnKey(tag, msgID), "state").Result()
+	}
+	if state == "REFUNDED" || state == "PARTIALLY_REFUNDED" {
+		return nil, policy.New(policy.CodeInternal, "an earlier submit with this message_id failed and was refunded; submit with a new message_id")
+	}
+	return nil, policy.New(policy.CodeConflict, "a submit with this message_id is still being processed; retry later with the same message_id")
 }
 
 func (p *Pipeline) enqueue(ctx context.Context, job *DispatchJob, req Request, clientRef string) error {
@@ -371,6 +469,41 @@ func (p *Pipeline) enqueue(ctx context.Context, job *DispatchJob, req Request, c
 		return nil
 	})
 	return err
+}
+
+// enqueued reports whether the msg state of msgID exists (enqueue's
+// MULTI/EXEC ran).
+func (p *Pipeline) enqueued(ctx context.Context, msgID string) (bool, error) {
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	return p.d.Redis.HExists(cctx, MsgKey(msgID), FCreatedAtMS).Result()
+}
+
+// markUndispatchable flags msgID as finished so a stream entry that landed
+// despite the reported error is skipped by the dispatcher.
+func (p *Pipeline) markUndispatchable(ctx context.Context, msgID string) {
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	key := MsgKey(msgID)
+	if _, err := p.d.Redis.TxPipelined(cctx, func(pl redis.Pipeliner) error {
+		pl.HSet(cctx, key, FDone, 1, FStatus, cdr.StatusFailed)
+		pl.Expire(cctx, key, p.d.MsgStateTTL)
+		return nil
+	}); err != nil {
+		p.log.Error("could not mark message undispatchable", "message_id", msgID, "err", err)
+	}
+}
+
+// MeasureText returns the encoding and the exact number of segments
+// (len(coding.Split)) of text, as the dispatcher will send it.
+func MeasureText(text string) (coding.Info, error) {
+	info := coding.Analyze(text)
+	segs, err := coding.Split(text, info.Encoding)
+	if err != nil {
+		return info, policy.Wrap(policy.CodeInternal, "cannot segment text", err)
+	}
+	info.Parts = len(segs)
+	return info, nil
 }
 
 func firstRunes(s string, n int) string {
@@ -413,6 +546,14 @@ func validateRequest(r *Request) error {
 	if !utf8.ValidString(r.Text) {
 		return policy.New(policy.CodeInvalidRequest, "text must be valid UTF-8")
 	}
+	// U+0000 is valid UTF-8 but PostgreSQL text cannot store it: the
+	// message would be charged and sent with its CDR silently dropped.
+	if strings.IndexByte(r.Text, 0) >= 0 {
+		return policy.New(policy.CodeInvalidRequest, "text must not contain NUL (U+0000) characters")
+	}
+	if strings.IndexByte(r.Source, 0) >= 0 || strings.IndexByte(r.ClientRef, 0) >= 0 || !utf8.ValidString(r.ClientRef) || !utf8.ValidString(r.Source) {
+		return policy.New(policy.CodeInvalidRequest, "source and client_ref must be valid UTF-8 without NUL characters")
+	}
 	if len(r.ClientRef) > 255 {
 		return policy.New(policy.CodeInvalidRequest, "client_ref is too long (max 255)")
 	}
@@ -444,72 +585,6 @@ func toBillingLegs(tag string, legs []Leg) []billing.Leg {
 		out[i] = billing.Leg{OrgID: l.OrgID, Tag: tag, Amount: l.Amount}
 	}
 	return out
-}
-
-// RefundLegs refunds a message debit (amounts nil = everything not yet
-// refunded; otherwise one cap per leg). When the Redis balance can no
-// longer be loaded the refund is recorded in the Postgres ledger (db may be
-// nil, in which case it is only logged). Errors are logged, never returned:
-// refunds are best effort and idempotent per message id.
-func RefundLegs(ctx context.Context, b Biller, db *pgxpool.Pool, log *slog.Logger, m *metrics.Engine,
-	msgID, tag string, legs []Leg, amounts []int64, reason string) {
-	if len(legs) == 0 || tag == "" {
-		return
-	}
-	res, err := b.Refund(ctx, msgID, toBillingLegs(tag, legs), amounts)
-	if err != nil {
-		log.Error("refund failed", "message_id", msgID, "reason", reason, "err", err)
-		return
-	}
-	if m != nil {
-		m.Refunds.With(reason).Inc()
-	}
-	switch res.Status {
-	case billing.StatusOK, billing.StatusNothingToRefund:
-		return
-	case billing.StatusNoTxn:
-		log.Warn("refund: debit record expired; nothing refunded", "message_id", msgID, "reason", reason)
-		return
-	case billing.StatusNotLoaded:
-		if db == nil {
-			log.Error("refund: balance not loaded and no database to record it", "message_id", msgID)
-			return
-		}
-		for i, l := range legs {
-			amt := l.Amount
-			if amounts != nil {
-				amt = min(amounts[i], l.Amount)
-			}
-			if amt <= 0 {
-				continue
-			}
-			if err := ledgerRefund(ctx, db, l.OrgID, amt, msgID); err != nil {
-				log.Error("ledger refund failed", "message_id", msgID, "org_id", l.OrgID, "err", err)
-			}
-		}
-	}
-}
-
-// ledgerRefund records a refund directly in Postgres (balance not in Redis).
-func ledgerRefund(ctx context.Context, db *pgxpool.Pool, orgID string, amount int64, msgID string) error {
-	tx, err := db.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck
-	tag, err := tx.Exec(ctx, `
-		INSERT INTO balance_transactions (org_id, type, amount_micros, idempotency_key, reference, note, applied_at)
-		VALUES ($1, 'REFUND', $2, $3, $4, 'engine refund (balance not loaded)', now())
-		ON CONFLICT (idempotency_key) DO NOTHING`, orgID, amount, "refund:"+msgID+":"+orgID, msgID)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 1 {
-		if _, err := tx.Exec(ctx, `UPDATE accounts_balance SET balance_micros = balance_micros + $2 WHERE org_id = $1`, orgID, amount); err != nil {
-			return err
-		}
-	}
-	return tx.Commit(ctx)
 }
 
 // ResolveTemplate applies §9 step 6 for (route, client org): the effective
@@ -661,7 +736,10 @@ func (p *Pipeline) Preview(_ context.Context, req PreviewRequest) (*PreviewResul
 		out.Output = &v
 		measured = r.Output
 	}
-	info := coding.Analyze(measured)
+	info, err := MeasureText(measured)
+	if err != nil {
+		return nil, err
+	}
 	out.Encoding, out.Parts = info.Encoding.String(), info.Parts
 	return out, nil
 }

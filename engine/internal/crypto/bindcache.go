@@ -73,6 +73,17 @@ func (c *BindCache) Verify(systemID, password, passwordHash string) (bool, error
 	return true, nil
 }
 
+// Cached reports whether this exact (system_id, password, hash) combination
+// verified successfully within the TTL — without running argon2.
+func (c *BindCache) Cached(systemID, password, passwordHash string) bool {
+	k := bindKey(systemID, password, passwordHash)
+	now := c.now()
+	c.mu.Lock()
+	exp, ok := c.entries[k]
+	c.mu.Unlock()
+	return ok && now.Before(exp)
+}
+
 func (c *BindCache) insertLocked(k [32]byte, now time.Time) {
 	if len(c.entries) >= c.maxSize || now.After(c.sweepAt) {
 		for key, exp := range c.entries {

@@ -19,7 +19,8 @@ npm run seed                      # SUPER_ADMIN org + admin user from ADMIN_EMAI
 Tests need the local Postgres and Redis. They use DB `sms_api2` (reset by jest globalSetup via
 `db/reset-db.sh`) and Redis DB 5 (flushed). The engine (and the Telegram Bot API / engine metrics
 endpoint) is replaced by a local fake HTTP server (`test/fake-engine.ts`). Background workers are
-disabled in tests (`*_INTERVAL_MS=0`) and driven with `worker.tick()`.
+disabled in tests (`*_INTERVAL_MS=0`) and driven with `worker.tick()`. Set `TEST_DB_NAME` /
+`TEST_REDIS_DB` to run against another DB / Redis index (parallel agents).
 
 ```bash
 npm run lint    # tsc --noEmit over src + test
@@ -173,9 +174,19 @@ See `CONTRACTS-CHANGES.md` (api section) for the deviations and additions, all b
   strings. They are never returned and are stripped from audit rows.
 - Refresh tokens are 32 random bytes; only their sha256 is stored. They rotate on every use, and
   reusing any revoked token revokes the whole family.
-- Lockout: 5 consecutive failures (password or 2FA) lock the account for 15 minutes.
-- Panel login honours `PANEL`/`ALL` IP whitelists. Adding a `PANEL`/`ALL` rule that excludes the
+- Lockout: 5 consecutive failures (password or 2FA — at login, `totp/disable` and the current
+  password of `POST /api/auth/password`) lock the account for 15 minutes. Each TOTP step is
+  accepted once (`users.totp_last_step`).
+- Every authenticated request and every refresh re-checks the session (`auth/session-check.ts`):
+  user active, the REAL org active (also while impersonating), the impersonation still allowed, and
+  the `PANEL`/`ALL` IP whitelist of the real org. Adding a `PANEL`/`ALL` rule that excludes the
   caller's own current IP is refused.
-- `POST /api/webhooks/:id/test` makes an outbound request to a client-supplied URL. The engine
-  makes the same requests for real DLRs. In production, run api and engine egress through a proxy
-  that blocks private address ranges.
+- Controls a parent sets on a child (reviewed sender IDs, blocklist entries, IP rules, SMPP account
+  settings, user activation / password resets) can't be undone by the child; see
+  `isParentActor` in `tenancy/scope.service.ts`.
+- Webhook URLs are an SSRF surface: `webhooks/egress.ts` rejects non-public targets on save and on
+  the address actually connected to, and the test endpoint never returns the target's body. The
+  engine applies the same rule to real deliveries. `WEBHOOK_ALLOW_PRIVATE_TARGETS=1` turns it off
+  (dev / tests only).
+- Sends are idempotent with `Idempotency-Key` (public and web) and always for campaigns: the api
+  chooses the message ids (UUIDv7, `message_id` on the engine submit) and reuses them on a retry.

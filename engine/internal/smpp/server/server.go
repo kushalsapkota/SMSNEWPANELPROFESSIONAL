@@ -10,7 +10,7 @@
 //	srv, _ := server.New(server.Config{Authenticator: auth, Handler: h})
 //	_ = srv.Listen(":2775")
 //	...
-//	srv.Deliver(ctx, systemID, receiptPDU)
+//	srv.DeliverTo(ctx, orgID, systemID, receiptPDU)
 //	srv.Kick(orgID)
 //	srv.Close()
 package server
@@ -186,6 +186,9 @@ type Config struct {
 	TLSConfig   *tls.Config   // Listen wraps the listener when set
 	BindTimeout time.Duration // close connections not bound within; default 30s
 	AuthTimeout time.Duration // Authenticate ctx timeout; default 10s
+	// MaxBindFailures closes a connection after this many rejected bind
+	// attempts (password guessing on one TCP connection); default 3.
+	MaxBindFailures int
 
 	WindowSize            int           // max outstanding deliver_sm per session; default 10
 	RequestTimeout        time.Duration // deliver_sm_resp wait; default 10s
@@ -200,6 +203,10 @@ type Config struct {
 	// PerPartMessageIDs gives every part its own id (as real SMSCs do).
 	// Default false: one id per logical message, returned for every part.
 	PerPartMessageIDs bool
+	// ConcatStore (optional) keeps incomplete multipart sets outside the
+	// process (e.g. Redis) so parts sent on binds held by different
+	// instances join. nil = in-process reassembly.
+	ConcatStore ConcatStore
 
 	OnIncomplete func(IncompleteMessage)  // expired multipart sets
 	OnBind       func(SessionInfo)        // after a successful bind
@@ -222,6 +229,9 @@ func (c Config) withDefaults() (Config, error) {
 	}
 	if c.AuthTimeout <= 0 {
 		c.AuthTimeout = 10 * time.Second
+	}
+	if c.MaxBindFailures <= 0 {
+		c.MaxBindFailures = 3
 	}
 	if c.ConcatTimeout <= 0 {
 		c.ConcatTimeout = 60 * time.Second
@@ -502,19 +512,28 @@ func (s *Server) kick(cs []*conn) int {
 	return len(cs)
 }
 
-// Deliver sends d to one bound RX/TRX session of systemID (round robin) and
-// waits for deliver_sm_resp (bounded by ctx and Config.RequestTimeout). If a
-// chosen session turns out to be closed, the next one is tried.
+// Deliver sends d to one bound RX/TRX session of systemID, whatever its
+// organization. Gateway code delivering tenant data must use DeliverTo.
+func (s *Server) Deliver(ctx context.Context, systemID string, d *pdu.DeliverSM) (*pdu.DeliverSMResp, error) {
+	return s.DeliverTo(ctx, "", systemID, d)
+}
+
+// DeliverTo sends d to one bound RX/TRX session of systemID that belongs to
+// orgID (round robin) and waits for deliver_sm_resp (bounded by ctx and
+// Config.RequestTimeout). If a chosen session turns out to be closed, the
+// next one is tried. orgID "" matches any organization. Matching the
+// organization matters because a system_id can be deleted and re-created
+// by another tenant while receipts for the old one are still queued.
 //
 // Results mirror client.Submit: (resp, nil) on success, (resp,
 // *pdu.StatusError) when the ESME answered with an error, ErrNoSession when
 // no receiver is bound, or a session/ctx error when the outcome is unknown.
 // d is not modified.
-func (s *Server) Deliver(ctx context.Context, systemID string, d *pdu.DeliverSM) (*pdu.DeliverSMResp, error) {
+func (s *Server) DeliverTo(ctx context.Context, orgID, systemID string, d *pdu.DeliverSM) (*pdu.DeliverSMResp, error) {
 	s.mu.Lock()
 	var cands []*conn
 	for c := range s.bySystem[systemID] {
-		if c.ready.Load() && !c.kicked.Load() && c.bindType.CanReceive() {
+		if c.receives(orgID) {
 			cands = append(cands, c)
 		}
 	}
@@ -543,16 +562,54 @@ func (s *Server) Deliver(ctx context.Context, systemID string, d *pdu.DeliverSM)
 	return nil, ErrNoSession
 }
 
-// HasReceiver reports whether systemID has a bound RX/TRX session.
-func (s *Server) HasReceiver(systemID string) bool {
+// HasReceiver reports whether systemID has a bound RX/TRX session (any
+// organization).
+func (s *Server) HasReceiver(systemID string) bool { return s.HasReceiverFor("", systemID) }
+
+// HasReceiverFor reports whether systemID has a bound RX/TRX session of
+// orgID ("" = any organization).
+func (s *Server) HasReceiverFor(orgID, systemID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for c := range s.bySystem[systemID] {
-		if c.ready.Load() && !c.kicked.Load() && c.bindType.CanReceive() {
+		if c.receives(orgID) {
 			return true
 		}
 	}
 	return false
+}
+
+// ReceiverKey identifies a bound receiver (RX/TRX) session owner.
+type ReceiverKey struct {
+	OrgID, SystemID string
+}
+
+// Receivers lists the distinct (org, system_id) pairs with a bound RX/TRX
+// session on this server.
+func (s *Server) Receivers() []ReceiverKey {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	seen := map[ReceiverKey]bool{}
+	var out []ReceiverKey
+	for _, m := range s.bySystem {
+		for c := range m {
+			if !c.receives("") {
+				continue
+			}
+			k := ReceiverKey{OrgID: c.ident.OrgID, SystemID: c.ident.SystemID}
+			if !seen[k] {
+				seen[k] = true
+				out = append(out, k)
+			}
+		}
+	}
+	return out
+}
+
+// receives reports whether c may get deliver_sm for orgID (under s.mu).
+func (c *conn) receives(orgID string) bool {
+	return c.ready.Load() && !c.kicked.Load() && c.bindType.CanReceive() &&
+		c.ident != nil && (orgID == "" || c.ident.OrgID == orgID)
 }
 
 // Close stops listening, unbinds all sessions (≤2s), cancels the Handler

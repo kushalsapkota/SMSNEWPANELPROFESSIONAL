@@ -194,8 +194,18 @@ func TestHandleDeliverEndToEnd(t *testing.T) {
 		ev.To != "447700900123" || ev.From != "ACME" || ev.SubmittedAt == nil || ev.Parts != 2 {
 		t.Fatalf("event %+v", ev)
 	}
-	// Unknown id: acknowledged (no DB fallback configured).
-	if st := p.HandleDeliver(conn, receipt("deadbeef", "DELIVRD")); st != pdu.ESME_ROK {
+	// Unknown id (no DB fallback configured): the SMSC is asked to redeliver
+	// a bounded number of times (its submit may still be in flight), then
+	// the receipt is acknowledged.
+	unk := "dead" + strings.ReplaceAll(uuid.NewString()[:8], "-", "")
+	t.Cleanup(func() { rdb.Del(context.Background(), "dlrunm:"+conn+":"+unk) })
+	p.opts.LookupWait = 50 * time.Millisecond
+	for i := 0; i < 3; i++ {
+		if st := p.HandleDeliver(conn, receipt(unk, "DELIVRD")); st != pdu.ESME_RX_T_APPN {
+			t.Fatalf("attempt %d: %v", i, st)
+		}
+	}
+	if st := p.HandleDeliver(conn, receipt(unk, "DELIVRD")); st != pdu.ESME_ROK {
 		t.Fatal(st)
 	}
 }
@@ -241,13 +251,15 @@ type fakeSMPP struct {
 	got   chan *pdu.DeliverSM
 }
 
-func (f *fakeSMPP) Deliver(_ context.Context, sys string, d *pdu.DeliverSM) (*pdu.DeliverSMResp, error) {
+func (f *fakeSMPP) DeliverTo(_ context.Context, org, sys string, d *pdu.DeliverSM) (*pdu.DeliverSMResp, error) {
 	if f.fails.Add(-1) >= 0 {
 		return nil, server.ErrNoSession
 	}
 	f.got <- d
 	return &pdu.DeliverSMResp{}, nil
 }
+
+func (f *fakeSMPP) HasReceiverFor(org, sys string) bool { return true }
 
 type fakeHooks struct {
 	mu   sync.Mutex
@@ -279,7 +291,8 @@ func TestForwarderRetriesSMPPAndEnqueuesWebhooksOnce(t *testing.T) {
 	smpp := &fakeSMPP{got: make(chan *pdu.DeliverSM, 1)}
 	smpp.fails.Store(2)
 	hooks := &fakeHooks{}
-	snap := staticSnap{store.NewSnapshot(store.Data{Webhooks: []*store.Webhook{{ID: "wh1", OrgID: "org1", URL: "http://x", Secret: "s", Events: []string{"dlr"}, Enabled: true}}})}
+	snap := staticSnap{store.NewSnapshot(store.Data{Webhooks: []*store.Webhook{{ID: "wh1", OrgID: "org1", URL: "http://x", Secret: "s", Events: []string{"dlr"}, Enabled: true}},
+		SMPPAccounts: []*store.SMPPAccount{{ID: "a1", OrgID: "org1", SystemID: "sys1", Enabled: true}}})}
 	f := NewForwarder(rdb, snap, smpp, hooks, ForwarderOptions{Stream: stream, Consumer: "t", RetryIdle: 200 * time.Millisecond, Block: 50 * time.Millisecond})
 	done := make(chan struct{})
 	go func() { f.Run(ctx); close(done) }()

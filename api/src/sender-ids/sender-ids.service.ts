@@ -6,7 +6,7 @@ import { Pagination, offsetOf, page } from '../common/pagination';
 import { DbService } from '../db/db.service';
 import type { SenderStatus } from '../db/types';
 import { InvalidationService } from '../redis/redis.module';
-import { ScopeService, isParentOf } from '../tenancy/scope.service';
+import { ScopeService, isParentActor, isParentOf } from '../tenancy/scope.service';
 
 @Injectable()
 export class SenderIdsService {
@@ -41,13 +41,13 @@ export class SenderIdsService {
     });
   }
 
-  /** Created by the org itself -> PENDING; created by its parent -> APPROVED immediately. */
+  /** Created by the org itself -> PENDING; created by its parent (also while impersonating) -> APPROVED immediately. */
   async create(orgIdParam: string | undefined, input: { sender: string; route_id?: string | null }) {
     const auth = currentAuth();
     const org = await this.scope.resolve(orgIdParam, 'write');
     if (org.role === 'SUPER_ADMIN') throw AppError.invalid('Sender IDs apply to resellers and clients');
     const sender = /^\+?[0-9]+$/.test(input.sender) ? input.sender.replace(/^\+/, '') : input.sender;
-    const byParent = isParentOf(auth, org);
+    const byParent = isParentActor(auth, org);
     return this.db.tenant(async (trx) => {
       if (input.route_id) {
         const assigned = await trx
@@ -76,11 +76,20 @@ export class SenderIdsService {
     });
   }
 
+  /**
+   * The org itself may withdraw only its own PENDING requests. Reviewed rows (approved or
+   * rejected by the parent, or created by it) are the parent's control — and any row makes the
+   * org sender-restricted in the engine — so only the parent (also while impersonating) removes them.
+   */
   async remove(id: string) {
+    const auth = currentAuth();
     return this.db.tenant(async (trx) => {
       const row = await trx.selectFrom('sender_ids').selectAll().where('id', '=', id).executeTakeFirst();
       if (!row) throw AppError.notFound('Sender ID');
-      await this.scope.assertOrgAccess(row.org_id, 'write');
+      const org = await this.scope.assertOrgAccess(row.org_id, 'write');
+      if (row.status !== 'PENDING' && !isParentActor(auth, org)) {
+        throw AppError.forbidden('Reviewed sender IDs can only be removed by your parent organization');
+      }
       await trx.deleteFrom('sender_ids').where('id', '=', id).execute();
       await this.audit.record({ action: 'sender_id.delete', entityType: 'sender_id', entityId: id, targetOrgId: row.org_id, before: row });
       await this.invalidation.invalidate('sender_ids', id);

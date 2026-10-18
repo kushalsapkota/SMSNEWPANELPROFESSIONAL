@@ -305,3 +305,16 @@ func FuzzSplit(f *testing.F) {
 		_ = Decode(uint8(len(s)), []byte(s))
 	})
 }
+
+func TestTextDataCoding(t *testing.T) {
+	for _, dc := range []uint8{0, 1, 3, 6, 7, 8} {
+		if !TextDataCoding(dc) {
+			t.Errorf("0x%02X should be text", dc)
+		}
+	}
+	for _, dc := range []uint8{2, 4, 0x10, 0x14, 0x18, 0xC0, 0xE0, 0xF0, 0xF4} {
+		if TextDataCoding(dc) {
+			t.Errorf("0x%02X should not be carried as text", dc)
+		}
+	}
+}

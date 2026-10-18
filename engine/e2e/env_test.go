@@ -330,6 +330,8 @@ func setup() (int, error) {
 		"ENGINE_CDR_FLUSH_INTERVAL": "30ms", "ENGINE_BALANCE_SYNC_INTERVAL": "100ms",
 		"ENGINE_DISPATCH_CLAIM_IDLE": "5s", "ENGINE_INSTANCE_ID": "e2e-" + randHex(6),
 		"ENGINE_SHUTDOWN_TIMEOUT": "10s", "LOG_LEVEL": "info", "LOG_FORMAT": "text",
+		// the webhook receiver is a local httptest server (SSRF guard off for tests)
+		"WEBHOOK_ALLOW_PRIVATE_TARGETS": "1",
 	}
 	cfg, err := config.LoadFrom(func(k string) (string, bool) { v, ok := env[k]; return v, ok })
 	if err != nil {

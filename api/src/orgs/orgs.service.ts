@@ -265,7 +265,8 @@ export class OrgsService {
     if (Object.keys(input).length === 0) throw AppError.invalid('Nothing to update');
     return this.db.tenant(async (trx) => {
       const before = await trx.selectFrom('organizations').selectAll().where('id', '=', id).forUpdate().executeTakeFirstOrThrow();
-      const kick = input.smpp_enabled === false && before.smpp_enabled;
+      // SMPP sessions need SMPP *and* sending rights (CONTRACTS §4: SENDING_DISABLED refuses binds).
+      const kick = (input.smpp_enabled === false && before.smpp_enabled) || (input.sending_enabled === false && before.sending_enabled);
       return this.updateState(target, input, `${roleWord(target)}.channels`, kick);
     });
   }
@@ -277,16 +278,28 @@ export class OrgsService {
       const after = await trx.updateTable('organizations').set(set).where('id', '=', target.id).returningAll().executeTakeFirstOrThrow();
       await this.audit.record({ action, entityType: 'organization', entityId: target.id, targetOrgId: target.id, before: publicOrg(before), after: publicOrg(after) });
       await this.invalidation.invalidate('organizations', target.id);
-      if (kick) {
-        // A reseller's state also gates its clients (app.org_effective_state), so kick them too.
-        const childIds =
-          target.role === 'RESELLER'
-            ? (await trx.selectFrom('organizations').select('id').where('parent_id', '=', target.id).execute()).map((r) => r.id)
-            : [];
-        await this.db.afterCommit(async () => {
-          for (const orgId of [target.id, ...childIds]) await this.engine.kickQuietly(orgId);
-        });
+      if (set.status === 'SUSPENDED') {
+        // Its users' impersonation sessions (into its children) end with it; the auth guard and
+        // refresh also refuse them because the real org is no longer active.
+        await trx
+          .updateTable('refresh_tokens')
+          .set({ revoked_at: new Date(), revoked_reason: 'org_suspended' })
+          .where('impersonated_org_id', 'is not', null)
+          .where('revoked_at', 'is', null)
+          .where('user_id', 'in', (eb) => eb.selectFrom('users').select('id').where('org_id', '=', target.id))
+          .execute();
       }
+      // A reseller's state also gates its clients (app.org_effective_state), so kick them too.
+      const childIds =
+        kick && target.role === 'RESELLER'
+          ? (await trx.selectFrom('organizations').select('id').where('parent_id', '=', target.id).execute()).map((r) => r.id)
+          : [];
+      await this.db.afterCommit(async () => {
+        // Apply the new state in the engine now (pubsub reload is debounced): a suspended or
+        // disabled org must not re-bind / submit in that window, a re-enabled one may send at once.
+        await this.engine.reloadConfigQuietly();
+        if (kick) for (const orgId of [target.id, ...childIds]) await this.engine.kickQuietly(orgId);
+      });
       return publicOrg(after);
     });
   }
@@ -318,8 +331,12 @@ export class OrgsService {
     });
   }
 
+  /**
+   * Parent only (directly or while impersonating the org): resetting needs no current password
+   * or 2FA, so an org's own session must not use it (self-service is POST /api/auth/password).
+   */
   async resetUserPassword(orgId: string, userId: string, newPassword: string) {
-    await this.scope.getOrg(orgId, 'write');
+    await this.scope.requireParentActor(orgId, 'Only the parent organization may reset passwords; use /api/auth/password for your own');
     const hash = await this.crypto.hashPassword(newPassword);
     return this.db.tenant(async (trx) => {
       const user = await trx
@@ -336,9 +353,11 @@ export class OrgsService {
     });
   }
 
+  /** full_name: the org itself or its parent; is_active: the parent only (a deactivation by the parent sticks). */
   async patchUser(orgId: string, userId: string, input: { is_active?: boolean; full_name?: string | null }) {
     const auth = currentAuth();
-    await this.scope.getOrg(orgId, 'write');
+    if (input.is_active !== undefined) await this.scope.requireParentActor(orgId, 'Only the parent organization may activate or deactivate users');
+    else await this.scope.getOrg(orgId, 'write');
     if (input.is_active === false && userId === auth.userId) throw AppError.invalid('You cannot deactivate yourself');
     return this.db.tenant(async (trx) => {
       const before = await trx.selectFrom('users').selectAll().where('id', '=', userId).where('org_id', '=', orgId).executeTakeFirst();

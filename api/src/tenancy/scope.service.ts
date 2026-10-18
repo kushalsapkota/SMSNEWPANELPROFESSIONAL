@@ -39,6 +39,16 @@ export function isParentOf(auth: AuthContext, target: ScopedOrg): boolean {
   );
 }
 
+/**
+ * The caller's REAL org is the direct parent of `target`: the parent acting directly, or the
+ * parent impersonating `target` (the guard has verified the impersonation is allowed). Used for
+ * controls the parent sets on a child that the child itself must not undo.
+ */
+export function isParentActor(auth: AuthContext, target: ScopedOrg): boolean {
+  if (isParentOf(auth, target)) return true;
+  return Boolean(auth.impersonatorUserId) && auth.orgId === target.id && !!target.parent_id && auth.originalOrgId === target.parent_id;
+}
+
 @Injectable()
 export class ScopeService {
   constructor(private readonly db: DbService) {}
@@ -86,6 +96,15 @@ export class ScopeService {
     const org = await this.findVisibleOrg(id);
     if (!org) throw AppError.notFound('Organization');
     if (!canAccessOrg(currentAuth(), org, mode)) throw AppError.forbidden();
+    return org;
+  }
+
+  /** Like requireChild, but the parent may also be impersonating the org (isParentActor). */
+  async requireParentActor(id: string, message = 'Only the parent organization may perform this action'): Promise<ScopedOrg> {
+    const auth = currentAuth();
+    const org = await this.findVisibleOrg(id);
+    if (!org) throw AppError.notFound('Organization');
+    if (!isParentActor(auth, org)) throw AppError.forbidden(message);
     return org;
   }
 

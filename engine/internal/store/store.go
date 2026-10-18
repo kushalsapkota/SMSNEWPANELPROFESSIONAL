@@ -62,8 +62,9 @@ type Store struct {
 
 	invalidate chan struct{}
 
-	subMu sync.Mutex
-	subs  map[*Subscription]struct{}
+	subMu    sync.Mutex
+	subs     map[*Subscription]struct{}
+	notifies []chan struct{}
 
 	reloads  atomic.Uint64
 	failures atomic.Uint64
@@ -142,7 +143,25 @@ func (s *Store) Load(ctx context.Context) error {
 			s.publish(diff)
 		}
 	}
+	s.subMu.Lock()
+	for _, ch := range s.notifies {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+	s.subMu.Unlock()
 	return nil
+}
+
+// Notify returns a channel signalled (coalesced, never blocking the store)
+// after every successful reload; compare Current() with what you last saw.
+func (s *Store) Notify() <-chan struct{} {
+	ch := make(chan struct{}, 1)
+	s.subMu.Lock()
+	s.notifies = append(s.notifies, ch)
+	s.subMu.Unlock()
+	return ch
 }
 
 // Invalidate schedules a debounced reload (what a cfg:invalidate message does).
@@ -271,7 +290,7 @@ func (s *Store) listen(ctx context.Context) {
 type ConnDiff struct {
 	Old, New *Snapshot
 	Added    []string // in New only
-	Updated  []string // in both, SessionConfigEqual false (rebind)
+	Updated  []string // in both, ConfigEqual false (rebind only if SessionConfigEqual is false too)
 	Removed  []string // in Old only
 }
 
@@ -292,7 +311,7 @@ func DiffConnections(old, new *Snapshot) ConnDiff {
 		switch {
 		case oc == nil:
 			d.Added = append(d.Added, id)
-		case !oc.SessionConfigEqual(nc):
+		case !oc.ConfigEqual(nc):
 			d.Updated = append(d.Updated, id)
 		}
 	}

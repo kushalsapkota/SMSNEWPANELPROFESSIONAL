@@ -5,3 +5,6 @@ dist/
 .env
 engine/bin/
 coverage/
+deploy/.build-reports.json
+deploy/.finish-report.json
+deploy/.run/

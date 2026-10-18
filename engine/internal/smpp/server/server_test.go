@@ -596,7 +596,7 @@ func TestBindStateEnforcement(t *testing.T) {
 	if err != nil || resp.Hdr().Status != pdu.ESME_RINVBNDSTS {
 		t.Fatal(resp, err)
 	}
-	resp, err = s.Request(ctx, &pdu.Bind{BindType: pdu.BindReceiver, SystemID: "alice", Password: "pw"})
+	resp, err = s.Request(ctx, &pdu.Bind{BindType: pdu.BindReceiver, SystemID: "alice", Password: "pw", InterfaceVersion: pdu.InterfaceVersion34})
 	if err != nil || resp.Hdr().Status != pdu.ESME_ROK || resp.(*pdu.BindResp).SystemID != "SMSGW" {
 		t.Fatal(resp, err)
 	}

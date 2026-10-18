@@ -47,8 +47,33 @@ export class AuditLogsService {
       if (q.to) base = base.where('created_at', '<', new Date(q.to));
       const [{ total }] = await base.select((eb) => eb.fn.countAll<number>().as('total')).execute();
       const rows = await base.selectAll().orderBy('created_at', 'desc').orderBy('id', 'desc').limit(q.page_size).offset(offsetOf(q)).execute();
-      return page(rows, total, q);
+      return page(await this.withNames(rows), total, q);
     });
+  }
+
+  /**
+   * Display names for the rows the caller may already see (RLS above): actor / impersonator
+   * emails and actor / target org names. Looked up with the privileged pool because RLS hides
+   * the parent (e.g. a client can't read its reseller's users and org row), but only for ids
+   * that appear on visible rows.
+   */
+  private async withNames<T extends { actor_user_id: string | null; impersonator_user_id: string | null; actor_org_id: string | null; target_org_id: string | null }>(rows: T[]) {
+    const userIds = [...new Set(rows.flatMap((r) => [r.actor_user_id, r.impersonator_user_id]).filter((v): v is string => !!v))];
+    const orgIds = [...new Set(rows.flatMap((r) => [r.actor_org_id, r.target_org_id]).filter((v): v is string => !!v))];
+    const [users, orgs] = await Promise.all([
+      userIds.length ? this.db.privileged.selectFrom('users').select(['id', 'email']).where('id', 'in', userIds).execute() : [],
+      orgIds.length ? this.db.privileged.selectFrom('organizations').select(['id', 'name']).where('id', 'in', orgIds).execute() : [],
+    ]);
+    const email = new Map(users.map((u) => [u.id, u.email]));
+    const name = new Map(orgs.map((o) => [o.id, o.name]));
+    const get = (m: Map<string, string>, id: string | null) => (id ? m.get(id) ?? null : null);
+    return rows.map((r) => ({
+      ...r,
+      actor_email: get(email, r.actor_user_id),
+      impersonator_email: get(email, r.impersonator_user_id),
+      actor_org_name: get(name, r.actor_org_id),
+      target_org_name: get(name, r.target_org_id),
+    }));
   }
 }
 

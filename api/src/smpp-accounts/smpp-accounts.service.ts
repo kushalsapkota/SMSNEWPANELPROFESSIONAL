@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { Transaction, sql } from 'kysely';
 import { AuditService } from '../audit/audit.service';
+import { currentAuth } from '../common/context';
 import { AppError } from '../common/errors';
 import { Pagination, offsetOf, page } from '../common/pagination';
 import { CryptoService } from '../crypto/crypto.service';
@@ -8,7 +9,7 @@ import { DbService } from '../db/db.service';
 import type { BindType, DB } from '../db/types';
 import { EngineClient } from '../engine/engine-client.service';
 import { InvalidationService } from '../redis/redis.module';
-import { ScopeService } from '../tenancy/scope.service';
+import { ScopeService, ScopedOrg, isParentActor } from '../tenancy/scope.service';
 
 export interface SmppAccountInput {
   system_id: string;
@@ -30,6 +31,7 @@ function columns(trx: Transaction<DB>) {
       'max_binds',
       'max_tps',
       'enabled',
+      'locked_by_parent',
       'last_bind_at',
       'last_bind_ip',
       'created_at',
@@ -73,6 +75,7 @@ export class SmppAccountsService {
           max_tps: input.max_tps ?? null,
           allowed_bind_types: input.allowed_bind_types,
           enabled: input.enabled,
+          locked_by_parent: isParentActor(currentAuth(), org),
         })
         .returning('id')
         .executeTakeFirstOrThrow();
@@ -83,11 +86,27 @@ export class SmppAccountsService {
     });
   }
 
+  /**
+   * The parent's settings stick: an update by the parent (also while impersonating) locks the
+   * account, and the org itself may then only tighten it (disable, fewer binds, lower TPS,
+   * fewer bind types) — never re-enable or loosen what the parent set.
+   */
   async update(id: string, input: Partial<Omit<SmppAccountInput, 'system_id' | 'password'>>) {
     if (Object.keys(input).length === 0) throw AppError.invalid('Nothing to update');
     return this.db.tenant(async (trx) => {
-      const before = await this.load(trx, id);
-      await trx.updateTable('smpp_accounts').set(input).where('id', '=', id).execute();
+      const { row: before, org } = await this.loadWithOrg(trx, id);
+      const byParent = isParentActor(currentAuth(), org);
+      if (!byParent && before.locked_by_parent) {
+        const loosened = loosenedFields(before, input);
+        if (loosened.length > 0) {
+          throw new AppError('FORBIDDEN', 'Your parent organization manages this SMPP account; you may only restrict it further', { fields: loosened });
+        }
+      }
+      await trx
+        .updateTable('smpp_accounts')
+        .set({ ...input, ...(byParent ? { locked_by_parent: true } : {}) })
+        .where('id', '=', id)
+        .execute();
       const after = await columns(trx).where('id', '=', id).executeTakeFirstOrThrow();
       await this.audit.record({ action: 'smpp_account.update', entityType: 'smpp_account', entityId: id, targetOrgId: before.org_id, before, after });
       await this.invalidation.invalidate('smpp_accounts', id);
@@ -96,9 +115,13 @@ export class SmppAccountsService {
     });
   }
 
+  /** A parent-managed account can't be deleted (and re-created unlocked) by the org itself. */
   async remove(id: string) {
     return this.db.tenant(async (trx) => {
-      const before = await this.load(trx, id);
+      const { row: before, org } = await this.loadWithOrg(trx, id);
+      if (before.locked_by_parent && !isParentActor(currentAuth(), org)) {
+        throw AppError.forbidden('Your parent organization manages this SMPP account; ask it to delete the account');
+      }
       await trx.deleteFrom('smpp_accounts').where('id', '=', id).execute();
       await this.audit.record({ action: 'smpp_account.delete', entityType: 'smpp_account', entityId: id, targetOrgId: before.org_id, before });
       await this.invalidation.invalidate('smpp_accounts', id);
@@ -122,13 +145,36 @@ export class SmppAccountsService {
   }
 
   private async load(trx: Transaction<DB>, id: string) {
+    return (await this.loadWithOrg(trx, id)).row;
+  }
+
+  private async loadWithOrg(trx: Transaction<DB>, id: string) {
     const row = await columns(trx).where('id', '=', id).forUpdate().executeTakeFirst();
     if (!row) throw AppError.notFound('SMPP account');
-    await this.scope.assertOrgAccess(row.org_id, 'write');
-    return row;
+    const org: ScopedOrg = await this.scope.assertOrgAccess(row.org_id, 'write');
+    return { row, org };
   }
 
   private kickAfterCommit(orgId: string): Promise<void> {
     return this.db.afterCommit(() => this.engine.kickQuietly(orgId));
   }
+}
+
+/** Fields of `input` that would loosen the account compared to `before` (re-enable, raise limits, add bind types). */
+export function loosenedFields(
+  before: { enabled: boolean; max_binds: number; max_tps: number | null; allowed_bind_types: BindType[] },
+  input: Partial<Pick<SmppAccountInput, 'enabled' | 'max_binds' | 'max_tps' | 'allowed_bind_types'>>,
+): string[] {
+  const out: string[] = [];
+  if (input.enabled === true && !before.enabled) out.push('enabled');
+  if (input.max_binds !== undefined && input.max_binds > before.max_binds) out.push('max_binds');
+  if (input.max_tps !== undefined) {
+    // null = no account cap (only the org's): looser than any number.
+    const loosens = before.max_tps !== null && (input.max_tps === null || input.max_tps > before.max_tps);
+    if (loosens) out.push('max_tps');
+  }
+  if (input.allowed_bind_types !== undefined && input.allowed_bind_types.some((t) => !before.allowed_bind_types.includes(t))) {
+    out.push('allowed_bind_types');
+  }
+  return out;
 }

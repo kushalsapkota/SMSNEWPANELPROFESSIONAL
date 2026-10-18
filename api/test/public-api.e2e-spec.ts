@@ -232,11 +232,67 @@ describe('public /v1 API', () => {
       expect(res.body.details.issues.map((i: { path: string }) => i.path).sort()).toEqual(['from', 'text']);
     });
 
-    it('engine down → 502', async () => {
+    it('engine down → 502 with outcome unknown', async () => {
       ctx.engine.down = true;
       const res = await v1(key).post('/v1/sms/send', { to: '919876543210', from: 'ACME', text: 'x' });
       expect(res.status).toBe(502);
       expect(res.body.error_code).toBe('INTERNAL');
+      expect(res.body.details).toEqual({ outcome: 'unknown', retry_safe: false });
+    });
+
+    it('Idempotency-Key: a retry after an engine timeout returns the original result and sends nothing twice', async () => {
+      const key = (await createApiKey(ctx, client)).key; // own key: stay below this file's 20 req/s limit
+      const body = { to: '919876543210', from: 'ACME', text: 'Your code is 1234' };
+      ctx.engine.submitFailAfterAccept = true; // accepted (charged) by the engine, but the api sees a 503
+      const first = await v1(key).post('/v1/sms/send', body).set('Idempotency-Key', 'order-77');
+      expect(first.status).toBe(502);
+      expect(first.body.details).toEqual({ outcome: 'unknown', retry_safe: true });
+      expect(ctx.engine.sends).toBe(1);
+      ctx.engine.submitFailAfterAccept = false;
+      const retry = await v1(key).post('/v1/sms/send', body).set('Idempotency-Key', 'order-77');
+      expect(retry.status).toBe(200);
+      expect(ctx.engine.sends).toBe(1);
+      const ids = ctx.engine.calls('/internal/v1/submit').map((c) => (c.body as { message_id: string }).message_id);
+      expect(ids).toHaveLength(2);
+      expect(ids[0]).toBe(ids[1]);
+      expect(retry.body.messages[0].message_id).toBe(ids[0]);
+      // again (e.g. a client that retries a success): same answer, still one send
+      const again = await v1(key).post('/v1/sms/send', body).set('Idempotency-Key', 'order-77');
+      expect(again.body).toEqual(retry.body);
+      expect(ctx.engine.sends).toBe(1);
+      // the same key for a different request is a conflict; keys are per org
+      const conflict = await v1(key).post('/v1/sms/send', { ...body, text: 'other' }).set('Idempotency-Key', 'order-77');
+      expect(conflict.status).toBe(409);
+      expect(conflict.body.error_code).toBe('CONFLICT');
+      const otherKey = (await createApiKey(ctx, other)).key;
+      expect((await v1(otherKey).post('/v1/sms/send', body).set('Idempotency-Key', 'order-77')).status).toBe(200);
+      expect(ctx.engine.sends).toBe(2);
+      expect((await v1(key).post('/v1/sms/send', body).set('Idempotency-Key', 'bad key with spaces')).status).toBe(400);
+      // no key: every request gets fresh ids
+      await v1(key).post('/v1/sms/send', body).expect(200);
+      await v1(key).post('/v1/sms/send', body).expect(200);
+      expect(ctx.engine.sends).toBe(4);
+    });
+
+    it('Idempotency-Key on a batch: items the engine accepted before failing are not sent again', async () => {
+      const key = (await createApiKey(ctx, client)).key;
+      const body = { to: ['447700900001', '447700900002', '447700900003'], from: 'ACME', text: 'Hi' };
+      ctx.engine.batchFailAfter = 2;
+      expect((await v1(key).post('/v1/sms/send', body).set('Idempotency-Key', 'batch-1')).status).toBe(502);
+      ctx.engine.batchFailAfter = null;
+      const retry = await v1(key).post('/v1/sms/send', body).set('Idempotency-Key', 'batch-1');
+      expect(retry.status).toBe(200);
+      expect(retry.body.messages.map((m: { status: string }) => m.status)).toEqual(['ACCEPTED', 'ACCEPTED', 'ACCEPTED']);
+      expect(ctx.engine.sends).toBe(3);
+    });
+
+    it('web quick send honours Idempotency-Key too', async () => {
+      const body = { to: '919876543210', from: 'ACME', text: 'web' };
+      const a = await as(ctx, client).post('/api/messages/send', body).set('Idempotency-Key', 'web-1');
+      const b = await as(ctx, client).post('/api/messages/send', body).set('Idempotency-Key', 'web-1');
+      expect(a.status).toBe(201);
+      expect(b.body).toEqual(a.body);
+      expect(ctx.engine.sends).toBe(1);
     });
   });
 
@@ -268,11 +324,16 @@ describe('public /v1 API', () => {
         dlr_stat: 'DELIVRD',
         parts: 2,
         cost_micros: 10_000,
+        refunded: false,
         created_at: created.toISOString(),
         submitted_at: new Date(created.getTime() + 500).toISOString(),
         done_at: new Date(created.getTime() + 4000).toISOString(),
         client_ref: 'my-ref',
       });
+
+      // fully refunded (failed before/at submission): it cost nothing
+      const failed = await insertMessage(ctx, { org_id: client.orgId, reseller_id: reseller.orgId, status: 'FAILED', client_cost_micros: 5000, refunded: true });
+      expect((await v1(key).get(`/v1/sms/${failed}`)).body).toMatchObject({ status: 'FAILED', cost_micros: 0, refunded: true });
 
       const foreign = await insertMessage(ctx, { org_id: other.orgId, reseller_id: reseller.orgId });
       expect((await v1(key).get(`/v1/sms/${foreign}`)).status).toBe(404);

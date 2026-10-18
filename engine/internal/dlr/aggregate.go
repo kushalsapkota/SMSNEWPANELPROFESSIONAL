@@ -18,7 +18,9 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 
 	"smsgw/engine/internal/cdr"
@@ -39,14 +41,32 @@ var severity = map[string]int{
 // recordSrc records one part outcome.
 //
 // KEYS[1] msg:<id>
-// ARGV    part index, part status, dlr stat, dlr err
+// ARGV    part index, part status, dlr stat, dlr err, now (unix ms), call token
 //
-// Returns {1,'PARTIAL',delivered,failed} | {1,'FINAL',status,stat,err,delivered,failed} |
+// Returns {1,'PARTIAL',delivered,failed} | {1,'FINAL',status,stat|err,delivered,failed} |
 // {0,'NO_MSG'} | {0,'DONE'} | {0,'DUP'}
+//
+// FINAL hands the caller the job of emitting the final status (it sets
+// "emitted" once the client event is queued). So that the final status is
+// never lost, a message that is done but not yet emitted answers FINAL
+// again to a replay of the same call (same token: go-redis re-sends a script
+// after a read timeout) and to anyone once the previous claim is older than
+// 30s (the finalizer crashed, or failed and released its claim).
 var recordScript = redis.NewScript(`
 local k = KEYS[1]
 if redis.call('EXISTS', k) == 0 then return {0, 'NO_MSG'} end
-if redis.call('HGET', k, 'done') then return {0, 'DONE'} end
+if redis.call('HGET', k, 'done') then
+  local atv = redis.call('HGET', k, 'fin_at')
+  if atv and not redis.call('HGET', k, 'emitted') then
+    local tok = redis.call('HGET', k, 'fin_tok')
+    if tok == ARGV[6] or tonumber(ARGV[5]) - (tonumber(atv) or 0) > 30000 then
+      redis.call('HSET', k, 'fin_tok', ARGV[6], 'fin_at', ARGV[5])
+      return {1, 'FINAL', redis.call('HGET', k, 'status') or 'UNKNOWN', redis.call('HGET', k, 'fin_e') or '|',
+        redis.call('HGET', k, 'delivered') or '0', redis.call('HGET', k, 'failed') or '0'}
+    end
+  end
+  return {0, 'DONE'}
+end
 local idx = ARGV[1]
 if redis.call('HSETNX', k, 's' .. idx, ARGV[2]) == 0 then return {0, 'DUP'} end
 redis.call('HSET', k, 'e' .. idx, ARGV[3] .. '|' .. ARGV[4])
@@ -71,7 +91,7 @@ for i = 0, n - 1 do
 end
 if worst == nil then worst = ARGV[2]; wi = idx end
 local e = redis.call('HGET', k, 'e' .. wi) or '|'
-redis.call('HSET', k, 'done', 1, 'status', worst)
+redis.call('HSET', k, 'done', 1, 'status', worst, 'fin_e', e, 'fin_tok', ARGV[6], 'fin_at', ARGV[5])
 return {1, 'FINAL', worst, e, tostring(d), tostring(f)}`)
 
 // Outcome kinds of RecordPart.
@@ -93,12 +113,18 @@ type Outcome struct {
 	Failed    int
 }
 
-// RecordPart records the outcome of part (0-based) of message msgID.
+// RecordPart records the outcome of part (0-based) of message msgID. A
+// FINAL outcome must be followed by MarkEmitted once the client event is
+// queued (or ReleaseFinal if that failed, so a redelivered receipt retries).
 func RecordPart(ctx context.Context, rdb redis.Scripter, msgID string, part int, status, stat, errCode string) (Outcome, error) {
+	return recordPart(ctx, rdb, msgID, part, status, stat, errCode, uuid.NewString(), time.Now())
+}
+
+func recordPart(ctx context.Context, rdb redis.Scripter, msgID string, part int, status, stat, errCode, token string, now time.Time) (Outcome, error) {
 	if _, ok := severity[status]; !ok {
 		return Outcome{}, fmt.Errorf("dlr: invalid part status %q", status)
 	}
-	raw, err := recordScript.Run(ctx, rdb, []string{pipeline.MsgKey(msgID)}, part, status, stat, errCode).Slice()
+	raw, err := recordScript.Run(ctx, rdb, []string{pipeline.MsgKey(msgID)}, part, status, stat, errCode, now.UnixMilli(), token).Slice()
 	if err != nil {
 		return Outcome{}, fmt.Errorf("dlr: record part: %w", err)
 	}
@@ -134,6 +160,25 @@ func RecordPart(ctx context.Context, rdb redis.Scripter, msgID string, part int,
 		return Outcome{}, fmt.Errorf("dlr: unexpected outcome %v", raw)
 	}
 	return o, nil
+}
+
+// FieldEmitted is set on msg:<id> once the final client event was queued.
+const FieldEmitted = "emitted"
+
+// MarkEmitted records that the final status of msgID was emitted.
+func MarkEmitted(ctx context.Context, rdb redis.Cmdable, msgID string) error {
+	return rdb.HSet(ctx, pipeline.MsgKey(msgID), FieldEmitted, 1).Err()
+}
+
+// ReleaseFinal drops the emission claim of a FINAL outcome that could not be
+// emitted, so the next (redelivered) receipt finalizes it again at once.
+func ReleaseFinal(ctx context.Context, rdb redis.Cmdable, msgID string) error {
+	_, err := rdb.TxPipelined(ctx, func(p redis.Pipeliner) error {
+		p.HDel(ctx, pipeline.MsgKey(msgID), "fin_tok")
+		p.HSet(ctx, pipeline.MsgKey(msgID), "fin_at", 0)
+		return nil
+	})
+	return err
 }
 
 // StatusForStat maps a normalized receipt stat to a message status

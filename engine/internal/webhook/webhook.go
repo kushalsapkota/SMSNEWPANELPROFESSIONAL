@@ -67,6 +67,10 @@ type Options struct {
 	DedupTTL     time.Duration // completion marker lifetime; default 72h
 	UserAgent    string        // default "smsgw-webhook/1"
 	HTTPClient   *http.Client  // default: Timeout, no redirects
+	// BlockPrivate refuses targets that resolve to non-public addresses
+	// (SSRF guard, egress.go). Production sets it (config
+	// WEBHOOK_ALLOW_PRIVATE_TARGETS unset); ignored when HTTPClient is given.
+	BlockPrivate bool
 	Logger       *slog.Logger
 	Metrics      *metrics.Engine
 	Now          func() time.Time
@@ -119,6 +123,9 @@ func New(rdb redis.UniversalClient, db *pgxpool.Pool, src Snapshotter, o Options
 		o.Now = time.Now
 	}
 	hc := o.HTTPClient
+	if hc == nil && o.BlockPrivate {
+		hc = guardedClient(o.Timeout)
+	}
 	if hc == nil {
 		hc = &http.Client{
 			Timeout: o.Timeout,
