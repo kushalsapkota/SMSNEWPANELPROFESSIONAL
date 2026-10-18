@@ -1,0 +1,320 @@
+# Production stack: Postgres 16, Redis 7, a one-shot db-init, engine, api and web.
+#
+#   cp deploy/.env.example deploy/.env      # fill every secret (generate commands are inside)
+#   docker compose -f deploy/docker-compose.prod.yml --env-file deploy/.env up -d --build
+#   docker compose -f deploy/docker-compose.prod.yml --env-file deploy/.env --profile seed run --rm seed
+#   docker compose -f deploy/docker-compose.prod.yml --env-file deploy/.env --profile sim up -d smsc-sim
+#
+# Networks:
+#   data     internal (no egress, nothing published): postgres, redis, db-init, db-maint
+#   backend  internal: engine:8081 internal API, engine:9100 metrics, smsc-sim
+#   edge     normal bridge: published ports and outbound traffic (upstream SMSCs, webhooks, SMTP)
+# Published (bind address PUBLISH_ADDR, default 0.0.0.0; set 127.0.0.1 behind nginx):
+#   web 3001, api 3000, client SMPP 2775. Nothing else is published.
+#
+# Compose resolves paths in this file relative to deploy/, and the build context is the repo
+# root (..).
+
+name: smsgw
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+x-pg-owner-env: &pg-owner-env
+  PGHOST: postgres
+  PGPORT: "5432"
+  PGDATABASE: ${POSTGRES_DB:-sms_gateway}
+  PGUSER: ${POSTGRES_USER:-sms_owner}
+  PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
+
+services:
+  postgres:
+    image: postgres:16.4-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-sms_gateway}
+      POSTGRES_USER: ${POSTGRES_USER:-sms_owner}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    # Schema is applied by db-init (tracked, idempotent), not docker-entrypoint-initdb.d.
+    command:
+      - postgres
+      - -c
+      - max_connections=${PG_MAX_CONNECTIONS:-200}
+      - -c
+      - shared_buffers=${PG_SHARED_BUFFERS:-512MB}
+      - -c
+      - effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-1536MB}
+      - -c
+      - work_mem=${PG_WORK_MEM:-16MB}
+      - -c
+      - wal_compression=on
+      - -c
+      - log_min_duration_statement=${PG_LOG_MIN_DURATION_MS:-1000}
+      - -c
+      - password_encryption=scram-sha-256
+    shm_size: 256mb
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\" -h 127.0.0.1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    networks: [data]
+    stop_grace_period: 60s
+    logging: *logging
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in deploy/.env}
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?set REDIS_PASSWORD in deploy/.env}
+    # AOF fsync every second: at most ~1s of balance debits at risk on a crash. noeviction:
+    # balance / txn / dispatch-stream keys must never be silently dropped (writes fail instead).
+    # Single node, not Redis Cluster: the rate-limit Lua script touches keys without a shared
+    # hash tag (CONTRACTS-CHANGES engine-core #11).
+    command:
+      - sh
+      - -c
+      - >-
+        exec redis-server
+        --appendonly yes --appendfsync everysec
+        --aof-use-rdb-preamble yes
+        --save 900 1 --save 300 100
+        --maxmemory ${REDIS_MAXMEMORY:-1gb} --maxmemory-policy noeviction
+        --requirepass "$$REDIS_PASSWORD"
+        --tcp-keepalive 60
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -h 127.0.0.1 ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [data]
+    logging: *logging
+
+  # One-shot: migrations (tracked in schema_migrations) + login roles + partitions. Idempotent;
+  # every `up` re-runs it and it exits 0 quickly when there is nothing to do.
+  db-init:
+    image: postgres:16.4-alpine
+    restart: "no"
+    entrypoint: ["bash", "/deploy/init/db-init.sh"]
+    environment:
+      <<: *pg-owner-env
+      MIGRATIONS_DIR: /migrations
+      SMS_API_DB_USER: ${SMS_API_DB_USER:-sms_api_login}
+      SMS_API_DB_PASSWORD: ${SMS_API_DB_PASSWORD:?set SMS_API_DB_PASSWORD in deploy/.env}
+      SMS_ENGINE_DB_USER: ${SMS_ENGINE_DB_USER:-sms_engine_login}
+      SMS_ENGINE_DB_PASSWORD: ${SMS_ENGINE_DB_PASSWORD:?set SMS_ENGINE_DB_PASSWORD in deploy/.env}
+      MAINT_PARTITION_MONTHS: ${MAINT_PARTITION_MONTHS:-3}
+    volumes:
+      - ../db/migrations:/migrations:ro
+      - ./migrate.sh:/deploy/migrate.sh:ro
+      - ./init:/deploy/init:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [data]
+    logging: *logging
+
+  # Partition upkeep + optional retention (deploy/init/maintenance.sh) every MAINT_INTERVAL_SECONDS.
+  db-maint:
+    image: postgres:16.4-alpine
+    restart: unless-stopped
+    entrypoint:
+      - bash
+      - -c
+      - 'while :; do bash /deploy/init/maintenance.sh || echo "maintenance failed (exit $$?)" >&2; sleep "$${MAINT_INTERVAL_SECONDS}"; done'
+    environment:
+      <<: *pg-owner-env
+      MAINT_INTERVAL_SECONDS: ${MAINT_INTERVAL_SECONDS:-21600}
+      MAINT_PARTITION_MONTHS: ${MAINT_PARTITION_MONTHS:-3}
+      MESSAGE_LOG_RETENTION: ${MESSAGE_LOG_RETENTION:-}
+    volumes:
+      - ./init:/deploy/init:ro
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+    networks: [data]
+    logging: *logging
+
+  engine:
+    build:
+      context: ..
+      dockerfile: deploy/engine.Dockerfile
+    image: ${IMAGE_PREFIX:-smsgw}/engine:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://${SMS_ENGINE_DB_USER:-sms_engine_login}:${SMS_ENGINE_DB_PASSWORD:?set SMS_ENGINE_DB_PASSWORD}@postgres:5432/${POSTGRES_DB:-sms_gateway}?sslmode=disable
+      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379/0
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:?set INTERNAL_TOKEN in deploy/.env}
+      APP_ENC_KEY: ${APP_ENC_KEY:?set APP_ENC_KEY in deploy/.env}
+      ENGINE_HTTP_ADDR: ":8081"
+      ENGINE_SMPP_ADDR: ":2775"
+      ENGINE_METRICS_ADDR: ":9100"
+      ENGINE_DB_MAX_CONNS: ${ENGINE_DB_MAX_CONNS:-20}
+      ENGINE_SMPP_MAX_SESSIONS: ${ENGINE_SMPP_MAX_SESSIONS:-5000}
+      ENGINE_SMPP_SYSTEM_ID: ${ENGINE_SMPP_SYSTEM_ID:-SMSGW}
+      ENGINE_SHUTDOWN_TIMEOUT: ${ENGINE_SHUTDOWN_TIMEOUT:-20s}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LOG_FORMAT: json
+    ports:
+      - "${PUBLISH_ADDR:-0.0.0.0}:${SMPP_PUBLIC_PORT:-2775}:2775"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    healthcheck:
+      # Readiness: DB + Redis reachable (503 otherwise).
+      test: ["CMD-SHELL", "wget -q -O /dev/null --header \"X-Internal-Token: $${INTERNAL_TOKEN}\" http://127.0.0.1:8081/internal/v1/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    networks: [data, backend, edge]
+    # > ENGINE_SHUTDOWN_TIMEOUT so in-flight PDUs drain and CDRs flush before SIGKILL.
+    stop_grace_period: 30s
+    logging: *logging
+
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/api.Dockerfile
+    image: ${IMAGE_PREFIX:-smsgw}/api:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    environment:
+      PORT: "3000"
+      DATABASE_URL: postgres://${SMS_API_DB_USER:-sms_api_login}:${SMS_API_DB_PASSWORD:?set SMS_API_DB_PASSWORD}@postgres:5432/${POSTGRES_DB:-sms_gateway}?sslmode=disable
+      DATABASE_URL_PRIVILEGED: postgres://${SMS_ENGINE_DB_USER:-sms_engine_login}:${SMS_ENGINE_DB_PASSWORD:?set SMS_ENGINE_DB_PASSWORD}@postgres:5432/${POSTGRES_DB:-sms_gateway}?sslmode=disable
+      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379/0
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:?set INTERNAL_TOKEN}
+      ENGINE_URL: http://engine:8081
+      ENGINE_METRICS_URL: http://engine:9100/metrics
+      APP_ENC_KEY: ${APP_ENC_KEY:?set APP_ENC_KEY}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in deploy/.env}
+      TRUST_PROXY: ${TRUST_PROXY:-1}
+      TOTP_ISSUER: ${TOTP_ISSUER:-SMS Gateway}
+      DB_POOL_MAX: ${API_DB_POOL_MAX:-20}
+      PUBLIC_API_RATE_LIMIT: ${PUBLIC_API_RATE_LIMIT:-100}
+      CAMPAIGN_WORKER_INTERVAL_MS: ${CAMPAIGN_WORKER_INTERVAL_MS:-1000}
+      ALERTS_INTERVAL_MS: ${ALERTS_INTERVAL_MS:-60000}
+      LEDGER_RECONCILE_INTERVAL_MS: ${LEDGER_RECONCILE_INTERVAL_MS:-30000}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_SECURE: ${SMTP_SECURE:-0}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      SWAGGER_ENABLED: ${SWAGGER_ENABLED:-1}
+    ports:
+      - "${PUBLISH_ADDR:-0.0.0.0}:${API_PUBLIC_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      engine:
+        condition: service_started
+    networks: [data, backend, edge]
+    stop_grace_period: 20s
+    logging: *logging
+
+  # One-shot admin seed (idempotent): creates the SUPER_ADMIN org + user if missing.
+  #   ADMIN_EMAIL=... ADMIN_PASSWORD=... docker compose ... --profile seed run --rm seed
+  seed:
+    profiles: ["seed"]
+    image: ${IMAGE_PREFIX:-smsgw}/api:${IMAGE_TAG:-latest}
+    restart: "no"
+    command: ["node", "dist/seed.js"]
+    environment:
+      DATABASE_URL_PRIVILEGED: postgres://${SMS_ENGINE_DB_USER:-sms_engine_login}:${SMS_ENGINE_DB_PASSWORD:?set SMS_ENGINE_DB_PASSWORD}@postgres:5432/${POSTGRES_DB:-sms_gateway}?sslmode=disable
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      ADMIN_ORG_NAME: ${ADMIN_ORG_NAME:-Platform Admin}
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+    networks: [data]
+    logging: *logging
+
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/web.Dockerfile
+      args:
+        # Server-side rewrite target for /api/* and /v1/* (baked in at build time).
+        API_URL: http://api:3000
+        NEXT_PUBLIC_API_BASE_URL: ${PUBLIC_API_BASE_URL:-}
+        NEXT_PUBLIC_SMPP_HOST: ${PUBLIC_SMPP_HOST:-}
+        NEXT_PUBLIC_SMPP_PORT: ${SMPP_PUBLIC_PORT:-2775}
+    image: ${IMAGE_PREFIX:-smsgw}/web:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    environment:
+      PORT: "3001"
+      HOSTNAME: 0.0.0.0
+    ports:
+      - "${PUBLISH_ADDR:-0.0.0.0}:${WEB_PUBLIC_PORT:-3001}:3001"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/login').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    depends_on:
+      api:
+        condition: service_started
+    networks: [edge]
+    stop_grace_period: 15s
+    logging: *logging
+
+  # Fake upstream SMSC for staging / smoke tests (never in production traffic). Point an
+  # upstream connection at host `smsc-sim`, port 2776 (any system_id / password unless set).
+  smsc-sim:
+    profiles: ["sim"]
+    image: ${IMAGE_PREFIX:-smsgw}/engine:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    entrypoint: ["/usr/local/bin/smsc-sim"]
+    environment:
+      SMSC_SIM_LISTEN: ":2776"
+      SMSC_SIM_HTTP: ":2777"
+      SMSC_SIM_SYSTEM_ID: ${SMSC_SIM_SYSTEM_ID:-}
+      SMSC_SIM_PASSWORD: ${SMSC_SIM_PASSWORD:-}
+      SMSC_SIM_DLR_DELAY: ${SMSC_SIM_DLR_DELAY:-1s}
+      SMSC_SIM_LOG_LEVEL: ${SMSC_SIM_LOG_LEVEL:-info}
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2777/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks: [backend]
+    logging: *logging
+
+networks:
+  data:
+    internal: true
+  backend:
+    internal: true
+  edge: {}
+
+volumes:
+  pg_data:
+  redis_data:

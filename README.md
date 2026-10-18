@@ -68,3 +68,224 @@ it keeps 3 months ahead. Alert if `message_logs_default` has any rows. Retention
 - `org_effective_state` under `sms_api`: a client can't see its reseller's row, so the
   inherited flags show as permissive there. The engine (BYPASSRLS) gets the true value, which is what
   enforces sending. Use the engine's value, or a definer function, for any UI display.
+
+---
+
+# Running the platform
+
+Components: **engine** (Go: SMPP server/client, routing, billing, DLR, CDR), **api** (NestJS:
+management REST `/api/*` and the public HTTP API `/v1/*`), **web** (Next.js panel), backed by
+**PostgreSQL 16** and **Redis 7**. Roles: SUPER_ADMIN manages resellers, a RESELLER controls its
+clients (suspend, channels, routes, rates, credit), and CLIENTs send over HTTP, SMPP or the panel.
+The cross-component contract is [CONTRACTS.md](CONTRACTS.md), with additions in
+[CONTRACTS-CHANGES.md](CONTRACTS-CHANGES.md).
+
+## Quick start: native, no Docker
+
+Needs root, Go 1.23, Node 22, PostgreSQL 16 on :5432, Redis on :6399, plus `curl`, `jq`, `openssl`
+and `make`.
+
+```bash
+make dev-up        # or deploy/dev-up.sh
+make dev-down      # stop everything (make dev-purge also drops sms_dev + Redis DB 6)
+```
+
+`dev-up` does the following:
+1. Recreates database `sms_dev` (`db/reset-db.sh`, dev login roles) and flushes Redis DB 6.
+2. Builds the engine, `smsc-sim` and `smpp-cli` into `deploy/.run/bin`, the api (`dist/`), and the
+   web (`next build`).
+3. Starts smsc-sim, then the engine, seeds the admin, then starts the api and the web. Each runs in
+   its own process group, with its PID in `deploy/.run/*.pid` and its log in `deploy/.run/logs/*.log`.
+4. Waits for every health check. If any fails, it stops everything it started and prints the log.
+5. Provisions a demo tree through the REST API (`deploy/dev-demo.sh`):
+   - a connection to smsc-sim and a route;
+   - a reseller and a client with credit and SMPP enabled;
+   - an API key and the SMPP account `demo1`/`demopw1`.
+
+   It then sends one SMS over **HTTP** and one over **SMPP** and waits for both DLRs (`DELIVERED`).
+
+Logins: `admin@smsgw.local` / `Admin-Passw0rd!`, `reseller@smsgw.local` / `Reseller-Passw0rd!`,
+`client@smsgw.local` / `Client-Passw0rd!`. The client API key is in `deploy/.run/demo.env`.
+Settings: `WEB_MODE=dev` (hot reload), `DEV_RESET_DB=0` (keep data), `DEV_DEMO=0`, `DEV_DB`,
+`DEV_REDIS_DB`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`. Run `deploy/dev-demo.sh` any time as an end-to-end
+smoke test.
+
+```bash
+source deploy/.run/demo.env
+curl -s localhost:3000/v1/sms/send -H "Authorization: Bearer $DEMO_API_KEY" \
+     -H 'Content-Type: application/json' -d '{"to":"+447700900123","from":"DEMO","text":"Code 1234"}'
+deploy/.run/bin/smpp-cli -system-id demo1 -password demopw1 -from DEMO -to 447700900123 -text "hi"
+curl -s localhost:2777/messages | jq '.[0]'          # what the fake SMSC received
+```
+
+## Quick start: Docker (production layout)
+
+```bash
+cp deploy/.env.example deploy/.env && chmod 600 deploy/.env
+# fill the secrets: the one-liner at the top of .env.example generates all of them
+docker compose -f deploy/docker-compose.prod.yml --env-file deploy/.env up -d --build
+ADMIN_EMAIL=you@example.com ADMIN_PASSWORD='<strong password>' \
+  docker compose -f deploy/docker-compose.prod.yml --env-file deploy/.env --profile seed run --rm seed
+# optional fake upstream for staging: --profile sim up -d smsc-sim  (connection host smsc-sim:2776)
+```
+
+The stack is defined in `deploy/docker-compose.prod.yml`:
+
+| Service | What it does |
+|---|---|
+| `postgres` | 16, scram-sha-256 |
+| `redis` | 7: AOF everysec, `noeviction`, password |
+| `db-init` | One-shot. Runs `deploy/migrate.sh`, which applies the migrations in order and records them in `schema_migrations`. Then runs `deploy/init/init-roles.sh`, which creates the login roles from env: the api role (RLS) and the engine role (BYPASSRLS). Then creates partitions. Runs again on every `up`, and does nothing if there is no work. |
+| `db-maint` | Partition upkeep every 6h. |
+| `engine` / `api` / `web` | Healthchecks, `restart: unless-stopped`, log rotation, graceful stop periods. |
+| `seed` | Profile `seed`. Idempotent admin seed. |
+| `smsc-sim` | Profile `sim`. |
+
+Postgres and Redis sit only on the internal `data` network. The engine's internal API (8081) and
+metrics (9100) sit only on the internal `backend` network. The only published ports are web 3001,
+api 3000 and SMPP 2775, bound to `PUBLISH_ADDR`. Images: `deploy/engine.Dockerfile` (static Go,
+non-root uid 10001), `deploy/api.Dockerfile` (production node_modules only, user `node`),
+`deploy/web.Dockerfile` (Next.js standalone; `API_URL` and `NEXT_PUBLIC_*` are build args). Run
+`make docker-build` to build all three.
+
+**TLS:** `deploy/nginx.conf` terminates HTTPS for the panel and the API. SMPP is raw TCP, so it goes
+in a `stream` block: plain 2775 and SMPP-over-TLS on 3775. Set `PUBLISH_ADDR=127.0.0.1` and
+`TRUST_PROXY=1` behind it.
+
+## Architecture
+
+```
+                 HTTPS (nginx: deploy/nginx.conf)                   raw TCP / TLS
+   browsers ───────────────┐            HTTP API clients ──┐      SMPP clients (ESMEs)
+                           v                               v              │
+                 ┌──────────────────┐  /api,/v1   ┌──────────────────┐    │ :2775 bind/submit_sm
+                 │ web  Next.js     │────────────>│ api   NestJS     │    │ deliver_sm (DLR)
+                 │ :3001  panel UI  │  rewrites   │ :3000 /api /v1   │    v
+                 └──────────────────┘             │ workers:         │  ┌───────────────────────────┐
+                                                  │ campaigns,alerts,│  │ engine  Go                │
+                                                  │ ledger reconcile │─>│ :8081 internal HTTP (token)│
+                                                  └────────┬─────────┘  │ :2775 client SMPP server  │
+                                     RLS role (sms_api) +  │            │ :9100 /metrics /healthz   │
+                                     privileged (sms_engine)            │ pipeline: policy → route →│
+                                                           │ cfg:invalidate  template → limits → debit │
+                                                           v  (pub/sub) │ dispatch · DLR · webhooks │
+            ┌─────────────────────────────┐   ┌──────────────────────┐  │ CDR writer · bal syncer   │
+            │ PostgreSQL 16               │<──│ Redis 7 (AOF)        │<─└─────────────┬─────────────┘
+            │ tenants, routes, rates,     │   │ balances (Lua), rate │   SQL (BYPASSRLS)│ SMPP client
+            │ message_logs (monthly parts)│   │ limits, msg state,   │                  │ sessions, TPS
+            │ stats_hourly, audit, RLS    │   │ dispatch streams     │                  v
+            └─────────────────────────────┘   └──────────────────────┘     upstream SMSCs / smsc-sim :2776
+```
+
+## Ports
+
+| Port | Service | Exposure |
+|---|---|---|
+| 3001 | web panel (also proxies `/api/*`, `/v1/*`) | published |
+| 3000 | api: `/api/*` management, `/v1/*` public, `/api/docs` Swagger, `/api/health` | published |
+| 2775 | engine client SMPP server | published |
+| 8081 | engine internal HTTP (`X-Internal-Token`) | internal only (api) |
+| 9100 | engine Prometheus `/metrics`, liveness `/healthz` | internal only (scrape from the `backend` network) |
+| 5432 / 6379 | Postgres / Redis (compose) | `data` network only (local dev Redis: 6399) |
+| 2776 / 2777 | smsc-sim SMPP / HTTP inspector | dev / `sim` profile only |
+
+## Environment
+
+`deploy/.env.example` documents every variable the compose stack uses, with generate commands.
+
+| Required | Meaning |
+|---|---|
+| `POSTGRES_PASSWORD` | Owner password, used only by db-init and db-maint. |
+| `SMS_API_DB_PASSWORD` | Login role for the api tenant pool (RLS). |
+| `SMS_ENGINE_DB_PASSWORD` | Login role for the engine and the api privileged pool (BYPASSRLS). |
+| `REDIS_PASSWORD` | Redis password. |
+| `INTERNAL_TOKEN` | Shared secret for api → engine calls. |
+| `APP_ENC_KEY` | AES-256-GCM key for the `*_enc` columns. **Back it up. Never rotate it in place.** |
+| `JWT_SECRET` | Signs panel JWTs. |
+
+Passwords that appear in URLs must be URL-safe, so use `openssl rand -hex 24`. The engine reads
+`DATABASE_URL`, `REDIS_URL`, `INTERNAL_TOKEN`, `APP_ENC_KEY` and `ENGINE_*` tunables
+(`engine/internal/config`). The api reads the same names plus `DATABASE_URL_PRIVILEGED`,
+`ENGINE_URL`, `JWT_SECRET`, SMTP / Telegram settings and worker intervals (`api/.env.example`). The
+web reads `API_URL` at **build** time (CONTRACTS-CHANGES web part 1 #2).
+
+## Make targets
+
+```
+make dev-up | dev-down | dev-purge | dev-demo   native stack
+make build                                        engine/bin/*, api/dist, web/.next
+make test                                         deploy checks, schema, migrate.sh, Lua, go vet + go test -race,
+                                                  api lint + jest, web lint + typecheck + vitest + build
+make test-go GO_TEST_DB_CORE=x GO_TEST_DB_FLOW=y  any suite alone; fixture DB names / Redis DBs are overridable
+make docker-build | compose-up | compose-down
+make migrate | partitions                         operations against $DATABASE_URL / PG* (schema owner)
+```
+
+## Operations
+
+**Migrations.** `deploy/migrate.sh` applies `db/migrations/*.sql` in order. Each file and its
+`schema_migrations` row commit in the same transaction, and a session advisory lock serializes
+concurrent runners. It refuses to run if an applied file's checksum has changed: migrations are
+append-only, so add `006_*.sql` instead of editing an old file. For a database built with
+`db/reset-db.sh` (no tracking rows), run once with `MIGRATE_BASELINE=1`. A file marked
+`-- migrate:no-transaction` runs outside a transaction, for `CREATE INDEX CONCURRENTLY`. The usual
+upgrade is:
+
+```bash
+docker compose ... build && docker compose ... up -d
+```
+
+db-init applies new files before the engine and api start.
+
+**Partitions.** `message_logs` is partitioned by month. `deploy/init/maintenance.sh` creates
+partitions from last month through `MAINT_PARTITION_MONTHS` (default 3) ahead. If
+`MESSAGE_LOG_RETENTION` (e.g. `13 months`) is set, it drops whole partitions older than that. It
+warns when rows land in `message_logs_default`; treat that as an alert. In compose, `db-maint` runs
+it every 6h. Without compose, add a cron line:
+
+```cron
+15 3 * * *  PGHOST=db PGUSER=sms_owner PGPASSWORD=... PGDATABASE=sms_gateway /opt/smsgw/deploy/init/maintenance.sh >>/var/log/smsgw-maint.log 2>&1
+```
+
+**Backups.**
+- *Postgres:* take a nightly logical dump:
+
+  ```bash
+  docker compose ... exec -T postgres pg_dump -U sms_owner -Fc sms_gateway > sms_$(date +%F).dump
+  ```
+
+  Restore with `pg_restore -d <empty db> --no-owner`, then run db-init, which recreates the login
+  roles. Roles are cluster-wide and are not in the dump. For point-in-time recovery, run WAL
+  archiving (pgBackRest or wal-g) against the `pg_data` volume.
+- *Redis* holds the live balances. The engine's syncer copies them to `accounts_balance` every
+  ~2s, and Postgres is the system of record when a key is missing, because the engine re-hydrates.
+  Still snapshot the AOF/RDB in `redis_data` (`BGSAVE`, then copy `/data`) so that in-flight
+  debits, queued dispatch streams and DLR maps survive a host loss.
+- *Secrets:* keep `APP_ENC_KEY` in a secret manager. A database backup is unreadable for the
+  `*_enc` columns without it.
+
+**Monitoring.**
+- Scrape `engine:9100/metrics` from the `backend` network.
+- Readiness checks: `GET /internal/v1/health` (with the token; 503 when DB or Redis is down) and
+  `GET /api/health`.
+- Alert on Redis `used_memory` against `maxmemory`: with `noeviction`, writes fail when it is full.
+- Alert on rows in `message_logs_default`.
+- Alert on engine `connections_up < connections_total` (also visible in `/api/analytics/live`).
+
+**Scaling.**
+- *api:* stateless, so scale it horizontally (`docker compose up -d --scale api=3`, but then drop
+  the fixed host port and put nginx or a load balancer in front). The background workers can stay
+  on in every replica: campaigns are claimed with `FOR UPDATE SKIP LOCKED`, alerts are deduplicated
+  in Redis, and the ledger reconciler is idempotent.
+- *engine:* several instances can share Postgres and Redis. Each takes a unique
+  `ENGINE_INSTANCE_ID` (defaults to hostname-pid) as its Redis stream consumer. Balance syncs are
+  guarded by `synced_at`, and dispatch uses consumer groups. Note:
+  - Every instance binds every upstream connection's `sessions`, so divide those counts and TPS
+    across instances or the upstream sees N× the binds.
+  - Client SMPP sessions are per instance. Front them with a TCP load balancer.
+- *Redis:* must stay a single primary, not Redis Cluster, because the rate-limit script uses keys
+  without a shared hash tag. Scale it vertically, and use Sentinel or a managed replica for
+  failover.
+- *Postgres:* size `PG_MAX_CONNECTIONS` for engine pools + 2 × api pools per replica. Monthly
+  partitions keep `message_logs` indexes small. Put a read replica behind reporting if analytics
+  load grows.

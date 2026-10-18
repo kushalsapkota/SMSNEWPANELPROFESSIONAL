@@ -1,0 +1,9 @@
+# Build context is the repo root; the web image needs only web/ sources.
+**
+!web/**
+web/node_modules
+web/.next
+web/tsconfig.tsbuildinfo
+web/.env
+web/.env.*
+web/coverage

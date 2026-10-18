@@ -1,0 +1,8 @@
+# Build context is the repo root; the engine image needs only engine/.
+**
+!engine/go.mod
+!engine/go.sum
+!engine/**/*.go
+!engine/**/*.lua
+engine/bin
+engine/**/*_test.go

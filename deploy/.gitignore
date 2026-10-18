@@ -1,0 +1,4 @@
+# Local runtime state of deploy/dev-up.sh (pids, logs, binaries, generated dev secrets)
+.run/
+# Production secrets (copy of .env.example)
+.env

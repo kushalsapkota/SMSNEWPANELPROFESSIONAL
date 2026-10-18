@@ -1,0 +1,8 @@
+# Build context is the repo root; the api image needs only these.
+**
+!api/package.json
+!api/package-lock.json
+!api/tsconfig.json
+!api/tsconfig.build.json
+!api/src/**
+api/src/**/*.spec.ts

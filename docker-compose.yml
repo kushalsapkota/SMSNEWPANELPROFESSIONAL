@@ -1,3 +1,5 @@
+# Local data stores only (Postgres 16 + Redis 7) for development against containers.
+# The full production stack (db-init, engine, api, web, sim) is deploy/docker-compose.prod.yml.
 name: sms-gateway
 
 services:

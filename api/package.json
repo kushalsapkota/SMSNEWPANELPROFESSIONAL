@@ -1,0 +1,50 @@
+{
+  "name": "@smsgw/api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "SMS gateway management REST API and public HTTP API (NestJS)",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "start": "node dist/main.js",
+    "start:dev": "ts-node --transpile-only src/main.ts",
+    "lint": "tsc --noEmit -p tsconfig.json",
+    "seed": "ts-node --transpile-only src/seed.ts",
+    "test": "jest --runInBand"
+  },
+  "dependencies": {
+    "@nestjs/common": "10.4.22",
+    "@nestjs/core": "10.4.22",
+    "@nestjs/platform-express": "10.4.22",
+    "@nestjs/swagger": "7.4.2",
+    "@node-rs/argon2": "2.0.2",
+    "csv-parse": "5.6.0",
+    "ioredis": "5.4.1",
+    "jsonwebtoken": "9.0.2",
+    "kysely": "0.27.5",
+    "nodemailer": "6.9.16",
+    "otplib": "12.0.1",
+    "pg": "8.13.1",
+    "reflect-metadata": "0.2.2",
+    "rxjs": "7.8.1",
+    "zod": "3.23.8"
+  },
+  "devDependencies": {
+    "@nestjs/testing": "10.4.22",
+    "@types/express": "4.17.21",
+    "@types/jest": "29.5.14",
+    "@types/jsonwebtoken": "9.0.7",
+    "@types/node": "22.10.2",
+    "@types/nodemailer": "6.4.17",
+    "@types/pg": "8.11.10",
+    "@types/supertest": "6.0.2",
+    "jest": "29.7.0",
+    "supertest": "7.1.4",
+    "ts-jest": "29.2.5",
+    "ts-node": "10.9.2",
+    "typescript": "5.6.3"
+  }
+}
