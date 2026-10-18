@@ -124,7 +124,7 @@ button gets an `aria-label`. Pages use `<PageHeader title description actions ba
 | `/resellers`, `/resellers/[id]` | admin | tabs: overview, channels, balance, routes, users, clients (read-only) |
 | `/clients`, `/clients/[id]` | reseller | same tabs + credentials + template overrides |
 | `/connections`, `/connections/[id]` | admin | CRUD (password write-only), rates editor, used-by routes |
-| `/routes`, `/routes/[id]` | admin: CRUD + connection mapping; reseller: assigned routes with my cost | |
+| `/routes`, `/routes/new`, `/routes/[id]` | admin: CRUD + connection mapping; reseller: assigned routes with my cost | `/routes/new` creates route + inline SMPP / existing connections in one step (`POST /api/routes/quick`); detail has a live "Carrier status" card (`GET /api/routes/:id/status`, 3s) with plain-words errors (`lib/carrier-status.ts`) and endpoint edit |
 | `/templates` | admin: route-wide; reseller: client overrides | live OTP preview via `POST /api/templates/preview` |
 | `/sender-ids` | all | admin/reseller approval queue (`include_children=true`); own requests |
 | `/blocklist` | admin, reseller | numbers / keywords; admin = global |

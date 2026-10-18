@@ -105,7 +105,7 @@ export class RoutesService {
       trx
         .selectFrom('route_connections as rc')
         .innerJoin('upstream_connections as c', 'c.id', 'rc.connection_id')
-        .select(['rc.connection_id', 'c.name as connection_name', 'c.enabled as connection_enabled', 'rc.priority', 'rc.weight', 'rc.enabled'])
+        .select(['rc.connection_id', 'c.name as connection_name', 'c.enabled as connection_enabled', 'c.host', 'c.port', 'c.use_tls', 'c.system_id', 'rc.priority', 'rc.weight', 'rc.enabled'])
         .where('rc.route_id', '=', routeId)
         .orderBy('rc.priority')
         .orderBy('c.name')

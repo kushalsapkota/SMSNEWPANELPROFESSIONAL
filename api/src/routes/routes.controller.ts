@@ -3,10 +3,11 @@ import { z } from 'zod';
 import { Roles } from '../common/decorators';
 import { paginationSchema } from '../common/pagination';
 import { UuidPipe } from '../common/uuid.pipe';
-import { digitsPrefix, queryBool, senderAddress, uuid } from '../common/validation';
+import { digitsPrefix, hostOrIp, queryBool, senderAddress, uuid } from '../common/validation';
 import { ZodPipe } from '../common/zod.pipe';
-import { TEMPLATE_FALLBACKS } from '../db/types';
+import { BIND_TYPES, MULTIPART_MODES, TEMPLATE_FALLBACKS } from '../db/types';
 import { AssignmentsService } from './assignments.service';
+import { QuickConnectionInput, QuickRouteService } from './quick-route.service';
 import { RoutesService } from './routes.service';
 
 const routeBase = {
@@ -32,6 +33,68 @@ const connectionsSchema = z
       .strict(),
   )
   .max(64);
+const priority = z.number().int().min(1).max(32767);
+const weight = z.number().int().min(1).max(32767);
+const quickExisting = z
+  .object({ existing_connection_id: uuid, priority: priority.optional(), weight: weight.default(100) })
+  .strict();
+const quickSmpp = z
+  .object({
+    type: z.literal('SMPP'),
+    name: z.string().trim().min(1).max(100).optional(),
+    host: hostOrIp,
+    port: z.number({ invalid_type_error: 'port must be a number' }).int().min(1, 'port must be 1-65535').max(65535, 'port must be 1-65535'),
+    system_id: z.string().min(1, 'username (system_id) is required').max(15, 'username (system_id) is at most 15 characters (SMPP 3.4)'),
+    password: z.string().min(1, 'password is required').max(8, 'SMPP 3.4 passwords are at most 8 characters'),
+    system_type: z.string().max(12).optional(),
+    bind_type: z.enum(BIND_TYPES).default('TRX'),
+    use_tls: z.boolean().default(false),
+    max_tps: z.number().int().positive().max(1_000_000).default(50),
+    sessions: z.number().int().min(1).max(64).default(1),
+    window_size: z.number().int().min(1).max(1000).optional(),
+    enquire_link_interval_s: z.number().int().min(1).max(3600).optional(),
+    multipart_mode: z.enum(MULTIPART_MODES).optional(),
+    request_dlr: z.boolean().default(true),
+    priority: priority.optional(),
+    weight: weight.default(100),
+    cost_micros: z.number().int().nonnegative().safe().optional(),
+  })
+  .strict();
+/** Either `{existing_connection_id}` or `{type: "SMPP", ...}`; errors are reported against the matching shape. */
+const quickConnection = z.unknown().transform((v, ctx): QuickConnectionInput => {
+  const isObj = typeof v === 'object' && v !== null;
+  if (isObj && 'existing_connection_id' in v) return parseInto(quickExisting, v, ctx);
+  if (isObj && (v as { type?: unknown }).type !== 'SMPP') {
+    const t = (v as { type?: unknown }).type;
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['type'],
+      message: t === 'HTTP' ? 'HTTP API connections are not supported yet' : 'type must be "SMPP" (or pass existing_connection_id)',
+    });
+    return z.NEVER;
+  }
+  return parseInto(quickSmpp, v, ctx);
+});
+function parseInto<S extends z.ZodTypeAny>(schema: S, v: unknown, ctx: z.RefinementCtx): z.output<S> {
+  const r = schema.safeParse(v);
+  if (r.success) return r.data;
+  for (const issue of r.error.issues) ctx.addIssue({ code: z.ZodIssueCode.custom, message: issue.message, path: issue.path });
+  return z.NEVER;
+}
+const quickSchema = z
+  .object({
+    ...routeBase,
+    description: routeBase.description.optional(),
+    enabled: z.boolean().default(true),
+    template_mode: z.boolean().default(false),
+    template_fallback: routeBase.template_fallback.optional(),
+    force_sender_id: routeBase.force_sender_id.optional(),
+    template_body: z.string().min(1).max(1600).optional(),
+    default_body: z.string().min(1).max(1600).nullable().optional(),
+    connections: z.array(quickConnection).min(1, 'add at least one connection').max(10, 'at most 10 connections'),
+  })
+  .strict();
+
 const assignmentsSchema = z
   .array(
     z
@@ -48,7 +111,10 @@ const assignmentsSchema = z
 
 @Controller('api/routes')
 export class RoutesController {
-  constructor(private readonly routes: RoutesService) {}
+  constructor(
+    private readonly routes: RoutesService,
+    private readonly quick: QuickRouteService,
+  ) {}
 
   @Get()
   list(@Query(new ZodPipe(listSchema)) q: z.infer<typeof listSchema>) {
@@ -59,6 +125,19 @@ export class RoutesController {
   @Roles('SUPER_ADMIN')
   create(@Body(new ZodPipe(createSchema)) body: z.infer<typeof createSchema>) {
     return this.routes.create(body);
+  }
+
+  /** One-step route creation with inline SMPP connections (CONTRACTS-CHANGES: quick route). */
+  @Post('quick')
+  @Roles('SUPER_ADMIN')
+  createQuick(@Body(new ZodPipe(quickSchema)) body: z.infer<typeof quickSchema>) {
+    return this.quick.create(body);
+  }
+
+  @Get(':id/status')
+  @Roles('SUPER_ADMIN')
+  status(@Param('id', UuidPipe) id: string) {
+    return this.quick.status(id);
   }
 
   @Get(':id')

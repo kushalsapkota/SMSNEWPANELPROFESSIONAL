@@ -125,6 +125,11 @@ const breakdownRow = (key: string, label: string, messages: number) => ({
   cost_micros: messages * 3000,
 });
 
+const routeConn = (id: string, name: string, priority: number) => ({
+  connection_id: id, connection_name: name, connection_enabled: true, host: "10.0.0.5", port: 2775 + priority - 1, use_tls: false,
+  system_id: "acme", bind_type: "TRX", priority, weight: 100, enabled: true, sessions: [], tps_limit: 50, tps_current: 0, inflight: 0, queue_depth: 0,
+});
+
 function fixture(method: string, path: string, query: URLSearchParams): unknown {
   const page = (items: unknown[]) => ({ items, total: items.length, page: 1, page_size: 50 });
   if (path === "/api/dashboard")
@@ -157,6 +162,28 @@ function fixture(method: string, path: string, query: URLSearchParams): unknown 
   if (/^\/api\/orgs\/[^/]+\/routes$/.test(path))
     return { items: [{ id: "a1", route_id: "r1", route_name: "Premium IN", prefix: "91", rate_micros: 5000, priority: 10, enabled: true, parent_rate_micros: null }] };
   if (path === "/api/orgs") return page([{ id: "c1", name: "Child Co", role: "CLIENT" }]);
+  if (path === "/api/routes/quick" && method === "POST") return { id: "rq1", name: "Quick IN", connections: [] };
+  if (path === "/api/routes/rq1/status")
+    return {
+      route_id: "rq1",
+      route_enabled: true,
+      engine_reachable: true,
+      engine_error: null,
+      checked_at: iso(0),
+      connections: [
+        { ...routeConn("k1", "Quick IN SMPP 1", 1), state: "BOUND", sessions_bound: 1, sessions_total: 1, bound_since: iso(120_000), last_error: null },
+        { ...routeConn("k2", "Quick IN SMPP 2", 2), state: "DOWN", sessions_bound: 0, sessions_total: 1, bound_since: null, last_error: "smpp client: bind rejected: ESME_RINVPASWD" },
+      ],
+    };
+  if (path === "/api/routes/rq1")
+    return {
+      id: "rq1", name: "Quick IN", description: null, enabled: true, template_mode: false, template_fallback: "SEND_RAW", force_sender_id: null,
+      created_at: iso(0), updated_at: iso(0),
+      connections: [
+        { connection_id: "k1", connection_name: "Quick IN SMPP 1", connection_enabled: true, host: "10.0.0.5", port: 2775, use_tls: false, system_id: "acme", priority: 1, weight: 100, enabled: true },
+      ],
+    };
+  if (path === "/api/connections") return page([]);
   if (path === "/api/routes") return page([{ id: "r1", name: "Premium IN", template_mode: true, enabled: true }]);
   if (path === "/api/sender-ids")
     return page([{ id: "s1", org_id: ORG_ID, route_id: null, sender: "ACME", status: "APPROVED", reviewed_by: null, reviewed_at: null, created_at: iso(0) }]);
@@ -434,5 +461,36 @@ describe("part 2 pages render with contract data", () => {
     expect(screen.getAllByText(/\/v1\/sms\/send/).length).toBeGreaterThan(0);
     fireEvent.click(screen.getByRole("tab", { name: "PHP" }));
     expect(screen.getByText(/hash_hmac/)).toBeTruthy();
+  });
+
+  it("new route: inline SMPP connection posts /api/routes/quick and opens the route", async () => {
+    role = "SUPER_ADMIN";
+    const { NewRouteForm } = await import("@/components/routes/new-route-form");
+    wrap(<NewRouteForm />);
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Quick IN" } });
+    fireEvent.change(screen.getByLabelText("Host / IP"), { target: { value: "10.0.0.5" } });
+    fireEvent.change(screen.getByLabelText("Username (system_id)"), { target: { value: "acme" } });
+    fireEvent.change(screen.getByLabelText("Password"), { target: { value: "123456789" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create route" }));
+    expect(await screen.findByText("Max 8 characters (SMPP 3.4)")).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("Password"), { target: { value: "s3cret" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create route" }));
+    await waitFor(() => expect(router.push).toHaveBeenCalledWith("/routes/rq1"));
+    const sent = calls.find((c) => c.path === "/api/routes/quick");
+    expect(sent?.body).toMatchObject({
+      name: "Quick IN",
+      connections: [{ type: "SMPP", host: "10.0.0.5", port: 2775, system_id: "acme", password: "s3cret", bind_type: "TRX", max_tps: 50, priority: 1 }],
+    });
+    expect(unmocked()).toEqual([]);
+  });
+
+  it("route detail shows live carrier status in plain words", async () => {
+    role = "SUPER_ADMIN";
+    const { RouteDetailView } = await import("@/components/routes/route-detail");
+    wrap(<RouteDetailView id="rq1" />);
+    expect(await screen.findByText("Carrier status")).toBeTruthy();
+    expect(await screen.findByText(/Bound since/)).toBeTruthy();
+    expect(await screen.findByText("Wrong username or password")).toBeTruthy();
+    expect(screen.getByText("smpp client: bind rejected: ESME_RINVPASWD")).toBeTruthy();
   });
 });

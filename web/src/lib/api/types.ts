@@ -510,6 +510,11 @@ export interface RouteConnection {
   connection_id: Uuid;
   connection_name?: string;
   connection_enabled?: boolean;
+  /** GET /api/routes/:id adds the upstream endpoint (never the password). */
+  host?: string;
+  port?: number;
+  use_tls?: boolean;
+  system_id?: string;
   priority: number;
   weight: number;
   enabled: boolean;
@@ -542,6 +547,92 @@ export interface RouteConnectionInput {
   priority: number;
   weight: number;
   enabled: boolean;
+}
+
+/** POST /api/routes/quick: one connection row — an existing connection or a new SMPP one. */
+export interface QuickExistingConnectionInput {
+  existing_connection_id: Uuid;
+  priority?: number;
+  weight?: number;
+}
+
+export interface QuickSmppConnectionInput {
+  type: "SMPP";
+  name?: string;
+  host: string;
+  port: number;
+  system_id: string;
+  password: string;
+  system_type?: string;
+  bind_type?: BindType;
+  use_tls?: boolean;
+  max_tps?: number;
+  sessions?: number;
+  window_size?: number;
+  enquire_link_interval_s?: number;
+  multipart_mode?: MultipartMode;
+  request_dlr?: boolean;
+  priority?: number;
+  weight?: number;
+  /** Default rate (prefix '') for this connection. */
+  cost_micros?: number;
+}
+
+export type QuickConnectionInput = QuickExistingConnectionInput | QuickSmppConnectionInput;
+
+export interface QuickRouteRequest {
+  name: string;
+  description?: string | null;
+  enabled?: boolean;
+  template_mode?: boolean;
+  template_fallback?: TemplateFallback;
+  force_sender_id?: string | null;
+  /** Required when template_mode; must contain {otp}. Creates the route-wide template. */
+  template_body?: string;
+  default_body?: string | null;
+  connections: QuickConnectionInput[];
+}
+
+export interface QuickRouteResponse extends Route {
+  template: RouteTemplate | null;
+  connections: Array<RouteConnection & { created: boolean; connection: Connection }>;
+}
+
+/** UNKNOWN = engine unreachable or the connection is not loaded by the engine yet. */
+export type RouteConnectionState = ConnectionState | "UNKNOWN";
+
+export interface RouteConnectionStatus {
+  connection_id: Uuid;
+  connection_name: string;
+  connection_enabled: boolean;
+  host: string;
+  port: number;
+  use_tls: boolean;
+  system_id: string;
+  bind_type: BindType;
+  priority: number;
+  weight: number;
+  enabled: boolean;
+  state: RouteConnectionState;
+  sessions: ConnectionSessionStatus[];
+  sessions_bound: number;
+  sessions_total: number;
+  bound_since: IsoDateTime | null;
+  last_error: string | null;
+  tps_limit: number | null;
+  tps_current: number | null;
+  inflight: number | null;
+  queue_depth: number | null;
+}
+
+/** GET /api/routes/:id/status */
+export interface RouteStatusResponse {
+  route_id: Uuid;
+  route_enabled: boolean;
+  engine_reachable: boolean;
+  engine_error: string | null;
+  checked_at: IsoDateTime;
+  connections: RouteConnectionStatus[];
 }
 
 export interface RouteListParams extends PageParams {

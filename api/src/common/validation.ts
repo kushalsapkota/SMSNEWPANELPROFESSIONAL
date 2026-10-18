@@ -1,3 +1,4 @@
+import { isIP } from 'node:net';
 import { z } from 'zod';
 
 /** Reusable zod building blocks. */
@@ -64,3 +65,21 @@ export const senderAddress = z
   .min(1)
   .max(16)
   .refine((v) => /^\+?[0-9]{1,15}$/.test(v) || /^[A-Za-z0-9 ._-]{1,11}$/.test(v), 'must be numeric (≤15 digits) or alphanumeric (≤11 chars)');
+
+/** True for an IPv4/IPv6 literal (IPv6 optionally in [brackets]) or an RFC 1123 hostname. */
+export function isHostOrIp(input: string): boolean {
+  const v = input.startsWith('[') && input.endsWith(']') ? input.slice(1, -1) : input;
+  if (isIP(v) !== 0) return true;
+  if (v.length === 0 || v.length > 253) return false;
+  // All-numeric dotted strings that are not valid IPv4 (e.g. 999.1.1.1) are typos, not hostnames.
+  if (/^[0-9.]+$/.test(v)) return false;
+  const name = v.endsWith('.') ? v.slice(0, -1) : v;
+  return name.split('.').every((l) => /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(l));
+}
+
+export const hostOrIp = z
+  .string()
+  .trim()
+  .min(1, 'host is required')
+  .max(253)
+  .refine(isHostOrIp, 'must be a hostname (e.g. smsc.example.net) or an IP address (e.g. 10.0.0.5)');

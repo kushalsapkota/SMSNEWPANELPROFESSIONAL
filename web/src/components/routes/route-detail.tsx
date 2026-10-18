@@ -13,6 +13,7 @@ import { BoolBadge } from "@/components/shared/status-badge";
 import { useApiMutation } from "@/hooks/use-api-mutation";
 import { api, qk } from "@/lib/api";
 import type { UpdateRouteRequest } from "@/lib/api/types";
+import { CarrierStatusCard } from "./carrier-status-card";
 import { RouteConnectionsEditor } from "./route-connections-editor";
 import { RouteForm } from "./route-form";
 
@@ -83,7 +84,8 @@ export function RouteDetailView({ id }: { id: string }) {
             <RouteForm route={r} pending={save.isPending} onSubmit={(b) => save.mutate(b)} submitLabel="Save route" />
           </CardContent>
         </Card>
-        <div className="min-w-0 xl:col-span-3">
+        <div className="min-w-0 space-y-6 xl:col-span-3">
+          <CarrierStatusCard routeId={r.id} />
           <RouteConnectionsEditor route={r} />
         </div>
       </div>

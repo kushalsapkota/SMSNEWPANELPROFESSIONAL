@@ -595,3 +595,40 @@ operators know them.
 14. **SMPP account passwords: not changed here.** The api still allows 1-character SMPP passwords
     (`smpp-accounts.controller.ts` `min(1)`; its tests rely on short ones). The engine-side limits in
     #12 bound guessing, but a minimum length (6–8) should be set by the api owner.
+
+## quick route (api/src/routes/quick-route.service.ts, web /routes/new + route "Carrier status")
+
+All items are backward compatible additions to §10 (admin only).
+
+1. **`POST /api/routes/quick`** (SUPER_ADMIN) creates a route and its upstream connections in one
+   request transaction. Body (strict):
+   `{name, description?, enabled?=true, template_mode?=false, template_fallback?, force_sender_id?,
+   template_body? (required when template_mode, must contain {otp}), default_body? (required when
+   template_mode and template_fallback=SEND_DEFAULT_TEMPLATE), connections: [1..10]}`. Each
+   connection is either `{existing_connection_id, priority?=1, weight?=100}` or
+   `{type:"SMPP", name?="<route name> SMPP <n>", host (hostname or IP literal), port 1-65535,
+   system_id ≤15, password ≤8, system_type?, bind_type?="TRX", use_tls?=false, max_tps?=50,
+   sessions?=1, window_size?, enquire_link_interval_s?, multipart_mode?, request_dlr?=true,
+   priority?=n, weight?=100, cost_micros?}` (`n` = 1-based row position; `cost_micros` inserts an
+   `upstream_rates` row with prefix `''`). `type:"HTTP"` → 400 "not supported yet".
+   Writes `upstream_connections` (password `v1:` encrypted), `upstream_rates`, `routes`,
+   `route_connections` and, with `template_body`, one active route-wide `route_templates` row
+   (name `"<route name> default"`, default patterns). Audit: `connection.create`,
+   `connection.rates_replace`, `route.create`, `route.connections_replace`, `template.create`
+   (no credentials). After commit it publishes `cfg:invalidate` for `upstream_connections` (id),
+   `upstream_rates` (null), `routes` (id), `route_connections` (null), `route_templates` (id). No
+   synchronous `config/reload` (connections are eventually consistent, integration #5).
+   Errors: 400 with `details.issues[].path` like `connections.0.password`; 409 CONFLICT with
+   `details.field` (`name` for a taken route name, `connections.<i>.name` / `connections.<i>.host`
+   for a taken connection name / host+port+system_id). Any failure rolls back every row.
+   201 → the route row + `template` (row or null) + `connections: [{connection_id, connection_name,
+   connection_enabled, priority, weight, enabled, created, connection: <connection DTO, has_password,
+   never the password>}]`.
+2. **`GET /api/routes/:id/status`** (SUPER_ADMIN) → `{route_id, route_enabled, engine_reachable,
+   engine_error, checked_at, connections: [{connection_id, connection_name, connection_enabled, host,
+   port, use_tls, system_id, bind_type, priority, weight, enabled, state, sessions, sessions_bound,
+   sessions_total, bound_since (earliest bound session), last_error (first unbound session's error,
+   else any), tps_limit, tps_current, inflight, queue_depth}]}`, merged from engine
+   `GET /internal/v1/connections/status`. `state` adds `UNKNOWN` (engine unreachable → still 200 with
+   `engine_reachable:false`, or the engine has not loaded the connection yet). 404 for unknown route.
+3. **`GET /api/routes/:id`** connection items add `host`, `port`, `use_tls`, `system_id`.

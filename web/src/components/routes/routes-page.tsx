@@ -4,28 +4,17 @@ import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { Plus } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog";
 import { DataTable, ResetFiltersButton, SearchFilter, type Column } from "@/components/data-table";
 import { Money } from "@/components/shared/money";
 import { PageHeader } from "@/components/shared/page-header";
 import { BoolBadge, humanize } from "@/components/shared/status-badge";
-import { useApiMutation } from "@/hooks/use-api-mutation";
 import { useTableState } from "@/hooks/use-table-state";
 import { api, qk } from "@/lib/api";
-import type { CreateRouteRequest, Route, RouteAssignment } from "@/lib/api/types";
+import type { Route, RouteAssignment } from "@/lib/api/types";
 import { useSession } from "@/lib/auth/session";
 import { formatDate, formatNumber } from "@/lib/format";
-import { RouteForm } from "./route-form";
 
 function AdminRoutes() {
   const router = useRouter();
@@ -34,16 +23,6 @@ function AdminRoutes() {
     queryKey: qk.routes.list(t.params),
     queryFn: () => api.routes.list(t.params),
     placeholderData: keepPreviousData,
-  });
-  const [open, setOpen] = useState(false);
-  const create = useApiMutation({
-    mutationFn: (body: CreateRouteRequest) => api.routes.create(body),
-    success: (r) => `Route “${r.name}” created`,
-    invalidate: [qk.routes.all, qk.dashboard],
-    onSuccess: (r) => {
-      setOpen(false);
-      router.push(`/routes/${r.id}`);
-    },
   });
 
   const columns: Column<Route>[] = [
@@ -107,22 +86,13 @@ function AdminRoutes() {
     <>
       <PageHeader
         title="Routes"
-        description="Named routing products mapped to upstream connections. Assign them to resellers with a rate."
+        description="Named routing products sent through your carriers (SMPP connections). Assign them to resellers with a rate."
         actions={
-          <Dialog open={open} onOpenChange={setOpen}>
-            <DialogTrigger asChild>
-              <Button>
-                <Plus /> New route
-              </Button>
-            </DialogTrigger>
-            <DialogContent className="max-h-[92vh] overflow-y-auto sm:max-w-2xl">
-              <DialogHeader>
-                <DialogTitle>New route</DialogTitle>
-                <DialogDescription>Map connections after creating the route.</DialogDescription>
-              </DialogHeader>
-              <RouteForm pending={create.isPending} onSubmit={(b) => create.mutate(b)} submitLabel="Create route" />
-            </DialogContent>
-          </Dialog>
+          <Button asChild>
+            <Link href="/routes/new">
+              <Plus /> New route
+            </Link>
+          </Button>
         }
       />
       <DataTable

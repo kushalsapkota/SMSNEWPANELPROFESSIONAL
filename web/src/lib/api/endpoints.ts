@@ -105,7 +105,12 @@ export const routes = {
   listAssigned: (params: T.RouteListParams = {}) =>
     http.get<T.Paginated<T.AssignedRoute>>("/api/routes", { query: params }),
   create: (body: T.CreateRouteRequest) => http.post<T.Route>("/api/routes", body),
+  /** One step: route + new SMPP connections / existing ones + optional template. */
+  createQuick: (body: T.QuickRouteRequest) => http.post<T.QuickRouteResponse>("/api/routes/quick", body),
   get: (id: T.Uuid) => http.get<T.RouteDetail>(`/api/routes/${e(id)}`),
+  /** Live engine state of each connection of the route. */
+  status: (id: T.Uuid, signal?: AbortSignal) =>
+    http.get<T.RouteStatusResponse>(`/api/routes/${e(id)}/status`, { signal }),
   update: (id: T.Uuid, body: T.UpdateRouteRequest) =>
     http.patch<T.Route>(`/api/routes/${e(id)}`, body),
   remove: (id: T.Uuid) => http.delete<T.Ack>(`/api/routes/${e(id)}`),

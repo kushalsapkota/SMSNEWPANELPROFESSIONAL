@@ -28,6 +28,7 @@ export const qk = {
     list: (params: object) => ["routes", "list", params] as const,
     assigned: (params: object) => ["routes", "assigned", params] as const,
     detail: (id: string) => ["routes", "detail", id] as const,
+    status: (id: string) => ["routes", "status", id] as const,
   },
   templates: {
     all: ["templates"] as const,

@@ -74,3 +74,33 @@ export const optionalText = z
   .nullable();
 
 export const positiveIntOrNull = z.number().int().positive("Must be > 0").nullable();
+
+function isIpv4(v: string): boolean {
+  const parts = v.split(".");
+  return parts.length === 4 && parts.every((p) => /^(0|[1-9][0-9]{0,2})$/.test(p) && Number(p) <= 255);
+}
+
+function isIpv6(v: string): boolean {
+  if (!v.includes(":") || !/^[0-9A-Fa-f:.]+$/.test(v)) return false;
+  try {
+    new URL(`http://[${v}]/`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Hostname (RFC 1123) or IPv4 / IPv6 address (optionally [bracketed]); same rule as the api. */
+export function isHostOrIp(input: string): boolean {
+  const v = input.startsWith("[") && input.endsWith("]") ? input.slice(1, -1) : input;
+  if (isIpv4(v) || isIpv6(v)) return true;
+  if (v.length === 0 || v.length > 253 || /^[0-9.]+$/.test(v)) return false;
+  const name = v.endsWith(".") ? v.slice(0, -1) : v;
+  return name.split(".").every((l) => /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(l));
+}
+
+export const hostSchema = z
+  .string()
+  .trim()
+  .min(1, "Required")
+  .refine(isHostOrIp, "Enter a host name (smsc.example.net) or an IP address");
