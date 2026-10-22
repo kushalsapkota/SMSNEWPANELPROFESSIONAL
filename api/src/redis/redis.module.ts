@@ -28,6 +28,7 @@ export type InvalidationEntity =
   | 'route_templates'
   | 'org_route_assignments'
   | 'sender_ids'
+  | 'approved_content'
   | 'smpp_accounts'
   | 'ip_whitelists'
   | 'webhooks'

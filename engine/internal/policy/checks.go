@@ -27,6 +27,31 @@ func CheckOrg(org *store.Org, channel string) error {
 	return nil
 }
 
+// CheckSwitches applies the global operator kill switches (service_switches)
+// for a submission on channel. The master switch off → SENDING_DISABLED; the
+// channel's own switch off → CHANNEL_DISABLED; a bulk/batch submission with
+// bulk sending off → SENDING_DISABLED. These are administrator-initiated
+// stops, distinct from per-account suspension.
+func CheckSwitches(sw store.Switches, channel string, bulk bool) error {
+	if !sw.AllEnabled {
+		return New(CodeSendingDisabled, "sending is temporarily disabled by the administrator")
+	}
+	switch channel {
+	case store.ChannelHTTP:
+		if !sw.HTTPAPIEnabled {
+			return New(CodeChannelDisabled, "the HTTP API is temporarily disabled by the administrator")
+		}
+	case store.ChannelSMPP:
+		if !sw.SMPPEnabled {
+			return New(CodeChannelDisabled, "SMPP is temporarily disabled by the administrator")
+		}
+	}
+	if bulk && !sw.BulkEnabled {
+		return New(CodeSendingDisabled, "bulk sending is temporarily disabled by the administrator")
+	}
+	return nil
+}
+
 // CheckBind is CheckOrg for an SMPP bind, adding the account checks:
 // unknown / disabled account → NOT_FOUND / CHANNEL_DISABLED, bind type not
 // allowed → FORBIDDEN, IP not whitelisted (scope SMPP) → IP_NOT_ALLOWED.
@@ -34,6 +59,9 @@ func CheckOrg(org *store.Org, channel string) error {
 func CheckBind(snap *store.Snapshot, acct *store.SMPPAccount, bindType string, ip netip.Addr) error {
 	if acct == nil {
 		return New(CodeNotFound, "unknown system_id")
+	}
+	if err := CheckSwitches(snap.Switches(), store.ChannelSMPP, false); err != nil {
+		return err
 	}
 	if err := CheckOrg(snap.Org(acct.OrgID), store.ChannelSMPP); err != nil {
 		return err
@@ -82,6 +110,20 @@ func CheckDestination(snap *store.Snapshot, orgID, msisdn string) error {
 func CheckContent(snap *store.Snapshot, orgID, text string) error {
 	if k := snap.ContentBlocked(orgID, text); k != nil {
 		return New(CodeContentBlocked, "message content is blocked")
+	}
+	return nil
+}
+
+// CheckApprovedContent enforces per-client content pre-approval: when the org
+// has content_approval_required set, text must match an APPROVED
+// approved_content entry (normalized), else CONTENT_NOT_APPROVED. Orgs
+// without the flag are unaffected.
+func CheckApprovedContent(snap *store.Snapshot, org *store.Org, text string) error {
+	if org == nil || !org.ContentApprovalRequired {
+		return nil
+	}
+	if !snap.ContentApproved(org.ID, text) {
+		return New(CodeContentNotApproved, "message content is not approved for this account")
 	}
 	return nil
 }

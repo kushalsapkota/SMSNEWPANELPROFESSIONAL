@@ -238,6 +238,70 @@ export class AnalyticsService {
     });
   }
 
+  /**
+   * Per-client billing/usage for a date range: one row per sending org (client), with volume and
+   * the amount that client was charged (client_cost_micros — the client's price, i.e. the reseller's
+   * revenue from it). Scope follows the caller: admin → every client across all resellers; reseller
+   * → its own clients; client → itself. `org_id` narrows an admin/reseller to one reseller's clients.
+   */
+  async clients(q: StatsQuery) {
+    const f = await resolveOrgFilter(this.scope, q.org_id);
+    return this.db.tenant(async (trx) => {
+      const conds = sql.join(this.conds(f, q), sql` and `);
+      const rows = (
+        await sql<{ key: string; messages: number; parts: number; delivered: number; failed: number; charged: number }>`
+          select s.org_id::text as key, sum(s.messages)::bigint as messages, sum(s.parts)::bigint as parts,
+                 sum(s.delivered)::bigint as delivered, ${FAILED_SUM} as failed,
+                 coalesce(sum(s.client_cost_micros), 0)::bigint as charged
+            from message_stats_hourly s where ${conds}
+           group by 1 order by charged desc, messages desc limit 1000`.execute(trx)
+      ).rows;
+
+      const ids = rows.map((r) => r.key).filter((k) => /^[0-9a-f-]{36}$/i.test(k));
+      const meta = new Map<string, { name: string; role: string; status: string; reseller: string | null; currency: string }>();
+      if (ids.length > 0) {
+        const orgs = await trx
+          .selectFrom('organizations as o')
+          .leftJoin('organizations as p', 'p.id', 'o.parent_id')
+          .leftJoin('accounts_balance as b', 'b.org_id', 'o.id')
+          .select(['o.id', 'o.name', 'o.role', 'o.status', 'p.name as reseller_name', 'b.currency'])
+          .where('o.id', 'in', ids)
+          .execute();
+        for (const o of orgs) meta.set(o.id, { name: o.name, role: o.role, status: o.status, reseller: o.reseller_name ?? null, currency: o.currency ?? 'USD' });
+      }
+
+      const result = rows.map((r) => {
+        const o = meta.get(r.key);
+        return {
+          org_id: r.key,
+          name: o?.name ?? r.key.slice(0, 8),
+          role: o?.role ?? null,
+          status: o?.status ?? null,
+          reseller_name: o?.reseller ?? null,
+          currency: o?.currency ?? 'USD',
+          messages: r.messages,
+          parts: r.parts,
+          delivered: r.delivered,
+          failed: r.failed,
+          delivery_rate: rate(r.delivered, r.messages),
+          charged_micros: r.charged,
+        };
+      });
+      const totals = result.reduce(
+        (a, r) => ({
+          clients: a.clients + 1,
+          messages: a.messages + r.messages,
+          parts: a.parts + r.parts,
+          delivered: a.delivered + r.delivered,
+          failed: a.failed + r.failed,
+          charged_micros: a.charged_micros + r.charged_micros,
+        }),
+        { clients: 0, messages: 0, parts: 0, delivered: 0, failed: 0, charged_micros: 0 },
+      );
+      return { rows: result, totals, currency: result[0]?.currency ?? 'USD', from: q.from, to: q.to };
+    });
+  }
+
   /** CONTRACTS §10 /api/analytics/live (admin): engine connection status + submit-rate from engine metrics. */
   async live() {
     const conns = await this.engine.connectionsStatus();

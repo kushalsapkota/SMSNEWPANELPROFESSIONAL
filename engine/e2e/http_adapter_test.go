@@ -114,7 +114,7 @@ func TestHTTPAdapterConnections(t *testing.T) {
 			DLRMode string `json:"dlr_mode"`
 		} `json:"adapters"`
 	}
-	if st, err := call("GET", "/internal/v1/adapters", nil, &cat); err != nil || st != 200 || len(cat.Adapters) != 10 {
+	if st, err := call("GET", "/internal/v1/adapters", nil, &cat); err != nil || st != 200 || len(cat.Adapters) != 11 {
 		t.Fatalf("catalogue %d %v %+v", st, err, cat)
 	}
 

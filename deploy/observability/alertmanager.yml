@@ -1,0 +1,36 @@
+route:
+  receiver: default
+  group_by: ["alertname"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 3h
+  routes:
+    - matchers: [severity="critical"]
+      receiver: default
+      repeat_interval: 1h
+
+receivers:
+  - name: default
+    # Replace with real notifications. Examples (fill in and uncomment one):
+    #
+    # email_configs:
+    #   - to: ops@example.com
+    #     from: alerts@example.com
+    #     smarthost: smtp.example.com:587
+    #     auth_username: alerts@example.com
+    #     auth_password: "<smtp-password>"
+    #
+    # slack_configs:
+    #   - api_url: "<slack-webhook-url>"
+    #     channel: "#sms-alerts"
+    #
+    # webhook_configs:
+    #   - url: "https://example.com/hooks/alerts"
+    webhook_configs:
+      - url: "http://127.0.0.1:5001/noop"
+        send_resolved: true
+
+inhibit_rules:
+  - source_matchers: [severity="critical"]
+    target_matchers: [severity="warning"]
+    equal: ["alertname"]

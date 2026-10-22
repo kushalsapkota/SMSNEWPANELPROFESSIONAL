@@ -338,7 +338,10 @@ func TestDeliverRoundRobin(t *testing.T) {
 	for _, c := range []*client.Client{c0, c1, c2} {
 		waitBound(t, c)
 	}
-	waitFor(t, "receiver ready", func() bool { return f.srv.HasReceiver("alice") })
+	// Both receiving sessions (c0 RX, c1 TRX) must be in the rotation before the
+	// first deliver, or the round-robin starts one session short and skews the
+	// 5/5 split. HasReceiver is true as soon as one is ready, so count them.
+	waitFor(t, "both receivers ready", func() bool { return f.srv.ReceiverCountFor("", "alice") == 2 })
 	r := pdu.Receipt{ID: "msg-1", Sub: 1, Dlvrd: 1, Stat: "DELIVRD", Err: "000", Text: "hello"}
 	d := &pdu.DeliverSM{SourceAddr: "919876543210", DestinationAddr: "MYBANK", ESMClass: pdu.ESMClassMCDeliveryRcpt, ShortMessage: []byte(r.Format())}
 	d.TLVs.SetReceiptedMessageID("msg-1")

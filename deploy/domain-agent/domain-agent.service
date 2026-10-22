@@ -1,0 +1,21 @@
+[Unit]
+Description=SMS gateway domain-agent (nginx + certbot vhost manager)
+After=network-online.target nginx.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Token (and any overrides) live here, mode 0600. See install.sh.
+EnvironmentFile=/etc/domain-agent/env
+ExecStart=/usr/bin/python3 -u /usr/local/lib/domain-agent/agent.py
+Restart=on-failure
+RestartSec=2
+User=root
+UMask=0022
+# state.json lives in /var/lib/domain-agent (matches DOMAIN_AGENT_STATE default)
+StateDirectory=domain-agent
+StateDirectoryMode=0750
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -31,6 +31,7 @@ type Snapshot struct {
 	assignments map[string][]*Assignment // org -> sorted
 	templates   map[string]map[string]*Template
 	senders     map[string][]*SenderID
+	approved    map[string]map[string]struct{} // org -> set of normalized APPROVED content
 	smppBySys   map[string]*SMPPAccount
 	smppByOrg   map[string][]*SMPPAccount
 	ipRules     map[string][]*IPRule
@@ -38,6 +39,7 @@ type Snapshot struct {
 	blockedNums map[string]map[string]struct{} // scope org ("" global) -> prefixes
 	keywords    map[string][]*BlockedKeyword   // scope org ("" global) -> compiled
 	maxBlockLen int
+	switches    *Switches // nil = DefaultSwitches (all on)
 
 	data Data
 }
@@ -56,6 +58,7 @@ func NewSnapshot(d Data) *Snapshot {
 		assignments: make(map[string][]*Assignment),
 		templates:   make(map[string]map[string]*Template),
 		senders:     make(map[string][]*SenderID),
+		approved:    make(map[string]map[string]struct{}),
 		smppBySys:   make(map[string]*SMPPAccount, len(d.SMPPAccounts)),
 		smppByOrg:   make(map[string][]*SMPPAccount),
 		ipRules:     make(map[string][]*IPRule),
@@ -162,6 +165,17 @@ func NewSnapshot(d Data) *Snapshot {
 	for _, sid := range d.SenderIDs {
 		s.senders[sid.OrgID] = append(s.senders[sid.OrgID], sid)
 	}
+	for _, a := range d.ApprovedContent {
+		if a.Status != "APPROVED" {
+			continue
+		}
+		set := s.approved[a.OrgID]
+		if set == nil {
+			set = make(map[string]struct{})
+			s.approved[a.OrgID] = set
+		}
+		set[normalizeContent(a.Content)] = struct{}{}
+	}
 	for _, a := range d.SMPPAccounts {
 		s.smppBySys[a.SystemID] = a
 		s.smppByOrg[a.OrgID] = append(s.smppByOrg[a.OrgID], a)
@@ -197,6 +211,7 @@ func NewSnapshot(d Data) *Snapshot {
 		}
 		s.keywords[k.OrgID] = append(s.keywords[k.OrgID], k)
 	}
+	s.switches = d.Switches
 	s.data = d
 	return s
 }
@@ -216,6 +231,15 @@ func assignmentLess(a, b *Assignment) bool {
 
 // Data returns the raw data the snapshot was built from (read-only).
 func (s *Snapshot) Data() *Data { return &s.data }
+
+// Switches returns the global operator kill switches, or DefaultSwitches
+// (all on) when no service_switches row was loaded (fail open).
+func (s *Snapshot) Switches() Switches {
+	if s.switches == nil {
+		return DefaultSwitches()
+	}
+	return *s.switches
+}
 
 // Org returns the org or nil.
 func (s *Snapshot) Org(id string) *Org { return s.orgs[id] }
@@ -363,6 +387,26 @@ func (s *Snapshot) SenderAllowed(orgID, routeID, source string) (allowed, restri
 		}
 	}
 	return false, true
+}
+
+// ContentApproved reports whether text matches an APPROVED approved_content
+// entry for org (normalized: lower-case, trimmed, whitespace collapsed). The
+// caller checks Org.ContentApprovalRequired first; an org with the flag on
+// and no approved entries can send nothing.
+func (s *Snapshot) ContentApproved(orgID, text string) bool {
+	set := s.approved[orgID]
+	if len(set) == 0 {
+		return false
+	}
+	_, ok := set[normalizeContent(text)]
+	return ok
+}
+
+// normalizeContent canonicalizes message text for approval matching:
+// lower-case, trimmed, and every run of whitespace collapsed to one space,
+// so differences in case or spacing still match an approved entry.
+func normalizeContent(s string) string {
+	return strings.ToLower(strings.Join(strings.Fields(s), " "))
 }
 
 func normalizeSender(s string) string {

@@ -44,6 +44,12 @@ export class AnalyticsController {
     return this.analytics.breakdown({ ...range(q), by: q.by });
   }
 
+  /** Per-client billing/usage table (volume + amount charged) over a date range. */
+  @Get('clients')
+  clients(@Query(new ZodPipe(base)) q: z.infer<typeof base>) {
+    return this.analytics.clients(range(q));
+  }
+
   /** Engine calls only (no DB): no request transaction. */
   @Get('live')
   @Roles('SUPER_ADMIN')

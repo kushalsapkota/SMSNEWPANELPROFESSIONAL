@@ -30,6 +30,8 @@ export const orgs = {
   list: (params: T.OrgListParams = {}) =>
     http.get<T.Paginated<T.OrgListItem>>("/api/orgs", { query: params }),
   create: (body: T.CreateOrgRequest) => http.post<T.CreateOrgResponse>("/api/orgs", body),
+  /** Admin only: provision up to 200 CLIENT orgs (login + SMPP account) under chosen resellers. */
+  bulkCreate: (body: T.BulkCreateRequest) => http.post<T.BulkCreateResponse>("/api/orgs/bulk", body),
   get: (id: T.Uuid) => http.get<T.OrgDetail>(`/api/orgs/${e(id)}`),
   update: (id: T.Uuid, body: T.UpdateOrgRequest) => http.patch<T.Org>(`/api/orgs/${e(id)}`, body),
   suspend: (id: T.Uuid, body: T.SuspendOrgRequest) =>
@@ -37,6 +39,12 @@ export const orgs = {
   activate: (id: T.Uuid) => http.post<T.Org>(`/api/orgs/${e(id)}/activate`),
   updateChannels: (id: T.Uuid, body: T.UpdateChannelsRequest) =>
     http.patch<T.Org>(`/api/orgs/${e(id)}/channels`, body),
+  /** Admin only: turn per-client content pre-approval on/off. */
+  setContentApproval: (id: T.Uuid, required: boolean) =>
+    http.patch<T.Org>(`/api/orgs/${e(id)}/content-approval`, { required }),
+  /** No `purge` → reversible close (returns the org); `purge:true` → permanent delete. */
+  remove: (id: T.Uuid, opts: T.DeleteOrgParams = {}) =>
+    http.delete<T.Org | T.DeleteResult>(`/api/orgs/${e(id)}`, { query: opts }),
 
   users: (id: T.Uuid, params: T.PageParams = {}) =>
     http.get<T.Paginated<T.User>>(`/api/orgs/${e(id)}/users`, { query: params }),
@@ -46,6 +54,8 @@ export const orgs = {
     http.post<T.Ack>(`/api/orgs/${e(id)}/users/${e(uid)}/reset-password`, body),
   updateUser: (id: T.Uuid, uid: T.Uuid, body: T.UpdateUserRequest) =>
     http.patch<T.User>(`/api/orgs/${e(id)}/users/${e(uid)}`, body),
+  deleteUser: (id: T.Uuid, uid: T.Uuid) =>
+    http.delete<T.DeleteResult>(`/api/orgs/${e(id)}/users/${e(uid)}`),
 
   balance: (id: T.Uuid) => http.get<T.OrgBalance>(`/api/orgs/${e(id)}/balance`),
   topup: (id: T.Uuid, body: T.TopupRequest) =>
@@ -131,6 +141,7 @@ export const routes = {
 export const monitor = {
   connections: () => http.get<T.ConnectionsStatusResponse>("/api/monitor/connections"),
   smppSessions: () => http.get<T.SmppSessionsResponse>("/api/monitor/smpp-sessions"),
+  smppEvents: () => http.get<T.SmppEventsResponse>("/api/monitor/smpp-events"),
 };
 
 export const templates = {
@@ -173,6 +184,8 @@ export const smppAccounts = {
   remove: (id: T.Uuid) => http.delete<T.Ack>(`/api/smpp-accounts/${e(id)}`),
   setPassword: (id: T.Uuid, body: T.SmppPasswordRequest) =>
     http.post<T.Ack>(`/api/smpp-accounts/${e(id)}/password`, body),
+  credentials: (id: T.Uuid) =>
+    http.get<T.SmppAccountCredentials>(`/api/smpp-accounts/${e(id)}/credentials`),
 };
 
 export const ipWhitelist = {
@@ -240,6 +253,8 @@ export const analytics = {
     http.get<T.AnalyticsTimeseries>("/api/analytics/timeseries", { query: params }),
   breakdown: (params: T.BreakdownParams) =>
     http.get<T.AnalyticsBreakdown>("/api/analytics/breakdown", { query: params }),
+  clients: (params: T.AnalyticsParams = {}) =>
+    http.get<T.BillingClientsResponse>("/api/analytics/clients", { query: params }),
   live: () => http.get<T.AnalyticsLive>("/api/analytics/live"),
 };
 
@@ -276,4 +291,33 @@ export const auditLogs = {
 
 export const dashboard = {
   get: () => http.get<T.DashboardResponse>("/api/dashboard"),
+};
+
+export const firewall = {
+  status: () => http.get<T.FirewallStatus>("/api/firewall"),
+  apply: (body: T.FirewallState) => http.put<T.FirewallStatus>("/api/firewall", body),
+  commit: () => http.post<T.FirewallStatus>("/api/firewall/commit"),
+  revert: () => http.post<T.FirewallStatus>("/api/firewall/revert"),
+};
+
+export const domains = {
+  status: () => http.get<T.DomainsStatus>("/api/domains"),
+  add: (body: T.AddDomainRequest) => http.post<{ ok: true; domain: string; role: T.DomainRole }>("/api/domains", body),
+  remove: (domain: string) =>
+    http.delete<{ ok: true; domain: string }>(`/api/domains/${encodeURIComponent(domain)}`),
+};
+
+export const switches = {
+  status: () => http.get<T.ServiceSwitches>("/api/switches"),
+  update: (body: T.ServiceSwitchesUpdate) => http.put<T.ServiceSwitches>("/api/switches", body),
+};
+
+export const approvedContent = {
+  list: (params: T.ApprovedContentListParams = {}) =>
+    http.get<T.Paginated<T.ApprovedContent>>("/api/approved-content", { query: params }),
+  create: (body: T.CreateApprovedContentRequest, scope: { org_id?: T.Uuid } = {}) =>
+    http.post<T.ApprovedContent>("/api/approved-content", body, { query: scope }),
+  remove: (id: T.Uuid) => http.delete<T.Ack>(`/api/approved-content/${e(id)}`),
+  approve: (id: T.Uuid) => http.post<T.ApprovedContent>(`/api/approved-content/${e(id)}/approve`),
+  reject: (id: T.Uuid) => http.post<T.ApprovedContent>(`/api/approved-content/${e(id)}/reject`),
 };

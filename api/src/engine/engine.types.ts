@@ -95,6 +95,18 @@ export interface EngineSmppSession {
   submitted_total: number;
 }
 
+export interface EngineBindEvent {
+  time: string;
+  type: 'bound' | 'rejected' | 'unbound';
+  system_id: string;
+  org_id: string;
+  remote_addr: string;
+  bind_type: string;
+  status: string;
+  reason: string;
+  session_id: string;
+}
+
 export interface EngineCreditResponse {
   status: 'OK' | 'DUPLICATE' | 'NOT_LOADED';
   balance_micros: number | null;

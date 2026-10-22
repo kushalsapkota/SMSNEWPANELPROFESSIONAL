@@ -3,6 +3,7 @@
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
+import { useState } from "react";
 import {
   DataTable,
   ResetFiltersButton,
@@ -12,6 +13,9 @@ import {
 } from "@/components/data-table";
 import { Money } from "@/components/shared/money";
 import { StatusBadge } from "@/components/shared/status-badge";
+import { ConfirmDialog } from "@/components/shared/confirm-dialog";
+import { Switch } from "@/components/ui/switch";
+import { useApiMutation } from "@/hooks/use-api-mutation";
 import { useTableState } from "@/hooks/use-table-state";
 import { api, qk } from "@/lib/api";
 import type { OrgListItem, OrgStatus } from "@/lib/api/types";
@@ -55,6 +59,14 @@ export function OrgsTable({
     placeholderData: keepPreviousData,
   });
 
+  // One-click SMPP start/stop per row. Turning off drops live binds, so it confirms first.
+  const [smppOff, setSmppOff] = useState<OrgListItem | null>(null);
+  const smpp = useApiMutation({
+    mutationFn: (v: { org: OrgListItem; on: boolean }) => api.orgs.updateChannels(v.org.id, { smpp_enabled: v.on }),
+    success: (_d, v) => `SMPP ${v.on ? "enabled" : "disabled"} for ${v.org.name}`,
+    invalidate: [qk.orgs.all],
+  });
+
   const columns: Column<OrgListItem>[] = [
     {
       id: "name",
@@ -80,6 +92,22 @@ export function OrgsTable({
     },
     { id: "status", header: "Status", cell: (o) => <StatusBadge status={o.status} /> },
     { id: "channels", header: "Channels", hideOnMobile: true, cell: (o) => <ChannelIcons org={o} /> },
+    {
+      id: "smpp",
+      header: "SMPP",
+      align: "center",
+      cell: (o) => (
+        // eslint-disable-next-line jsx-a11y/no-static-element-interactions, jsx-a11y/click-events-have-key-events
+        <div className="flex justify-center" onClick={(e) => e.stopPropagation()}>
+          <Switch
+            checked={o.smpp_enabled}
+            disabled={smpp.isPending}
+            aria-label={`SMPP for ${o.name}`}
+            onCheckedChange={(v) => (v ? smpp.mutate({ org: o, on: true }) : setSmppOff(o))}
+          />
+        </div>
+      ),
+    },
     {
       id: "max_tps",
       header: "TPS",
@@ -118,6 +146,7 @@ export function OrgsTable({
   ];
 
   return (
+    <>
     <DataTable
       caption={k.plural}
       columns={columns}
@@ -152,5 +181,16 @@ export function OrgsTable({
         </>
       }
     />
+    <ConfirmDialog
+      open={!!smppOff}
+      onOpenChange={(o) => !o && setSmppOff(null)}
+      title={`Turn off SMPP for ${smppOff?.name ?? ""}?`}
+      description="Active SMPP sessions will be disconnected immediately and new binds refused until you turn it back on."
+      confirmLabel="Turn off SMPP"
+      onConfirm={async () => {
+        if (smppOff) await smpp.mutateAsync({ org: smppOff, on: false });
+      }}
+    />
+    </>
   );
 }

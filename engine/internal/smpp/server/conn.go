@@ -126,17 +126,27 @@ func (c *conn) handleBind(p *pdu.Bind) {
 	}()
 
 	ctx, cancel := context.WithTimeout(c.srv.ctx, c.srv.cfg.AuthTimeout)
-	ident, st := c.srv.cfg.Authenticator.Authenticate(ctx, &BindRequest{
+	br := &BindRequest{
 		BindType: p.BindType, SystemID: p.SystemID, Password: p.Password, SystemType: p.SystemType,
 		InterfaceVersion: p.InterfaceVersion, AddrTON: p.AddrTON, AddrNPI: p.AddrNPI,
 		AddressRange: p.AddressRange, RemoteAddr: c.remote,
-	})
+	}
+	ident, st := c.srv.cfg.Authenticator.Authenticate(ctx, br)
 	cancel()
 	if st == pdu.ESME_ROK && ident == nil {
 		st = pdu.ESME_RBINDFAIL
 	}
 	if st != pdu.ESME_ROK {
+		reason := br.Reason
+		if reason == "" {
+			reason = statusReason(st)
+		}
+		orgID := ""
+		if ident != nil {
+			orgID = ident.OrgID
+		}
 		c.srv.log.Info("smpp server: bind rejected", "system_id", p.SystemID, "remote", c.remote.String(), "status", st.String())
+		c.recordBindEvent("rejected", p.SystemID, orgID, p.BindType.String(), st.String(), reason, "")
 		fail(st)
 		return
 	}
@@ -145,11 +155,13 @@ func (c *conn) handleBind(p *pdu.Bind) {
 		id.SystemID = p.SystemID
 	}
 	if !id.allows(p.BindType) {
+		c.recordBindEvent("rejected", id.SystemID, id.OrgID, p.BindType.String(), pdu.ESME_RBINDFAIL.String(), "bind type not allowed", "")
 		fail(pdu.ESME_RBINDFAIL)
 		return
 	}
 	if !c.srv.reserve(c, &id, p.BindType) {
 		c.srv.log.Info("smpp server: bind rejected, max_binds reached", "system_id", id.SystemID, "max_binds", id.MaxBinds)
+		c.recordBindEvent("rejected", id.SystemID, id.OrgID, p.BindType.String(), pdu.ESME_RBINDFAIL.String(), "max_binds reached", "")
 		fail(pdu.ESME_RBINDFAIL)
 		return
 	}
@@ -164,11 +176,20 @@ func (c *conn) handleBind(p *pdu.Bind) {
 	c.respond(resp)
 	c.ready.Store(true)
 	c.srv.log.Info("smpp server: bound", "session", c.id, "system_id", id.SystemID, "org_id", id.OrgID, "bind", p.BindType.String(), "remote", c.remote.String())
+	c.recordBindEvent("bound", id.SystemID, id.OrgID, p.BindType.String(), "", "", c.id)
 	if c.srv.cfg.OnBind != nil {
 		if info, ok := c.boundInfo(); ok {
 			c.srv.cfg.OnBind(info)
 		}
 	}
+}
+
+// recordBindEvent appends a bind event to the server's recent-events ring buffer.
+func (c *conn) recordBindEvent(typ, systemID, orgID, bindType, status, reason, sessionID string) {
+	c.srv.events.add(BindEvent{
+		Time: time.Now(), Type: typ, SystemID: systemID, OrgID: orgID, RemoteAddr: c.remote.String(),
+		BindType: bindType, Status: status, Reason: reason, SessionID: sessionID,
+	})
 }
 
 // inbound is the common view of submit_sm and data_sm.

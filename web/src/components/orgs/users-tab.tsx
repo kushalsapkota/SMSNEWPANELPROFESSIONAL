@@ -2,7 +2,7 @@
 
 import { zodResolver } from "@hookform/resolvers/zod";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
-import { KeyRound, MoreHorizontal, Plus, UserCheck, UserX } from "lucide-react";
+import { KeyRound, MoreHorizontal, Plus, Trash2, UserCheck, UserX } from "lucide-react";
 import { useState } from "react";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
@@ -154,11 +154,17 @@ export function UsersTab({ org }: { org: OrgDetail }) {
   const [creating, setCreating] = useState(false);
   const [resetting, setResetting] = useState<User | null>(null);
   const [toggling, setToggling] = useState<User | null>(null);
+  const [deleting, setDeleting] = useState<User | null>(null);
 
   const setActive = useApiMutation({
     mutationFn: (v: { user: User; is_active: boolean }) => api.orgs.updateUser(org.id, v.user.id, { is_active: v.is_active }),
     success: (_d, v) => (v.is_active ? `${v.user.email} reactivated` : `${v.user.email} deactivated`),
     invalidate: [qk.orgs.users(org.id), qk.auditLogs.all],
+  });
+  const del = useApiMutation({
+    mutationFn: (u: User) => api.orgs.deleteUser(org.id, u.id),
+    success: (_d, u) => `${u.email} deleted`,
+    invalidate: [qk.orgs.users(org.id), qk.orgs.detail(org.id), qk.auditLogs.all],
   });
 
   const columns: Column<User>[] = [
@@ -211,6 +217,9 @@ export function UsersTab({ org }: { org: OrgDetail }) {
                 <UserCheck className="mr-2 h-4 w-4" /> Reactivate
               </DropdownMenuItem>
             )}
+            <DropdownMenuItem className="text-destructive" onSelect={() => setDeleting(u)}>
+              <Trash2 className="mr-2 h-4 w-4" /> Delete user
+            </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
       ),
@@ -253,6 +262,17 @@ export function UsersTab({ org }: { org: OrgDetail }) {
         confirmLabel="Deactivate"
         onConfirm={async () => {
           if (toggling) await setActive.mutateAsync({ user: toggling, is_active: false });
+        }}
+      />
+      <ConfirmDialog
+        open={!!deleting}
+        onOpenChange={(v) => !v && setDeleting(null)}
+        title={`Delete ${deleting?.email}?`}
+        description="Permanently removes this user and signs them out everywhere. This can't be undone. An organization's last remaining user can't be deleted — close the organization instead."
+        confirmText={deleting?.email}
+        confirmLabel="Delete user"
+        onConfirm={async () => {
+          if (deleting) await del.mutateAsync(deleting);
         }}
       />
     </Card>

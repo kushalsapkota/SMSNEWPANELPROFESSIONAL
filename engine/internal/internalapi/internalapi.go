@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"net/http"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -57,6 +58,7 @@ type HTTPConnections interface {
 type SMPPServer interface {
 	Sessions() []server.SessionInfo
 	Kick(orgID string) int
+	Events(limit int) []server.BindEvent
 }
 
 // Balances is the subset of *billing.Biller used here.
@@ -132,6 +134,7 @@ func New(d Deps) *API {
 	a.mux.HandleFunc("POST /internal/v1/provider-dlr/{token}", a.providerDLR)
 	a.mux.HandleFunc("GET /internal/v1/provider-dlr/{token}", a.providerDLR)
 	a.mux.HandleFunc("GET /internal/v1/smpp/sessions", a.sessions)
+	a.mux.HandleFunc("GET /internal/v1/smpp/events", a.events)
 	a.mux.HandleFunc("POST /internal/v1/smpp/sessions/kick", a.kick)
 	a.mux.HandleFunc("POST /internal/v1/config/reload", a.reload)
 	a.mux.HandleFunc("POST /internal/v1/balance/credit", a.credit)
@@ -265,11 +268,12 @@ func (b *submitBody) request() (pipeline.Request, error) {
 	}, nil
 }
 
-func (a *API) submitOne(ctx context.Context, b *submitBody) (*pipeline.Result, error) {
+func (a *API) submitOne(ctx context.Context, b *submitBody, bulk bool) (*pipeline.Result, error) {
 	req, err := b.request()
 	if err != nil {
 		return nil, err
 	}
+	req.Bulk = bulk
 	return a.d.Pipeline.Submit(ctx, req)
 }
 
@@ -279,7 +283,7 @@ func (a *API) submit(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, r, err)
 		return
 	}
-	res, err := a.submitOne(r.Context(), &b)
+	res, err := a.submitOne(r.Context(), &b, false)
 	if err != nil {
 		a.fail(w, r, err)
 		return
@@ -317,7 +321,7 @@ func (a *API) submitBatch(w http.ResponseWriter, r *http.Request) {
 					results[i] = eb
 					continue
 				}
-				res, err := a.submitOne(r.Context(), &b)
+				res, err := a.submitOne(r.Context(), &b, true)
 				if err != nil {
 					if policy.CodeOf(err) == policy.CodeInternal {
 						a.log.Error("batch item failed", "item", i, "err", err)
@@ -392,6 +396,40 @@ func (a *API) sessions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"sessions": out})
+}
+
+type eventJSON struct {
+	Time       time.Time `json:"time"`
+	Type       string    `json:"type"`
+	SystemID   string    `json:"system_id"`
+	OrgID      string    `json:"org_id"`
+	RemoteAddr string    `json:"remote_addr"`
+	BindType   string    `json:"bind_type"`
+	Status     string    `json:"status"`
+	Reason     string    `json:"reason"`
+	SessionID  string    `json:"session_id"`
+}
+
+// events returns the server's recent bind events (accepted/rejected/unbound),
+// newest first. Optional ?limit=N (default 500, max 2000).
+func (a *API) events(w http.ResponseWriter, r *http.Request) {
+	limit := 500
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > 2000 {
+		limit = 2000
+	}
+	out := []eventJSON{}
+	if a.d.SMPP != nil {
+		for _, e := range a.d.SMPP.Events(limit) {
+			out = append(out, eventJSON{Time: e.Time.UTC(), Type: e.Type, SystemID: e.SystemID, OrgID: e.OrgID,
+				RemoteAddr: e.RemoteAddr, BindType: e.BindType, Status: e.Status, Reason: e.Reason, SessionID: e.SessionID})
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"events": out})
 }
 
 // reload applies committed config changes synchronously (the cfg:invalidate

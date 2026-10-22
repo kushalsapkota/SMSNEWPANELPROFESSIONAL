@@ -11,6 +11,7 @@ import { DbService } from '../db/db.service';
 import type { Organization, User } from '../db/types';
 import { publicOrg, publicUser } from '../orgs/org.dto';
 import { evaluateSession, mayImpersonate } from './session-check';
+import { LoginRateLimiter } from './login-rate-limiter.service';
 import { TokenPair, TokenService } from './token.service';
 
 export const MAX_FAILED_LOGINS = 5;
@@ -39,6 +40,7 @@ export class AuthService {
     private readonly crypto: CryptoService,
     private readonly tokens: TokenService,
     private readonly audit: AuditService,
+    private readonly loginLimiter: LoginRateLimiter,
     @Inject(APP_CONFIG) private readonly config: AppConfig,
   ) {}
 
@@ -49,6 +51,14 @@ export class AuthService {
   async login(email: string, password: string, totpCode: string | undefined) {
     const db = this.db.privileged;
     const meta = currentMeta();
+    // Per-IP throttle before any work, so credential spraying and enumeration are both capped
+    // and the per-account lockout cannot be weaponised at volume from one source.
+    const rate = await this.loginLimiter.hit(meta.ip);
+    if (!rate.allowed) {
+      throw new AppError('RATE_LIMITED', 'Too many login attempts from your network; please wait and try again', {
+        retry_after_seconds: rate.retryAfterSeconds,
+      });
+    }
     const user = await db.selectFrom('users').selectAll().where('email', '=', email).executeTakeFirst();
     if (!user) {
       this.dummyHash ??= this.crypto.hashPassword(this.crypto.randomToken(16));

@@ -76,6 +76,9 @@ type Org struct {
 	APIEnabled      bool
 	SMPPEnabled     bool
 	WebEnabled      bool
+	// ContentApprovalRequired: every message must match an APPROVED
+	// approved_content entry for this org, else CONTENT_NOT_APPROVED.
+	ContentApprovalRequired bool
 	MaxTPS          int
 	DailyLimit      int // 0 = unlimited
 	MonthlyLimit    int // 0 = unlimited
@@ -99,6 +102,25 @@ func (o *Org) CanUseChannel(ch string) bool {
 		return o.Effective.CanWeb
 	}
 	return false
+}
+
+// Switches is the global service_switches row: operator kill switches an
+// administrator flips to stop services at once. Zero value is NOT the
+// default — DefaultSwitches (all-on) is, so a missing row never causes an
+// outage. AllEnabled is the master; the others gate one channel/mode.
+type Switches struct {
+	AllEnabled     bool // master; false stops every channel and bind
+	HTTPAPIEnabled bool // HTTP API ingress (channel HTTP)
+	SMPPEnabled    bool // SMPP binds + submits (channel SMPP)
+	BulkEnabled    bool // bulk / batch sending
+	UpdatedAt      time.Time
+}
+
+// DefaultSwitches is the all-on state used when no service_switches row is
+// loaded (fail open: the kill switch must not take the gateway down by its
+// own absence).
+func DefaultSwitches() Switches {
+	return Switches{AllEnabled: true, HTTPAPIEnabled: true, SMPPEnabled: true, BulkEnabled: true}
 }
 
 // Rate is the currently effective upstream_rates row for a (connection, prefix).
@@ -298,6 +320,16 @@ func (a *SMPPAccount) AllowsBind(bindType string) bool {
 	return false
 }
 
+// ApprovedContent is an approved_content row: one piece of message content
+// in a client's pre-approval allow-list. Only Status "APPROVED" entries gate
+// sending; others are carried for the review UI.
+type ApprovedContent struct {
+	ID      string
+	OrgID   string
+	Content string
+	Status  string // PENDING | APPROVED | REJECTED
+}
+
 // IPRule is an ip_whitelists row.
 type IPRule struct {
 	ID     string
@@ -358,10 +390,12 @@ type Data struct {
 	Templates        []*Template
 	SenderIDs        []*SenderID
 	SMPPAccounts     []*SMPPAccount
+	ApprovedContent  []*ApprovedContent
 	IPRules          []*IPRule
 	Webhooks         []*Webhook
 	BlockedNumbers   []*BlockedNumber
 	BlockedKeywords  []*BlockedKeyword
+	Switches         *Switches // nil = no row loaded (DefaultSwitches applies)
 	LoadedAt         time.Time
 	Warnings         []string
 }

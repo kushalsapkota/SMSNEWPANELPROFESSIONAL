@@ -1,6 +1,7 @@
 "use client";
 
-import { LogIn, Pause, Play } from "lucide-react";
+import { Ban, LogIn, Pause, Play, Trash2 } from "lucide-react";
+import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/shared/confirm-dialog";
 import { useApiMutation } from "@/hooks/use-api-mutation";
@@ -25,21 +26,22 @@ export function SuspendActivateButton({ org, kind }: { org: OrgDetail; kind: Org
     invalidate,
   });
 
-  if (org.status === "SUSPENDED") {
+  if (org.status === "SUSPENDED" || org.status === "CLOSED") {
+    const wasClosed = org.status === "CLOSED";
     return (
       <ConfirmDialog
         trigger={
           <Button variant="outline">
-            <Play /> Activate
+            <Play /> {wasClosed ? "Re-open" : "Activate"}
           </Button>
         }
-        title={`Activate ${org.name}?`}
+        title={`${wasClosed ? "Re-open" : "Activate"} ${org.name}?`}
         description={
           kind === "reseller"
-            ? "The reseller and all of its clients will be able to log in and send again (subject to their own state)."
-            : "The client will be able to log in and send again."
+            ? "The reseller and all of its clients will be able to log in and send again (subject to their own state). Channels that were turned off on close stay off until you re-enable them."
+            : "The client will be able to log in and send again. Channels that were turned off on close stay off until you re-enable them."
         }
-        confirmLabel="Activate"
+        confirmLabel={wasClosed ? "Re-open" : "Activate"}
         destructive={false}
         onConfirm={() => activate.mutateAsync()}
       />
@@ -48,7 +50,7 @@ export function SuspendActivateButton({ org, kind }: { org: OrgDetail; kind: Org
   return (
     <ConfirmDialog
       trigger={
-        <Button variant="destructive" disabled={org.status === "CLOSED"}>
+        <Button variant="destructive">
           <Pause /> Suspend
         </Button>
       }
@@ -62,6 +64,76 @@ export function SuspendActivateButton({ org, kind }: { org: OrgDetail; kind: Org
       confirmLabel="Suspend"
       onConfirm={(reason) => suspend.mutateAsync(reason)}
     />
+  );
+}
+
+/**
+ * Close (reversible) and permanently delete. Closing turns all channels off and logs everyone
+ * out; it is undone by Activate. Permanent delete is gated behind typing the org name and is only
+ * allowed once the org is closed/suspended and has no sub-orgs (the api enforces both).
+ */
+export function DeleteOrgButton({ org, kind }: { org: OrgDetail; kind: OrgKind }) {
+  const k = KIND[kind];
+  const router = useRouter();
+  const invalidate = [qk.orgs.all, qk.auditLogs.all];
+  const close = useApiMutation({
+    mutationFn: () => api.orgs.remove(org.id),
+    success: `${k.singular} closed`,
+    invalidate,
+  });
+  const purge = useApiMutation({
+    mutationFn: () => api.orgs.remove(org.id, { purge: true }),
+    success: `${k.singular} permanently deleted`,
+    invalidate,
+  });
+  const canPurge = org.status === "CLOSED" || org.status === "SUSPENDED";
+
+  return (
+    <>
+      {org.status !== "CLOSED" ? (
+        <ConfirmDialog
+          trigger={
+            <Button variant="outline">
+              <Ban /> Close
+            </Button>
+          }
+          title={`Close ${org.name}?`}
+          description={
+            kind === "reseller"
+              ? "Turns off sending, API and SMPP for this reseller and all of its clients, and logs everyone out. Billing history is kept and you can re-open it later with Activate."
+              : "Turns off sending, API and SMPP for this client and logs everyone out. Billing history is kept and you can re-open it later with Activate."
+          }
+          confirmLabel="Close"
+          onConfirm={() => close.mutateAsync()}
+        />
+      ) : null}
+      <ConfirmDialog
+        trigger={
+          <Button variant="destructive" disabled={!canPurge} title={canPurge ? undefined : "Close this account first"}>
+            <Trash2 /> Delete permanently
+          </Button>
+        }
+        title={`Permanently delete ${org.name}?`}
+        description={
+          <div className="space-y-2">
+            <p>
+              This cannot be undone. It removes the {k.singular.toLowerCase()}, its users, balance,
+              SMPP accounts, API keys, sender IDs, webhooks and route assignments.
+            </p>
+            <p className="text-muted-foreground">
+              Message history and audit logs are kept for the record.
+              {kind === "reseller" ? " A reseller with sub-clients cannot be deleted until those are removed." : ""}
+            </p>
+          </div>
+        }
+        confirmText={org.name}
+        confirmLabel="Delete permanently"
+        onConfirm={async () => {
+          await purge.mutateAsync();
+          router.push(k.basePath);
+        }}
+      />
+    </>
   );
 }
 

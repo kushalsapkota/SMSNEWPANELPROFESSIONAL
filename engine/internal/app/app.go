@@ -144,9 +144,15 @@ func New(ctx context.Context, cfg *config.Config, log *slog.Logger, ov Overrides
 	}
 
 	a.Metrics = metrics.NewEngine(metrics.NewRegistry())
+	// Channel precedence: an explicit test Override wins; otherwise the configured
+	// CFG_INVALIDATE_CHANNEL (which defaults to store.InvalidateChannel).
+	invalidateChannel := ov.InvalidateChannel
+	if invalidateChannel == "" {
+		invalidateChannel = cfg.ConfigInvalidateChannel
+	}
 	a.Store = store.New(a.pool, a.rdb, cipher, store.Options{
 		ReloadInterval: cfg.ConfigReloadInterval, Debounce: cfg.ConfigDebounce, MaxDebounce: cfg.ConfigMaxDebounce,
-		Channel: ov.InvalidateChannel, Logger: log,
+		Channel: invalidateChannel, Logger: log,
 	})
 	if err := a.Store.Load(ctx); err != nil {
 		return nil, fmt.Errorf("app: initial config load: %w", err)

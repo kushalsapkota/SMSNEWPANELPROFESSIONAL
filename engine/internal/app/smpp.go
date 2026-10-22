@@ -64,6 +64,7 @@ func (a *authenticator) Authenticate(ctx context.Context, req *server.BindReques
 	}
 	if err := policy.CheckIP(snap, acct.OrgID, ip, store.ScopeSMPP); err != nil {
 		a.log.Info("SMPP bind rejected", "system_id", req.SystemID, "ip", ipKey, "reason", err.Error())
+		req.Reason = err.Error()
 		if a.guard != nil {
 			a.guard.fail(ipKey, "")
 		}
@@ -94,6 +95,7 @@ func (a *authenticator) Authenticate(ctx context.Context, req *server.BindReques
 	}
 	if err := policy.CheckBind(snap, acct, req.BindType.String(), ip); err != nil {
 		a.log.Info("SMPP bind rejected", "system_id", req.SystemID, "ip", ipKey, "reason", err.Error())
+		req.Reason = err.Error()
 		return nil, pdu.CommandStatus(policy.SMPPBindStatus(policy.CodeOf(err)))
 	}
 	org := snap.Org(acct.OrgID)
@@ -181,6 +183,16 @@ func (h *smppHandler) HandleMessage(ctx context.Context, m *server.Message) pdu.
 // use SMPP (suspension, SMPP disabled, account disabled/deleted) — a safety
 // net in addition to the api's explicit kick.
 func sweepSessions(snap *store.Snapshot, srv *server.Server, log *slog.Logger) {
+	// Operator kill switch: when SMPP (or the master) is off, drop every
+	// bound client session. New binds are already refused by CheckBind.
+	if sw := snap.Switches(); !sw.AllEnabled || !sw.SMPPEnabled {
+		for _, s := range srv.Sessions() {
+			if n := srv.KickSystemID(s.SystemID); n > 0 {
+				log.Info("unbound SMPP client sessions", "system_id", s.SystemID, "org_id", s.OrgID, "sessions", n, "reason", "SMPP disabled by administrator")
+			}
+		}
+		return
+	}
 	for _, s := range srv.Sessions() {
 		acct := snap.SMPPAccount(s.SystemID)
 		org := snap.Org(s.OrgID)

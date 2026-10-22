@@ -1,0 +1,107 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "schemaVersion": 39,
+  "title": "SMS Gateway",
+  "uid": "sms-gateway",
+  "tags": ["sms", "engine"],
+  "time": { "from": "now-6h", "to": "now" },
+  "refresh": "30s",
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Upstream connections up",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "thresholds": { "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] } }, "overrides": [] },
+      "targets": [ { "refId": "A", "expr": "sum(smsgw_upstream_connection_up)" } ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "TPS in / out",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "targets": [
+        { "refId": "A", "expr": "smsgw_tps_in", "legendFormat": "in" },
+        { "refId": "B", "expr": "smsgw_tps_out", "legendFormat": "out" }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "SMPP client sessions",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "targets": [ { "refId": "A", "expr": "smsgw_smpp_client_sessions" } ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Config version",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "targets": [ { "refId": "A", "expr": "smsgw_config_version" } ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Submit rate by result (per s)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [ { "refId": "A", "expr": "sum by (result) (rate(smsgw_submit_total[5m]))", "legendFormat": "{{result}}" } ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Submit latency p50 / p95 / p99 (s)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.5, sum by (le) (rate(smsgw_submit_duration_seconds_bucket[5m])))", "legendFormat": "p50" },
+        { "refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(smsgw_submit_duration_seconds_bucket[5m])))", "legendFormat": "p95" },
+        { "refId": "C", "expr": "histogram_quantile(0.99, sum by (le) (rate(smsgw_submit_duration_seconds_bucket[5m])))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Dispatch queue depth & CDR queue length",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        { "refId": "A", "expr": "smsgw_dispatch_queue_depth", "legendFormat": "dispatch" },
+        { "refId": "B", "expr": "smsgw_cdr_queue_length", "legendFormat": "cdr" }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "DLR final by status (per s)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [ { "refId": "A", "expr": "sum by (status) (rate(smsgw_dlr_final_total[5m]))", "legendFormat": "{{status}}" } ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Failovers & refunds (15m increase)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "targets": [
+        { "refId": "A", "expr": "increase(smsgw_dispatch_failover_total[15m])", "legendFormat": "failovers" },
+        { "refId": "B", "expr": "increase(smsgw_refunds_total[15m])", "legendFormat": "refunds" }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Upstream submit latency p95 (s)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "targets": [ { "refId": "A", "expr": "histogram_quantile(0.95, sum by (le) (rate(smsgw_upstream_submit_duration_seconds_bucket[5m])))", "legendFormat": "p95" } ]
+    }
+  ]
+}

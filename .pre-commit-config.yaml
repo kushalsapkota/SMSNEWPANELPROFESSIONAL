@@ -1,0 +1,34 @@
+# Optional local hooks. Install once:  pip install pre-commit && pre-commit install
+# These are fast, local checks; the full suite runs in CI (`make test`).
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.10.0.1
+    hooks:
+      - id: shellcheck
+
+  - repo: local
+    hooks:
+      - id: gofmt
+        name: gofmt (engine)
+        entry: bash -c 'cd engine && test -z "$(gofmt -l .)" || { echo "gofmt needed:"; gofmt -l .; exit 1; }'
+        language: system
+        files: ^engine/.*\.go$
+        pass_filenames: false
+
+      - id: deploy-validate
+        name: deploy static checks
+        entry: make test-deploy
+        language: system
+        files: ^deploy/
+        pass_filenames: false

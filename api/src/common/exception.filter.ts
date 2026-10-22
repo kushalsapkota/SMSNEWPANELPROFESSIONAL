@@ -65,6 +65,10 @@ export class AppExceptionFilter implements ExceptionFilter {
       res.end();
       return;
     }
+    if (body.error_code === 'RATE_LIMITED') {
+      const retry = (body.details as { retry_after_seconds?: unknown } | undefined)?.retry_after_seconds;
+      res.setHeader('Retry-After', String(typeof retry === 'number' && retry > 0 ? Math.ceil(retry) : 1));
+    }
     res.status(status).json(body);
   }
 

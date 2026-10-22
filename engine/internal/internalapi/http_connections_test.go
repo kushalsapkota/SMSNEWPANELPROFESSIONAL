@@ -56,7 +56,7 @@ func TestHTTPConnectionEndpoints(t *testing.T) {
 
 	st, b := do(t, a, "GET", "/internal/v1/adapters", "", token)
 	ads, _ := b["adapters"].([]any)
-	if st != 200 || len(ads) != 10 {
+	if st != 200 || len(ads) != 11 {
 		t.Fatalf("%d %v", st, b)
 	}
 	first := ads[0].(map[string]any)

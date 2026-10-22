@@ -8,6 +8,7 @@ import type {
   EngineConnectionStatus,
   EngineCreditResponse,
   EngineAdapter,
+  EngineBindEvent,
   EngineHealthResponse,
   EngineProviderBalanceResponse,
   EngineProviderDlrEnvelope,
@@ -68,6 +69,11 @@ export class EngineClient {
   async smppSessions(): Promise<EngineSmppSession[]> {
     const r = await this.request<{ sessions: EngineSmppSession[] }>('GET', '/internal/v1/smpp/sessions');
     return r.sessions;
+  }
+
+  async smppEvents(limit = 500): Promise<EngineBindEvent[]> {
+    const r = await this.request<{ events: EngineBindEvent[] }>('GET', `/internal/v1/smpp/events?limit=${encodeURIComponent(String(limit))}`);
+    return r.events;
   }
 
   async kickSmppSessions(orgId: string): Promise<number> {

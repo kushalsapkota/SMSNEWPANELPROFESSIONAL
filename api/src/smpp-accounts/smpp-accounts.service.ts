@@ -64,6 +64,7 @@ export class SmppAccountsService {
     const org = await this.scope.resolve(orgIdParam, 'write');
     if (org.role === 'SUPER_ADMIN') throw AppError.invalid('SMPP accounts belong to resellers and clients');
     const hash = await this.crypto.hashPassword(input.password);
+    const passwordEnc = this.crypto.encrypt(input.password);
     return this.db.tenant(async (trx) => {
       const { id } = await trx
         .insertInto('smpp_accounts')
@@ -71,6 +72,7 @@ export class SmppAccountsService {
           org_id: org.id,
           system_id: input.system_id,
           password_hash: hash,
+          password_enc: passwordEnc,
           max_binds: input.max_binds,
           max_tps: input.max_tps ?? null,
           allowed_bind_types: input.allowed_bind_types,
@@ -133,14 +135,48 @@ export class SmppAccountsService {
   /** Rotate the bind password; live sessions are kicked so they must rebind with it. */
   async rotatePassword(id: string, password: string) {
     const hash = await this.crypto.hashPassword(password);
+    const passwordEnc = this.crypto.encrypt(password);
     return this.db.tenant(async (trx) => {
       const before = await this.load(trx, id);
-      await trx.updateTable('smpp_accounts').set({ password_hash: hash }).where('id', '=', id).execute();
+      await trx.updateTable('smpp_accounts').set({ password_hash: hash, password_enc: passwordEnc }).where('id', '=', id).execute();
       const after = await columns(trx).where('id', '=', id).executeTakeFirstOrThrow();
       await this.audit.record({ action: 'smpp_account.password_rotate', entityType: 'smpp_account', entityId: id, targetOrgId: before.org_id });
       await this.invalidation.invalidate('smpp_accounts', id);
       await this.kickAfterCommit(before.org_id);
       return after;
+    });
+  }
+
+  /**
+   * Reveal the bind password (and system_id) so the parent, admin, or the org itself can copy the
+   * full SMPP connection. Readable by anyone who can read the org (admin → its tree, reseller → its
+   * clients, a client → itself). Every reveal is audited. `password` is null for pre-008 accounts
+   * whose password predates reversible storage — rotate it once to make it copyable.
+   */
+  async credentials(id: string) {
+    return this.db.tenant(async (trx) => {
+      const row = await trx
+        .selectFrom('smpp_accounts')
+        .select(['id', 'org_id', 'system_id', 'password_enc', 'enabled'])
+        .where('id', '=', id)
+        .executeTakeFirst();
+      if (!row) throw AppError.notFound('SMPP account');
+      await this.scope.assertOrgAccess(row.org_id, 'read');
+      let password: string | null = null;
+      if (row.password_enc) {
+        try {
+          password = this.crypto.decrypt(row.password_enc);
+        } catch {
+          password = null; // undecryptable (e.g. key rotation): treat as not revealable
+        }
+      }
+      await this.audit.record({
+        action: 'smpp_account.credentials_view',
+        entityType: 'smpp_account',
+        entityId: id,
+        targetOrgId: row.org_id,
+      });
+      return { id: row.id, system_id: row.system_id, password, password_available: password !== null, enabled: row.enabled };
     });
   }
 

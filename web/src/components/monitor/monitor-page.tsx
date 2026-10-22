@@ -16,7 +16,7 @@ import { StatCard } from "@/components/shared/stat-card";
 import { EmptyState, ErrorState, LoadingState } from "@/components/shared/states";
 import { StatusBadge } from "@/components/shared/status-badge";
 import { api, qk } from "@/lib/api";
-import type { ConnectionStatus, SmppSession } from "@/lib/api/types";
+import type { ConnectionStatus, GeoLocation, SmppBindEvent, SmppSession } from "@/lib/api/types";
 import { useSession } from "@/lib/auth/session";
 import { SERIES, compactNumber } from "@/lib/chart";
 import { formatDateTime, formatNumber, formatRelative } from "@/lib/format";
@@ -153,6 +153,37 @@ function ConnectionTile({ c }: { c: ConnectionStatus }) {
   );
 }
 
+/** "City, Country" (or whichever parts are known) for display and filtering. */
+function locationText(loc?: GeoLocation | null): string {
+  if (!loc) return "";
+  return [loc.city, loc.country ?? loc.country_code].filter(Boolean).join(", ");
+}
+
+/** Turns a 2-letter country code into its flag emoji (regional indicators); "" when unknown. */
+function flagEmoji(cc: string | null): string {
+  if (!cc || !/^[a-zA-Z]{2}$/.test(cc)) return "";
+  return String.fromCodePoint(...[...cc.toUpperCase()].map((c) => 0x1f1e6 + c.charCodeAt(0) - 65));
+}
+
+function LocationCell({ loc }: { loc?: GeoLocation | null }) {
+  const text = locationText(loc);
+  if (!text) return <span className="text-xs text-muted-foreground">—</span>;
+  const flag = flagEmoji(loc?.country_code ?? null);
+  const cell = (
+    <span className="whitespace-nowrap text-sm">
+      {flag ? <span className="mr-1">{flag}</span> : null}
+      {text}
+    </span>
+  );
+  if (!loc?.isp) return cell;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>{cell}</TooltipTrigger>
+      <TooltipContent>{loc.isp}</TooltipContent>
+    </Tooltip>
+  );
+}
+
 function SessionsTable({ sessions, isLoading, error, onRetry, role }: {
   sessions: SmppSession[] | undefined;
   isLoading: boolean;
@@ -165,13 +196,20 @@ function SessionsTable({ sessions, isLoading, error, onRetry, role }: {
     const all = sessions ?? [];
     if (!filter) return all;
     const f = filter.toLowerCase();
-    return all.filter((s) => s.system_id.toLowerCase().includes(f) || (s.org_name ?? "").toLowerCase().includes(f) || s.remote_addr.includes(f));
+    return all.filter(
+      (s) =>
+        s.system_id.toLowerCase().includes(f) ||
+        (s.org_name ?? "").toLowerCase().includes(f) ||
+        s.remote_addr.includes(f) ||
+        locationText(s.location).toLowerCase().includes(f),
+    );
   }, [sessions, filter]);
   const columns: Column<SmppSession>[] = [
     { id: "system_id", header: "System ID", cell: (s) => <span className="font-mono text-sm">{s.system_id}</span> },
     ...(role !== "CLIENT" ? [{ id: "org", header: "Account", cell: (s: SmppSession) => s.org_name ?? s.org_id.slice(0, 8) }] : []),
     { id: "bind", header: "Bind", cell: (s) => <Badge variant="outline">{s.bind_type}</Badge> },
     { id: "remote", header: "Remote", hideOnMobile: true, cell: (s) => <span className="font-mono text-xs">{s.remote_addr}</span> },
+    { id: "location", header: "Location", hideOnMobile: true, cell: (s) => <LocationCell loc={s.location} /> },
     { id: "since", header: "Bound since", hideOnMobile: true, cell: (s) => <span title={formatDateTime(s.bound_since)}>{formatRelative(s.bound_since)}</span> },
     { id: "tps", header: "TPS", align: "right", cell: (s) => s.tps_current.toFixed(1) },
     { id: "total", header: "Submitted", align: "right", hideOnMobile: true, cell: (s) => formatNumber(s.submitted_total) },
@@ -186,7 +224,74 @@ function SessionsTable({ sessions, isLoading, error, onRetry, role }: {
       error={error}
       onRetry={onRetry}
       empty={{ title: "No SMPP clients bound", description: "Sessions appear here as soon as a client binds on port 2775." }}
-      toolbar={<SearchFilter value={filter} onChange={setFilter} placeholder="System ID, account or IP" />}
+      toolbar={<SearchFilter value={filter} onChange={setFilter} placeholder="System ID, account, IP or location" />}
+    />
+  );
+}
+
+const EVENT_BADGE: Record<SmppBindEvent["type"], { label: string; variant: "success" | "destructive" | "muted" }> = {
+  bound: { label: "Bound", variant: "success" },
+  rejected: { label: "Rejected", variant: "destructive" },
+  unbound: { label: "Unbound", variant: "muted" },
+};
+
+function EventsTable({ events, isLoading, error, onRetry, role }: {
+  events: SmppBindEvent[] | undefined;
+  isLoading: boolean;
+  error: unknown;
+  onRetry: () => void;
+  role: string;
+}) {
+  const [filter, setFilter] = useState<string | undefined>();
+  const rows = useMemo(() => {
+    const all = (events ?? []).map((e, i) => ({ ...e, _k: `${e.time}-${i}` }));
+    if (!filter) return all;
+    const f = filter.toLowerCase();
+    return all.filter(
+      (e) =>
+        e.system_id.toLowerCase().includes(f) ||
+        (e.org_name ?? "").toLowerCase().includes(f) ||
+        e.remote_addr.includes(f) ||
+        e.reason.toLowerCase().includes(f) ||
+        e.type.includes(f),
+    );
+  }, [events, filter]);
+
+  type Row = (typeof rows)[number];
+  const columns: Column<Row>[] = [
+    { id: "time", header: "Time", cell: (e) => <span title={formatDateTime(e.time)}>{formatRelative(e.time)}</span> },
+    { id: "type", header: "Event", cell: (e) => <Badge variant={EVENT_BADGE[e.type].variant}>{EVENT_BADGE[e.type].label}</Badge> },
+    { id: "system_id", header: "System ID", cell: (e) => <span className="font-mono text-sm">{e.system_id || "—"}</span> },
+    ...(role !== "CLIENT"
+      ? [{ id: "org", header: "Account", hideOnMobile: true, cell: (e: Row) => e.org_name ?? (e.org_id ? e.org_id.slice(0, 8) : "—") }]
+      : []),
+    { id: "remote", header: "Remote", hideOnMobile: true, cell: (e) => <span className="font-mono text-xs">{e.remote_addr}</span> },
+    { id: "bind", header: "Bind", hideOnMobile: true, cell: (e) => (e.bind_type ? <Badge variant="outline">{e.bind_type}</Badge> : <span className="text-muted-foreground">—</span>) },
+    {
+      id: "reason",
+      header: "Reason",
+      cell: (e) =>
+        e.type === "bound" ? (
+          <span className="text-muted-foreground">—</span>
+        ) : (
+          <span className="text-sm">
+            {e.reason || e.status || "—"}
+            {e.status && e.type === "rejected" ? <span className="ml-1 font-mono text-xs text-muted-foreground">({e.status})</span> : null}
+          </span>
+        ),
+    },
+  ];
+  return (
+    <DataTable
+      caption="SMPP event log"
+      columns={columns}
+      data={rows}
+      rowKey={(e) => e._k}
+      isLoading={isLoading}
+      error={error}
+      onRetry={onRetry}
+      empty={{ title: "No SMPP events yet", description: "Bind attempts (accepted or rejected, with the reason) appear here as clients connect." }}
+      toolbar={<SearchFilter value={filter} onChange={setFilter} placeholder="System ID, account, IP or reason" />}
     />
   );
 }
@@ -207,6 +312,11 @@ export function MonitorPage() {
   const sessions = useQuery({
     queryKey: qk.monitor.smppSessions,
     queryFn: api.monitor.smppSessions,
+    refetchInterval: interval,
+  });
+  const events = useQuery({
+    queryKey: qk.monitor.smppEvents,
+    queryFn: api.monitor.smppEvents,
     refetchInterval: interval,
   });
   const live = useQuery({
@@ -381,6 +491,17 @@ export function MonitorPage() {
           isLoading={sessions.isLoading}
           error={sessions.error}
           onRetry={() => sessions.refetch()}
+          role={role}
+        />
+      </section>
+
+      <section>
+        <h2 className="mb-3 text-lg font-semibold tracking-tight">SMPP event log</h2>
+        <EventsTable
+          events={events.data?.events}
+          isLoading={events.isLoading}
+          error={events.error}
+          onRetry={() => events.refetch()}
           role={role}
         />
       </section>

@@ -121,6 +121,7 @@ export interface Org {
   api_enabled: boolean;
   smpp_enabled: boolean;
   web_enabled: boolean;
+  content_approval_required: boolean;
   max_tps: number;
   daily_limit: number | null;
   monthly_limit: number | null;
@@ -208,6 +209,52 @@ export interface UpdateOrgRequest {
   whitelabel_domain?: string | null;
 }
 
+/** One client to provision in a bulk create (admin only). Blank email/password/system_id/smpp_password are auto-filled server-side. */
+export interface BulkClientInput {
+  reseller_id: Uuid;
+  name: string;
+  email?: string;
+  password?: string;
+  billing_mode: BillingMode;
+  credit_limit_micros?: number;
+  smpp_system_id?: string;
+  smpp_password?: string;
+  max_binds?: number;
+  max_tps?: number | null;
+  allowed_bind_types?: BindType[];
+  route_id?: Uuid;
+  rate_micros?: number;
+}
+
+export interface BulkCreateRequest {
+  clients: BulkClientInput[];
+}
+
+export interface BulkResultRow {
+  index: number;
+  name: string;
+  status: "created" | "error";
+  org_id?: Uuid;
+  reseller_id?: Uuid;
+  reseller_name?: string;
+  email?: string;
+  password?: string;
+  billing_mode?: BillingMode;
+  credit_limit_micros?: number;
+  smpp_system_id?: string;
+  smpp_password?: string;
+  route_id?: Uuid;
+  route_name?: string;
+  rate_micros?: number;
+  error?: string;
+}
+
+export interface BulkCreateResponse {
+  created: number;
+  failed: number;
+  results: BulkResultRow[];
+}
+
 export interface SuspendOrgRequest {
   reason: string;
 }
@@ -217,6 +264,18 @@ export interface UpdateChannelsRequest {
   api_enabled?: boolean;
   smpp_enabled?: boolean;
   web_enabled?: boolean;
+}
+
+export interface DeleteOrgParams {
+  /** true = permanent hard delete; omitted/false = reversible close. */
+  purge?: boolean;
+  reason?: string;
+}
+
+/** Returned by a hard delete (org or user). */
+export interface DeleteResult {
+  id: Uuid;
+  deleted: boolean;
 }
 
 /* --------------------------------------------------------------- users */
@@ -864,6 +923,31 @@ export interface CreateSenderIdRequest {
   route_id?: Uuid | null;
 }
 
+export type ContentStatus = "PENDING" | "APPROVED" | "REJECTED";
+
+export interface ApprovedContent {
+  id: Uuid;
+  org_id: Uuid;
+  org_name?: string;
+  content: string;
+  status: ContentStatus;
+  note: string | null;
+  reviewed_by: Uuid | null;
+  reviewed_at: IsoDateTime | null;
+  created_at: IsoDateTime;
+}
+
+export interface ApprovedContentListParams extends PageParams, ScopedParams {
+  status?: ContentStatus;
+  /** List content of the acting org's child orgs (the review queue). */
+  include_children?: boolean;
+  q?: string;
+}
+
+export interface CreateApprovedContentRequest {
+  content: string;
+}
+
 export interface ApiKey {
   id: Uuid;
   org_id: Uuid;
@@ -905,6 +989,15 @@ export interface SmppAccount {
   last_bind_ip: string | null;
   created_at: IsoDateTime;
   updated_at: IsoDateTime;
+}
+
+export interface SmppAccountCredentials {
+  id: Uuid;
+  system_id: string;
+  /** Null when the password predates reversible storage (rotate it to make it copyable). */
+  password: string | null;
+  password_available: boolean;
+  enabled: boolean;
 }
 
 export interface CreateSmppAccountRequest {
@@ -1204,6 +1297,39 @@ export interface AnalyticsBreakdown {
   rows: BreakdownRow[];
 }
 
+/* ------------------------------------------------------- billing / usage */
+
+export interface BillingClientRow {
+  org_id: Uuid;
+  name: string;
+  role: OrgRole | null;
+  status: OrgStatus | null;
+  reseller_name: string | null;
+  currency: string;
+  messages: number;
+  parts: number;
+  delivered: number;
+  failed: number;
+  delivery_rate: number;
+  /** what this client was charged over the period (their price). */
+  charged_micros: number;
+}
+
+export interface BillingClientsResponse {
+  rows: BillingClientRow[];
+  totals: {
+    clients: number;
+    messages: number;
+    parts: number;
+    delivered: number;
+    failed: number;
+    charged_micros: number;
+  };
+  currency: string;
+  from: IsoDateTime;
+  to: IsoDateTime;
+}
+
 export interface AnalyticsLive {
   /** null when the engine metrics endpoint is unreachable */
   tps_in: number | null;
@@ -1411,6 +1537,13 @@ export interface ConnectionsStatusResponse {
   connections: ConnectionStatus[];
 }
 
+export interface GeoLocation {
+  country: string | null;
+  country_code: string | null;
+  city: string | null;
+  isp: string | null;
+}
+
 export interface SmppSession {
   session_id: string;
   org_id: Uuid;
@@ -1418,6 +1551,8 @@ export interface SmppSession {
   system_id: string;
   bind_type: BindType;
   remote_addr: string;
+  /** Coarse geolocation of remote_addr (null when private, unknown, or geo-IP is disabled). */
+  location?: GeoLocation | null;
   bound_since: IsoDateTime;
   tps_current: number;
   submitted_total: number;
@@ -1426,6 +1561,96 @@ export interface SmppSession {
 export interface SmppSessionsResponse {
   sessions: SmppSession[];
 }
+
+export interface SmppBindEvent {
+  time: IsoDateTime;
+  type: "bound" | "rejected" | "unbound";
+  system_id: string;
+  org_id: string;
+  org_name?: string | null;
+  remote_addr: string;
+  bind_type: string;
+  /** SMPP command_status word for a rejection; "" otherwise. */
+  status: string;
+  /** human-readable cause for a rejection (e.g. "max_binds reached"). */
+  reason: string;
+  session_id: string;
+}
+
+export interface SmppEventsResponse {
+  events: SmppBindEvent[];
+}
+
+/* ------------------------------------------------------- firewall (admin) */
+
+export interface FirewallRule {
+  action: "allow" | "deny";
+  proto: "tcp" | "udp" | "any";
+  port: number | null;
+  source: string | null;
+}
+
+export interface FirewallState {
+  enabled: boolean;
+  default_policy: "allow" | "deny";
+  rules: FirewallRule[];
+}
+
+export interface FirewallStatus extends FirewallState {
+  /** false when no firewall-agent is configured/deployed. */
+  available: boolean;
+  protected_tcp_ports: number[];
+  pending_revert: boolean;
+  revert_in_seconds: number;
+  table_active: boolean;
+}
+
+/* ------------------------------------------------------- domains (admin vhost manager) */
+
+export type DomainRole = "panel" | "smpp" | "both";
+
+export interface DomainCert {
+  exists: boolean;
+  expires: string | null;
+}
+
+export interface DomainEntry {
+  domain: string;
+  role: DomainRole;
+  enabled: boolean;
+  cert: DomainCert;
+  added_at: string | null;
+}
+
+export interface DomainsStatus {
+  /** false when no domain-agent is configured/installed on the host. */
+  available: boolean;
+  nginx_ok: boolean;
+  domains: DomainEntry[];
+}
+
+export interface AddDomainRequest {
+  domain: string;
+  role: DomainRole;
+}
+
+/* ------------------------------------------------------- service switches (admin kill switch) */
+
+export interface ServiceSwitches {
+  /** Master switch: off stops every channel and SMPP bind. */
+  all_enabled: boolean;
+  http_api_enabled: boolean;
+  smpp_enabled: boolean;
+  bulk_enabled: boolean;
+  note: string | null;
+  updated_at: string;
+  updated_by: string | null;
+}
+
+/** A PUT sends only the keys it changes. */
+export type ServiceSwitchesUpdate = Partial<
+  Pick<ServiceSwitches, "all_enabled" | "http_api_enabled" | "smpp_enabled" | "bulk_enabled" | "note">
+>;
 
 /* ------------------------------------------------------- public (§11) */
 

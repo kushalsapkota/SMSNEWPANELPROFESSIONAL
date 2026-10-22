@@ -282,7 +282,9 @@ func (m *Manager) attemptHTTP(ctx context.Context, job *pipeline.DispatchJob, c 
 				id = job.ID
 			}
 			m.mapPart(c.ID, job, id, 0, map[string][]int{})
-			return attemptResult{ids: []string{id}, pdus: 1, noDLR: httpadapter.EffectiveDLRMode(ad, hc) == httpadapter.DLRNone}
+			noDLR := httpadapter.EffectiveDLRMode(ad, hc) == httpadapter.DLRNone
+			return attemptResult{ids: []string{id}, pdus: 1, noDLR: noDLR,
+				deliveredOnAccept: noDLR && httpadapter.DeliveredOnAccept(ad, hc)}
 		case httpadapter.Unknown:
 			m.log.Warn("provider call outcome unknown; not resending", "message_id", job.ID, "connection_id", c.ID,
 				"adapter", c.Adapter, "error_code", res.ErrorCode, "err", res.Error)

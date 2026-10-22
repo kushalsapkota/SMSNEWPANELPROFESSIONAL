@@ -42,6 +42,11 @@ type Config struct {
 	ConfigReloadInterval time.Duration // ENGINE_CONFIG_RELOAD_INTERVAL, default 60s
 	ConfigDebounce       time.Duration // ENGINE_CONFIG_DEBOUNCE, default 200ms
 	ConfigMaxDebounce    time.Duration // ENGINE_CONFIG_MAX_DEBOUNCE, default 2s
+	// CFG_INVALIDATE_CHANNEL: Redis pub/sub channel for config invalidation. Must match the
+	// api's CFG_INVALIDATE_CHANNEL. Default "cfg:invalidate" (store.InvalidateChannel). Set a
+	// unique value per stack when several stacks share one Redis server, so each only reacts to
+	// its own invalidations.
+	ConfigInvalidateChannel string
 
 	// Billing
 	BalanceSyncInterval time.Duration // ENGINE_BALANCE_SYNC_INTERVAL, default 2s
@@ -121,6 +126,8 @@ func LoadFrom(getenv Getenv) (*Config, error) {
 		ConfigReloadInterval: l.dur("ENGINE_CONFIG_RELOAD_INTERVAL", 60*time.Second, time.Second),
 		ConfigDebounce:       l.dur("ENGINE_CONFIG_DEBOUNCE", 200*time.Millisecond, time.Millisecond),
 		ConfigMaxDebounce:    l.dur("ENGINE_CONFIG_MAX_DEBOUNCE", 2*time.Second, time.Millisecond),
+		// Default kept in sync with store.InvalidateChannel ("cfg:invalidate").
+		ConfigInvalidateChannel: l.str("CFG_INVALIDATE_CHANNEL", "cfg:invalidate"),
 
 		BalanceSyncInterval: l.dur("ENGINE_BALANCE_SYNC_INTERVAL", 2*time.Second, 10*time.Millisecond),
 		BalanceFullSyncEach: l.dur("ENGINE_BALANCE_FULL_SYNC_INTERVAL", 60*time.Second, time.Second),

@@ -144,7 +144,7 @@ func wantOutcome(t *testing.T, r SendResult, o Outcome, code string) {
 // --- catalogue -----------------------------------------------------------------
 
 func TestCatalogue(t *testing.T) {
-	want := []string{"sparrow_v2", "aakash_v3", "aakash_v4", "swift_smartsms", "messengernepal", "twozero", "nestsms", "bulletsms", "bitmoro", "generic_http"}
+	want := []string{"sparrow_v2", "aakash_v3", "aakash_v4", "swift_smartsms", "messengernepal", "twozero", "nestsms", "bulletsms", "bitmoro", "kavrelisms", "generic_http"}
 	cat := Catalogue()
 	if len(cat) != len(want) {
 		t.Fatalf("catalogue has %d adapters", len(cat))
@@ -354,6 +354,60 @@ func TestSparrow(t *testing.T) {
 	if b.Balance != "1520" || b.Error != "" || f.last(t).Method != "GET" || !strings.Contains(f.last(t).Query, "token=") {
 		t.Fatalf("balance %+v", b)
 	}
+}
+
+func TestKavreliSMS(t *testing.T) {
+	f := newFake(t, func(r rec) reply {
+		switch r.form(t).Get("mobile") {
+		case "9841234567":
+			return reply{status: 200, body: `{"status":"success","message":"SMS sent successfully."}`}
+		case "9800000000":
+			// 2xx body that reports an error → rejection.
+			return reply{status: 200, body: `{"status":"error","message":"insufficient credits"}`}
+		}
+		return reply{status: 400, body: `{"status":"error","message":"Missing mobile or message parameter."}`}
+	})
+	// No credentials: the page is called with just mobile and message.
+	c := conn(t, "kavrelisms", nil, map[string]any{"base_url": f.srv.URL + "/page.aspx"})
+
+	r := send(t, "kavrelisms", c, msg())
+	wantOutcome(t, r, Accepted, "")
+	if r.ProviderID() != "" {
+		t.Fatal("kavrelisms returns no id")
+	}
+	// Accept is the delivery signal: messages are recorded DELIVERED, not NODLR.
+	if EffectiveDLRMode(Get("kavrelisms"), c) != DLRNone || !DeliveredOnAccept(Get("kavrelisms"), c) {
+		t.Fatal("kavrelisms should have no DLR and deliver on accept")
+	}
+	req := f.last(t)
+	fv := req.form(t)
+	if req.Method != "POST" || req.Path != "/page.aspx" ||
+		!strings.HasPrefix(req.Header.Get("Content-Type"), "application/x-www-form-urlencoded") ||
+		fv.Get("mobile") != "9841234567" || fv.Get("message") != "Hello नमस्ते" {
+		t.Fatalf("request %+v form %v", req, fv)
+	}
+
+	m := msg()
+	m.To = "9779800000000"
+	r = send(t, "kavrelisms", c, m)
+	wantOutcome(t, r, Rejected, "PROVIDER_ERROR")
+
+	m.To = "9779811111111"
+	r = send(t, "kavrelisms", c, m)
+	wantOutcome(t, r, Rejected, "HTTP_400")
+
+	// Non-Nepali destination is rejected before any request.
+	before := f.count()
+	m.To = "14155550123"
+	r = send(t, "kavrelisms", c, m)
+	wantOutcome(t, r, Rejected, "DESTINATION_NOT_SUPPORTED")
+	if f.count() != before {
+		t.Fatal("no request should be sent for a non-NP number")
+	}
+
+	// Missing base URL is a config error.
+	c2 := conn(t, "kavrelisms", nil, map[string]any{})
+	wantOutcome(t, send(t, "kavrelisms", c2, msg()), Rejected, "BAD_CONFIG")
 }
 
 // --- Aakash --------------------------------------------------------------------

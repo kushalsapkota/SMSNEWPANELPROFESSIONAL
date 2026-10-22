@@ -65,6 +65,9 @@ func (f *fakeSMPP) Sessions() []server.SessionInfo {
 	return []server.SessionInfo{{ID: "s1", OrgID: "o1", SystemID: "sys", BindType: pdu.BindTransceiver, RemoteAddr: "1.2.3.4:5", BoundSince: time.Unix(0, 0)}}
 }
 func (f *fakeSMPP) Kick(org string) int { f.kicked = append(f.kicked, org); return 2 }
+func (f *fakeSMPP) Events(int) []server.BindEvent {
+	return []server.BindEvent{{Time: time.Unix(0, 0), Type: "bound", SystemID: "sys", OrgID: "o1", RemoteAddr: "1.2.3.4:5"}}
+}
 
 type fakeBal struct{ calls []string }
 

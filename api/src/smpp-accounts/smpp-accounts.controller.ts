@@ -49,4 +49,10 @@ export class SmppAccountsController {
   password(@Param('id', UuidPipe) id: string, @Body(new ZodPipe(passwordSchema)) body: z.infer<typeof passwordSchema>) {
     return this.accounts.rotatePassword(id, body.password);
   }
+
+  /** Reveal system_id + bind password so the parent, admin or the org can copy the connection. Audited. */
+  @Get(':id/credentials')
+  credentials(@Param('id', UuidPipe) id: string) {
+    return this.accounts.credentials(id);
+  }
 }

@@ -18,6 +18,15 @@ describe('config', () => {
     void _omit;
     expect(envSchema.parse(rest).CFG_INVALIDATE_CHANNEL).toBe('cfg:invalidate');
   });
+  it('rejects placeholder and low-entropy secrets', () => {
+    // Long enough, but a known placeholder.
+    expect(() => loadConfig({ ...process.env, JWT_SECRET: 'changeme-changeme-changeme-chang' })).toThrow(/JWT_SECRET/);
+    // Long enough, but almost no distinct characters.
+    expect(() => loadConfig({ ...process.env, JWT_SECRET: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' })).toThrow(/JWT_SECRET/);
+    expect(() => loadConfig({ ...process.env, INTERNAL_TOKEN: 'secret-secret-secret' })).toThrow(/INTERNAL_TOKEN/);
+    // A realistic random secret is accepted.
+    expect(() => loadConfig({ ...process.env, JWT_SECRET: 'b1946ac92492d2347c6235b4d2611184f5a1b2c3' })).not.toThrow();
+  });
 });
 
 describe('crypto (CONTRACTS §2)', () => {

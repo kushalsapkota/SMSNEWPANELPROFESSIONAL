@@ -41,6 +41,9 @@ type BindRequest struct {
 	AddrTON, AddrNPI uint8
 	AddressRange     string
 	RemoteAddr       net.Addr // for IP whitelisting
+	// Reason is set by the Authenticator on rejection to a human-readable cause
+	// (e.g. "SMPP access is disabled for this account") for the bind-event log.
+	Reason string
 }
 
 // Identity is the authenticated principal of a session.
@@ -211,7 +214,10 @@ type Config struct {
 	OnIncomplete func(IncompleteMessage)  // expired multipart sets
 	OnBind       func(SessionInfo)        // after a successful bind
 	OnUnbind     func(SessionInfo, error) // a bound session ended
-	Logger       *slog.Logger
+	// BindEventLogSize caps the recent bind-event ring buffer (accept/reject/
+	// unbind) exposed via Server.Events; 0 = default 2000.
+	BindEventLogSize int
+	Logger           *slog.Logger
 }
 
 func (c Config) withDefaults() (Config, error) {
@@ -251,6 +257,83 @@ var (
 	ErrNoSession    = errors.New("smpp server: no bound receiver session for system_id")
 )
 
+// BindEvent is one entry in the server's recent bind-event log (accepted,
+// rejected — with reason — or unbound). Exposed for monitoring.
+type BindEvent struct {
+	Time       time.Time
+	Type       string // "bound", "rejected", "unbound"
+	SystemID   string
+	OrgID      string
+	RemoteAddr string
+	BindType   string
+	Status     string // SMPP command_status word for a rejection; "" otherwise
+	Reason     string
+	SessionID  string
+}
+
+// bindEventLog is a fixed-size, concurrency-safe ring buffer of BindEvents.
+type bindEventLog struct {
+	mu   sync.Mutex
+	buf  []BindEvent
+	next int
+	full bool
+}
+
+func newBindEventLog(capacity int) *bindEventLog {
+	if capacity <= 0 {
+		capacity = 2000
+	}
+	return &bindEventLog{buf: make([]BindEvent, capacity)}
+}
+
+func (l *bindEventLog) add(ev BindEvent) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.buf[l.next] = ev
+	l.next = (l.next + 1) % len(l.buf)
+	if l.next == 0 {
+		l.full = true
+	}
+}
+
+// snapshot returns up to limit events, newest first (0 = all held).
+func (l *bindEventLog) snapshot(limit int) []BindEvent {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := l.next
+	start := 0
+	if l.full {
+		n = len(l.buf)
+		start = l.next
+	}
+	out := make([]BindEvent, 0, n)
+	for i := n - 1; i >= 0; i-- { // newest first
+		out = append(out, l.buf[(start+i)%len(l.buf)])
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
+// statusReason gives a generic reason when the Authenticator set none.
+func statusReason(st pdu.CommandStatus) string {
+	switch st {
+	case pdu.ESME_RINVSYSID:
+		return "unknown system_id"
+	case pdu.ESME_RINVPASWD:
+		return "invalid password"
+	case pdu.ESME_RALYBND:
+		return "already bound on this connection"
+	case pdu.ESME_RSYSERR:
+		return "server error"
+	case pdu.ESME_RBINDFAIL:
+		return "bind failed"
+	default:
+		return st.String()
+	}
+}
+
 // Server is the SMPP SMSC. Safe for concurrent use.
 type Server struct {
 	cfg Config
@@ -269,7 +352,11 @@ type Server struct {
 	concat *reassembler
 	nextID atomic.Uint64
 	wg     sync.WaitGroup
+	events *bindEventLog
 }
+
+// Events returns the most recent bind events, newest first (0 = all held).
+func (s *Server) Events(limit int) []BindEvent { return s.events.snapshot(limit) }
 
 // New validates cfg and creates a Server (not yet listening).
 func New(cfg Config) (*Server, error) {
@@ -287,6 +374,7 @@ func New(cfg Config) (*Server, error) {
 		conns:     map[*conn]struct{}{},
 		bySystem:  map[string]map[*conn]struct{}{},
 		rr:        map[string]uint64{},
+		events:    newBindEventLog(cfg.BindEventLogSize),
 	}
 	s.concat = newReassembler(s)
 	return s, nil
@@ -394,8 +482,18 @@ func (s *Server) accept(nc net.Conn) {
 		<-c.sess.Done()
 		c.bindTimer.Stop()
 		s.remove(c)
-		if info, ok := c.boundInfo(); ok && s.cfg.OnUnbind != nil {
-			s.cfg.OnUnbind(info, c.sess.Err())
+		if info, ok := c.boundInfo(); ok {
+			reason := ""
+			if err := c.sess.Err(); err != nil {
+				reason = err.Error()
+			}
+			s.events.add(BindEvent{
+				Time: time.Now(), Type: "unbound", SystemID: info.SystemID, OrgID: info.OrgID,
+				RemoteAddr: info.RemoteAddr, BindType: info.BindType.String(), SessionID: info.ID, Reason: reason,
+			})
+			if s.cfg.OnUnbind != nil {
+				s.cfg.OnUnbind(info, c.sess.Err())
+			}
 		}
 		<-finished
 	}()
@@ -577,6 +675,22 @@ func (s *Server) HasReceiverFor(orgID, systemID string) bool {
 		}
 	}
 	return false
+}
+
+// ReceiverCountFor reports how many bound, delivery-ready RX/TRX sessions
+// systemID has for orgID ("" = any organization). It uses the same readiness
+// predicate as delivery, so a non-zero count means that many sessions are
+// eligible to receive deliver_sm right now.
+func (s *Server) ReceiverCountFor(orgID, systemID string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for c := range s.bySystem[systemID] {
+		if c.receives(orgID) {
+			n++
+		}
+	}
+	return n
 }
 
 // ReceiverKey identifies a bound receiver (RX/TRX) session owner.

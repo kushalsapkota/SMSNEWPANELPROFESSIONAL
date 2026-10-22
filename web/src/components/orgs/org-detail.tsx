@@ -21,7 +21,7 @@ import { api, qk } from "@/lib/api";
 import { BalanceTab } from "./balance-tab";
 import { ChannelsTab } from "./channels-tab";
 import { KIND, type OrgKind } from "./kind";
-import { LoginAsButton, SuspendActivateButton } from "./org-actions";
+import { DeleteOrgButton, LoginAsButton, SuspendActivateButton } from "./org-actions";
 import { OrgsTable } from "./orgs-table";
 import { OverviewTab } from "./overview-tab";
 import { RoutesTab } from "./routes-tab";
@@ -81,6 +81,7 @@ export function OrgDetailView({ orgId, kind }: { orgId: string; kind: OrgKind })
           <>
             <LoginAsButton org={org} />
             <SuspendActivateButton org={org} kind={kind} />
+            <DeleteOrgButton org={org} kind={kind} />
           </>
         }
       />

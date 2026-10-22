@@ -251,6 +251,22 @@ type DLRModer interface {
 	DLRMode(c *Conn) string
 }
 
+// AcceptIsDelivery is implemented by adapters that have no delivery reports
+// and whose successful submit is itself the delivery signal (the provider
+// only answers "accepted", and that means the handset was reached). A
+// message sent through such a connection is recorded DELIVERED on accept
+// instead of staying "Sent (provider gives no delivery report)".
+type AcceptIsDelivery interface {
+	AcceptIsDelivery(c *Conn) bool
+}
+
+// DeliveredOnAccept reports whether a accepted message on connection c
+// should be finalized as DELIVERED (see AcceptIsDelivery).
+func DeliveredOnAccept(a Adapter, c *Conn) bool {
+	d, ok := a.(AcceptIsDelivery)
+	return ok && d.AcceptIsDelivery(c)
+}
+
 // --- registry ----------------------------------------------------------------
 
 var registry = map[string]Adapter{}
@@ -272,7 +288,7 @@ func Catalogue() []Info {
 }
 
 var order = []string{"sparrow_v2", "aakash_v3", "aakash_v4", "swift_smartsms", "messengernepal", "twozero",
-	"nestsms", "bulletsms", "bitmoro", "generic_http"}
+	"nestsms", "bulletsms", "bitmoro", "kavrelisms", "generic_http"}
 
 func rank(id string) int {
 	for i, x := range order {

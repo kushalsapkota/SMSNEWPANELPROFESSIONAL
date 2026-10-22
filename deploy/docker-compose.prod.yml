@@ -163,6 +163,8 @@ services:
       ENGINE_HTTP_ADDR: ":8081"
       ENGINE_SMPP_ADDR: ":2775"
       ENGINE_METRICS_ADDR: ":9100"
+      # Must match the api's value below (set a unique one per stack if sharing a Redis server).
+      CFG_INVALIDATE_CHANNEL: ${CFG_INVALIDATE_CHANNEL:-cfg:invalidate}
       ENGINE_DB_MAX_CONNS: ${ENGINE_DB_MAX_CONNS:-20}
       ENGINE_SMPP_MAX_SESSIONS: ${ENGINE_SMPP_MAX_SESSIONS:-5000}
       ENGINE_SMPP_SYSTEM_ID: ${ENGINE_SMPP_SYSTEM_ID:-SMSGW}
@@ -214,6 +216,10 @@ services:
       TOTP_ISSUER: ${TOTP_ISSUER:-SMS Gateway}
       DB_POOL_MAX: ${API_DB_POOL_MAX:-20}
       PUBLIC_API_RATE_LIMIT: ${PUBLIC_API_RATE_LIMIT:-100}
+      LOGIN_RATE_LIMIT: ${LOGIN_RATE_LIMIT:-20}
+      LOGIN_RATE_WINDOW_S: ${LOGIN_RATE_WINDOW_S:-60}
+      # Must match the engine's value above.
+      CFG_INVALIDATE_CHANNEL: ${CFG_INVALIDATE_CHANNEL:-cfg:invalidate}
       CAMPAIGN_WORKER_INTERVAL_MS: ${CAMPAIGN_WORKER_INTERVAL_MS:-1000}
       ALERTS_INTERVAL_MS: ${ALERTS_INTERVAL_MS:-60000}
       LEDGER_RECONCILE_INTERVAL_MS: ${LEDGER_RECONCILE_INTERVAL_MS:-30000}
@@ -224,7 +230,21 @@ services:
       SMTP_PASS: ${SMTP_PASS:-}
       SMTP_FROM: ${SMTP_FROM:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
-      SWAGGER_ENABLED: ${SWAGGER_ENABLED:-1}
+      SWAGGER_ENABLED: ${SWAGGER_ENABLED:-0}
+      # Geo-IP for the live SMPP sessions monitor. GEOIP_ENABLED=0 keeps every bind IP in-house.
+      GEOIP_ENABLED: ${GEOIP_ENABLED:-1}
+      GEOIP_ENDPOINT: ${GEOIP_ENDPOINT:-}
+      GEOIP_CACHE_TTL_S: ${GEOIP_CACHE_TTL_S:-604800}
+      # Host firewall GUI (admin): unix socket to the firewall-agent. Empty token = feature off.
+      FW_AGENT_SOCKET: /run/fwagent/agent.sock
+      FW_AGENT_TOKEN: ${FW_AGENT_TOKEN:-}
+      # Host domain/vhost manager (admin): unix socket to the host domain-agent (systemd).
+      # Empty token = feature off. The socket dir is bind-mounted from the host below.
+      DOMAIN_AGENT_SOCKET: /run/domainagent/agent.sock
+      DOMAIN_AGENT_TOKEN: ${DOMAIN_AGENT_TOKEN:-}
+    volumes:
+      - fwagent_run:/run/fwagent
+      - /run/domainagent:/run/domainagent
     ports:
       - "${PUBLISH_ADDR:-127.0.0.1}:${API_PUBLIC_PORT:-3000}:3000"
     healthcheck:
@@ -316,6 +336,39 @@ services:
     networks: [backend]
     logging: *logging
 
+  # Privileged host-firewall agent (admin Firewall GUI). Behind the `firewall` profile, so it only
+  # starts when you opt in (set FW_AGENT_TOKEN and run with --profile firewall). It needs the host
+  # network namespace + NET_ADMIN to program the host's nftables; it touches only the `inet smsgw`
+  # table and never closes the SSH/panel/SMPP ports. Deploying it changes nothing until an admin
+  # enables and commits rules in the panel (every apply auto-reverts in 60s otherwise).
+  firewall-agent:
+    build:
+      context: ..
+      dockerfile: deploy/firewall-agent/Dockerfile
+    image: ${IMAGE_PREFIX:-smsgw}/firewall-agent:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    profiles: ["firewall"]
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+    environment:
+      # Profile-gated service, so this is a plain default (not a required secret). Set it in
+      # deploy/.env before starting the profile; the agent refuses to run with an empty token.
+      FW_AGENT_TOKEN: ${FW_AGENT_TOKEN:-}
+      FW_REVERT_SECONDS: ${FW_REVERT_SECONDS:-60}
+      FW_PROTECTED_PORTS: ${FW_PROTECTED_PORTS:-2775,3775}
+      FW_AGENT_SOCKET: /run/fwagent/agent.sock
+      FW_STATE_FILE: /var/lib/fwagent/state.json
+    volumes:
+      - fwagent_run:/run/fwagent
+      - fwagent_state:/var/lib/fwagent
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /run/fwagent/agent.sock"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging: *logging
+
 networks:
   data:
     internal: true
@@ -326,3 +379,5 @@ networks:
 volumes:
   pg_data:
   redis_data:
+  fwagent_run:
+  fwagent_state:

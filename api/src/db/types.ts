@@ -67,6 +67,9 @@ export const LEDGER_TYPES = ['TOPUP', 'DEDUCT', 'ADJUSTMENT', 'REFUND', 'USAGE_S
 export type LedgerType = (typeof LEDGER_TYPES)[number];
 export const SENDER_STATUSES = ['PENDING', 'APPROVED', 'REJECTED'] as const;
 export type SenderStatus = (typeof SENDER_STATUSES)[number];
+
+export const CONTENT_STATUSES = ['PENDING', 'APPROVED', 'REJECTED'] as const;
+export type ContentStatus = (typeof CONTENT_STATUSES)[number];
 export const CAMPAIGN_STATUSES = ['DRAFT', 'SCHEDULED', 'RUNNING', 'PAUSED', 'COMPLETED', 'CANCELLED', 'FAILED'] as const;
 export type CampaignStatus = (typeof CAMPAIGN_STATUSES)[number];
 export const MULTIPART_MODES = ['UDH', 'SAR', 'PAYLOAD'] as const;
@@ -87,6 +90,7 @@ export interface OrganizationsTable {
   api_enabled: ColumnType<boolean, boolean | undefined, boolean>;
   smpp_enabled: ColumnType<boolean, boolean | undefined, boolean>;
   web_enabled: ColumnType<boolean, boolean | undefined, boolean>;
+  content_approval_required: ColumnType<boolean, boolean | undefined, boolean>;
   max_tps: ColumnType<number, number | undefined, number>;
   daily_limit: number | null;
   monthly_limit: number | null;
@@ -294,6 +298,8 @@ export interface SmppAccountsTable {
   org_id: string;
   system_id: string;
   password_hash: string;
+  /** 008: app-encrypted copy of the bind password for display/copy (NULL for pre-008 accounts). */
+  password_enc: string | null;
   /** bind_type[]: select with sql`allowed_bind_types::text[]` — pg returns enum arrays as raw literals. */
   allowed_bind_types: ColumnType<BindType[], BindType[] | undefined, BindType[]>;
   max_binds: ColumnType<number, number | undefined, number>;
@@ -488,6 +494,33 @@ export interface WebhookDeliveriesTable {
   created_at: DefaultTimestamp;
 }
 
+// Per-client content pre-approval allow-list (db/migrations/010). A client
+// whose organizations.content_approval_required is on may only send content
+// that has an APPROVED row here; a SUPER_ADMIN reviews.
+export interface ApprovedContentTable {
+  id: Generated<string>;
+  org_id: string;
+  content: string;
+  status: ColumnType<ContentStatus, ContentStatus | undefined, ContentStatus>;
+  note: string | null;
+  reviewed_by: string | null;
+  reviewed_at: Timestamp | null;
+  created_at: DefaultTimestamp;
+}
+
+// Single-row global operator kill switches (db/migrations/009). all_enabled is
+// the master; the others gate one channel/mode. Admin-only (RLS).
+export interface ServiceSwitchesTable {
+  id: ColumnType<boolean, boolean | undefined, never>;
+  all_enabled: ColumnType<boolean, boolean | undefined, boolean>;
+  http_api_enabled: ColumnType<boolean, boolean | undefined, boolean>;
+  smpp_enabled: ColumnType<boolean, boolean | undefined, boolean>;
+  bulk_enabled: ColumnType<boolean, boolean | undefined, boolean>;
+  note: string | null;
+  updated_at: DefaultTimestamp;
+  updated_by: string | null;
+}
+
 // ---------------------------------------------------------------------------
 // Database
 // ---------------------------------------------------------------------------
@@ -519,6 +552,8 @@ export interface DB {
   campaign_recipients: CampaignRecipientsTable;
   notification_settings: NotificationSettingsTable;
   webhook_deliveries: WebhookDeliveriesTable;
+  service_switches: ServiceSwitchesTable;
+  approved_content: ApprovedContentTable;
 }
 
 export type Organization = Selectable<OrganizationsTable>;
@@ -533,6 +568,7 @@ export type Route = Selectable<RoutesTable>;
 export type RouteTemplate = Selectable<RouteTemplatesTable>;
 export type OrgRouteAssignment = Selectable<OrgRouteAssignmentsTable>;
 export type SenderId = Selectable<SenderIdsTable>;
+export type ApprovedContent = Selectable<ApprovedContentTable>;
 export type ApiKey = Selectable<ApiKeysTable>;
 export type SmppAccount = Selectable<SmppAccountsTable>;
 export type IpWhitelist = Selectable<IpWhitelistsTable>;

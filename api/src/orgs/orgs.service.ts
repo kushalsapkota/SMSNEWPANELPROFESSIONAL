@@ -261,13 +261,115 @@ export class OrgsService {
   }
 
   async channels(id: string, input: ChannelsInput) {
-    const target = await this.scope.requireChild(id);
+    const auth = currentAuth();
+    // SUPER_ADMIN may toggle channels on ANY org (including a client of a reseller) — e.g. stop
+    // SMPP for one client in one click; a reseller only on its own direct clients.
+    const target = auth.role === 'SUPER_ADMIN' ? await this.scope.getOrg(id, 'read') : await this.scope.requireChild(id);
     if (Object.keys(input).length === 0) throw AppError.invalid('Nothing to update');
     return this.db.tenant(async (trx) => {
       const before = await trx.selectFrom('organizations').selectAll().where('id', '=', id).forUpdate().executeTakeFirstOrThrow();
       // SMPP sessions need SMPP *and* sending rights (CONTRACTS §4: SENDING_DISABLED refuses binds).
       const kick = (input.smpp_enabled === false && before.smpp_enabled) || (input.sending_enabled === false && before.sending_enabled);
       return this.updateState(target, input, `${roleWord(target)}.channels`, kick);
+    });
+  }
+
+  /**
+   * SUPER_ADMIN-only: turn per-client content pre-approval on/off for any org. When on, the client
+   * may only send content a SUPER_ADMIN has approved (engine policy.CheckApprovedContent). No kick:
+   * it gates submits, not binds.
+   */
+  async contentApproval(id: string, required: boolean) {
+    const target = await this.scope.getOrg(id, 'read');
+    return this.updateState(target, { content_approval_required: required }, 'org.content_approval', false);
+  }
+
+  /**
+   * Deletes a child org. Default is a reversible *close* (status CLOSED, all channels off, every
+   * session revoked) — the org disappears from day-to-day use but its history and billing stay and
+   * `activate` brings it back. `purge: true` is a permanent hard delete: it needs the org to be
+   * closed/suspended first and to have no sub-orgs, then cascades away users, balances, SMPP
+   * accounts, API keys, webhooks, etc. (message history and audit logs are kept on purpose).
+   */
+  async remove(id: string, opts: { purge?: boolean; reason?: string } = {}) {
+    const target = await this.scope.requireChild(id);
+    if (!opts.purge) {
+      return this.db.tenant(async (trx) => {
+        const before = await trx.selectFrom('organizations').selectAll().where('id', '=', target.id).forUpdate().executeTakeFirstOrThrow();
+        const after = await trx
+          .updateTable('organizations')
+          .set({
+            status: 'CLOSED',
+            suspended_reason: opts.reason ?? 'Closed by parent organization',
+            sending_enabled: false,
+            api_enabled: false,
+            smpp_enabled: false,
+            web_enabled: false,
+          })
+          .where('id', '=', target.id)
+          .returningAll()
+          .executeTakeFirstOrThrow();
+        // Log everyone out: this org's own users, plus anyone impersonating into it.
+        await trx
+          .updateTable('refresh_tokens')
+          .set({ revoked_at: new Date(), revoked_reason: 'org_closed' })
+          .where('revoked_at', 'is', null)
+          .where((eb) =>
+            eb.or([
+              eb('user_id', 'in', eb.selectFrom('users').select('id').where('org_id', '=', target.id)),
+              eb('impersonated_org_id', '=', target.id),
+            ]),
+          )
+          .execute();
+        await this.audit.record({
+          action: `${roleWord(target)}.close`,
+          entityType: 'organization',
+          entityId: target.id,
+          targetOrgId: target.id,
+          before: publicOrg(before),
+          after: publicOrg(after),
+        });
+        await this.invalidation.invalidate('organizations', target.id);
+        const childIds =
+          target.role === 'RESELLER'
+            ? (await trx.selectFrom('organizations').select('id').where('parent_id', '=', target.id).execute()).map((r) => r.id)
+            : [];
+        await this.db.afterCommit(async () => {
+          await this.engine.reloadConfigQuietly();
+          for (const orgId of [target.id, ...childIds]) await this.engine.kickQuietly(orgId);
+        });
+        return publicOrg(after);
+      });
+    }
+    // Permanent delete: guard against the two ways it silently loses data or fails.
+    if (target.status === 'ACTIVE') {
+      throw AppError.invalid(`Close this ${roleWord(target)} before permanently deleting it`);
+    }
+    const children = await this.db.tenant((trx) =>
+      trx.selectFrom('organizations').select((eb) => eb.fn.countAll<number>().as('n')).where('parent_id', '=', target.id).executeTakeFirst(),
+    );
+    if (Number(children?.n ?? 0) > 0) {
+      throw AppError.invalid(`Cannot permanently delete a ${roleWord(target)} that still has sub-organizations; delete those first`);
+    }
+    return this.db.tenant(async (trx) => {
+      const before = await trx.selectFrom('organizations').selectAll().where('id', '=', target.id).forUpdate().executeTakeFirstOrThrow();
+      // users / accounts_balance / balance_transactions / smpp_accounts / api_keys / webhooks /
+      // sender_ids / ip_whitelists / route assignments cascade via ON DELETE CASCADE; message_logs
+      // and audit_logs have no FK and are retained for history/compliance.
+      await trx.deleteFrom('organizations').where('id', '=', target.id).execute();
+      await this.audit.record({
+        action: `${roleWord(target)}.delete`,
+        entityType: 'organization',
+        entityId: target.id,
+        targetOrgId: target.id,
+        before: publicOrg(before),
+      });
+      await this.invalidation.invalidate('organizations', target.id);
+      await this.db.afterCommit(async () => {
+        await this.engine.reloadConfigQuietly();
+        await this.engine.kickQuietly(target.id);
+      });
+      return { id: target.id, deleted: true };
     });
   }
 
@@ -366,6 +468,26 @@ export class OrgsService {
       if (input.is_active === false) await this.revokeSessions(trx, userId, 'user_disabled');
       await this.audit.record({ action: 'user.update', entityType: 'user', entityId: userId, targetOrgId: orgId, before: publicUser(before), after: publicUser(after) });
       return publicUser(after);
+    });
+  }
+
+  /**
+   * Parent only: permanently deletes a user. You cannot delete yourself, and the last remaining
+   * user of an org cannot be removed (that would leave it with no login — close the org instead).
+   * The user's refresh tokens cascade away via FK.
+   */
+  async deleteUser(orgId: string, userId: string) {
+    const auth = currentAuth();
+    await this.scope.requireParentActor(orgId, 'Only the parent organization may delete users');
+    if (userId === auth.userId) throw AppError.invalid('You cannot delete yourself');
+    return this.db.tenant(async (trx) => {
+      const before = await trx.selectFrom('users').selectAll().where('id', '=', userId).where('org_id', '=', orgId).executeTakeFirst();
+      if (!before) throw AppError.notFound('User');
+      const [{ n }] = await trx.selectFrom('users').select((eb) => eb.fn.countAll<number>().as('n')).where('org_id', '=', orgId).execute();
+      if (Number(n) <= 1) throw AppError.invalid('Cannot delete the only user of an organization; close the organization instead');
+      await trx.deleteFrom('users').where('id', '=', userId).where('org_id', '=', orgId).execute();
+      await this.audit.record({ action: 'user.delete', entityType: 'user', entityId: userId, targetOrgId: orgId, before: publicUser(before) });
+      return { id: userId, deleted: true };
     });
   }
 

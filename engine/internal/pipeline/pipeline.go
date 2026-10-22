@@ -124,6 +124,7 @@ type Request struct {
 	CampaignID  string
 	RouteID     string // forced route (tester); must be assigned to the org
 	Test        bool   // tester: SUPER_ADMIN traffic is never billed
+	Bulk        bool   // batch / multi-recipient submission (gated by the bulk kill switch)
 
 	// SMPP only.
 	MessageID          string // id already returned / to be returned to the ESME ("" = generate)
@@ -176,6 +177,9 @@ func (p *Pipeline) Submit(ctx context.Context, req Request) (res *Result, err er
 	}
 
 	// 1. Org state and channel.
+	if err := policy.CheckSwitches(snap.Switches(), req.Channel, req.Bulk); err != nil {
+		return nil, err
+	}
 	org := snap.Org(req.OrgID)
 	if err := policy.CheckOrg(org, req.Channel); err != nil {
 		return nil, err
@@ -202,6 +206,9 @@ func (p *Pipeline) Submit(ctx context.Context, req Request) (res *Result, err er
 		return nil, err
 	}
 	if err := policy.CheckContent(snap, org.ID, req.Text); err != nil {
+		return nil, err
+	}
+	if err := policy.CheckApprovedContent(snap, org, req.Text); err != nil {
 		return nil, err
 	}
 

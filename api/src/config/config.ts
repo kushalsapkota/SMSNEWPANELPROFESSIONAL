@@ -30,6 +30,18 @@ const optionalString = z
   .optional()
   .transform((v) => (v === undefined || v.trim() === '' ? undefined : v.trim()));
 
+/** Common placeholder/example secrets that must never reach production. */
+const WEAK_SECRET_RE = /(changeme|change-me|secret|password|passw0rd|example|replace|placeholder|dummy|default|test1234|insecure|^0+$|^(.)\1+$)/i;
+
+/**
+ * Rejects secrets that pass a length check but are obviously weak: a well-known placeholder,
+ * a single repeated character, or too few distinct characters to carry real entropy.
+ */
+const strongSecret = (field: z.ZodString, minDistinct: number) =>
+  field.refine((v) => !WEAK_SECRET_RE.test(v) && new Set(v).size >= minDistinct, {
+    message: `looks weak or is a known placeholder; use a randomly generated value (needs >= ${minDistinct} distinct characters)`,
+  });
+
 const postgresUrl = z
   .string({ required_error: 'is required' })
   .min(1, 'is required')
@@ -42,7 +54,7 @@ export const envSchema = z.object({
     .string({ required_error: 'is required' })
     .min(1, 'is required')
     .refine((v) => /^rediss?:\/\//.test(v), 'must be a redis:// URL'),
-  INTERNAL_TOKEN: z.string({ required_error: 'is required' }).min(16, 'must be at least 16 characters'),
+  INTERNAL_TOKEN: strongSecret(z.string({ required_error: 'is required' }).min(16, 'must be at least 16 characters'), 10),
   ENGINE_URL: z
     .string({ required_error: 'is required' })
     .url('must be a URL')
@@ -50,7 +62,7 @@ export const envSchema = z.object({
   APP_ENC_KEY: z
     .string({ required_error: 'is required' })
     .refine((v) => Buffer.from(v, 'base64').length === 32, 'must be base64 of exactly 32 bytes'),
-  JWT_SECRET: z.string({ required_error: 'is required' }).min(32, 'must be at least 32 characters'),
+  JWT_SECRET: strongSecret(z.string({ required_error: 'is required' }).min(32, 'must be at least 32 characters'), 12),
 
   PORT: intWithDefault(3000, 1),
   /** Believe X-Forwarded-For at all (only from TRUSTED_PROXIES peers; see request.util clientIp). */
@@ -69,6 +81,9 @@ export const envSchema = z.object({
     }),
   ENGINE_TIMEOUT_MS: intWithDefault(5000, 100),
   TOTP_ISSUER: z.string().optional().default('SMS Gateway'),
+  // Domain used to auto-generate a client's login email in bulk create when none is given
+  // (e.g. "casino3" -> "casino3@clients.local"). Admins can still set an explicit email per row.
+  CLIENT_EMAIL_DOMAIN: z.string().trim().toLowerCase().optional().default('clients.local'),
   REFRESH_TOKEN_TTL_DAYS: intWithDefault(30, 1),
   LEDGER_RECONCILE_INTERVAL_MS: intWithDefault(30000, 0),
   DB_POOL_MAX: intWithDefault(20, 1),
@@ -85,6 +100,12 @@ export const envSchema = z.object({
   PUBLIC_API_RATE_LIMIT: intWithDefault(100, 1),
   /** api_keys.last_used_at is written at most once per key per this interval. */
   API_KEY_TOUCH_INTERVAL_MS: intWithDefault(60000, 0),
+
+  // Panel login brute-force protection (defense-in-depth; nginx also throttles /api/auth/login per IP).
+  /** Max login attempts per client IP per LOGIN_RATE_WINDOW_S window (fixed window in Redis). */
+  LOGIN_RATE_LIMIT: intWithDefault(20, 1),
+  /** Window length, in seconds, for LOGIN_RATE_LIMIT. */
+  LOGIN_RATE_WINDOW_S: intWithDefault(60, 1),
 
   // HTTP upstream connections (docs/providers/HTTP-CONNECTIONS-CONTRACT.md)
   /**
@@ -133,6 +154,37 @@ export const envSchema = z.object({
   ENGINE_METRICS_URL: optionalString,
   /** Serve Swagger UI at /api/docs (+ /api/docs-json). */
   SWAGGER_ENABLED: boolDefaultTrue,
+
+  // Geo-IP enrichment for the live SMPP sessions monitor (country/city/ISP of each bind IP).
+  /** Off → the monitor shows no location (no IP ever leaves this deployment). Default on. */
+  GEOIP_ENABLED: boolDefaultTrue,
+  /**
+   * Lookup URL template; `{ip}` is replaced with the (URL-encoded) bind IP. The default is the
+   * free, keyless ip-api.com. Point it at a self-hosted service to keep lookups in-house.
+   * Parsed for ip-api.com's field names (country, countryCode, city, isp) and ipinfo-style (loc/org).
+   */
+  GEOIP_ENDPOINT: z
+    .string()
+    .optional()
+    .transform((v) => (v && v.trim() !== '' ? v.trim() : 'http://ip-api.com/json/{ip}?fields=status,country,countryCode,city,isp,query')),
+  /** How long a resolved IP→location is cached in Redis (IPs are stable, so this can be long). */
+  GEOIP_CACHE_TTL_S: intWithDefault(604800, 60),
+
+  // Host firewall GUI (admin only). The API talks to the privileged firewall-agent container over
+  // a Unix socket on a shared volume. Empty FW_AGENT_TOKEN → the feature reports "not configured".
+  FW_AGENT_SOCKET: z
+    .string()
+    .optional()
+    .transform((v) => (v && v.trim() !== '' ? v.trim() : '/run/fwagent/agent.sock')),
+  FW_AGENT_TOKEN: optionalString,
+
+  // Domain/vhost manager (admin only). The API talks to the privileged host domain-agent (systemd)
+  // over a Unix socket (bind-mounted from the host). Empty DOMAIN_AGENT_TOKEN → "not configured".
+  DOMAIN_AGENT_SOCKET: z
+    .string()
+    .optional()
+    .transform((v) => (v && v.trim() !== '' ? v.trim() : '/run/domainagent/agent.sock')),
+  DOMAIN_AGENT_TOKEN: optionalString,
 });
 
 export type AppConfig = z.infer<typeof envSchema>;

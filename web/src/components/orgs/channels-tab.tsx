@@ -8,6 +8,7 @@ import { ConfirmDialog } from "@/components/shared/confirm-dialog";
 import { useApiMutation } from "@/hooks/use-api-mutation";
 import { api, qk } from "@/lib/api";
 import type { OrgDetail, UpdateChannelsRequest } from "@/lib/api/types";
+import { useSession } from "@/lib/auth/session";
 import type { OrgKind } from "./kind";
 
 type Flag = keyof UpdateChannelsRequest;
@@ -40,10 +41,17 @@ const FLAGS: Array<{ key: Flag; label: string; description: string; offWarning: 
 ];
 
 export function ChannelsTab({ org, kind }: { org: OrgDetail; kind: OrgKind }) {
+  const { role } = useSession();
   const [pendingOff, setPendingOff] = useState<Flag | null>(null);
+  const [approvalOn, setApprovalOn] = useState(false);
   const update = useApiMutation({
     mutationFn: (body: UpdateChannelsRequest) => api.orgs.updateChannels(org.id, body),
     success: "Channels updated",
+    invalidate: [qk.orgs.all],
+  });
+  const setApproval = useApiMutation({
+    mutationFn: (required: boolean) => api.orgs.setContentApproval(org.id, required),
+    success: "Content approval updated",
     invalidate: [qk.orgs.all],
   });
 
@@ -81,6 +89,24 @@ export function ChannelsTab({ org, kind }: { org: OrgDetail; kind: OrgKind }) {
             </div>
           );
         })}
+        {role === "SUPER_ADMIN" ? (
+          <div className="flex items-center justify-between gap-4 rounded-lg border border-dashed p-3">
+            <div className="space-y-0.5">
+              <Label htmlFor="content-approval">Require content approval</Label>
+              <p className="text-sm text-muted-foreground">
+                This account may only send message content a super admin has approved; anything else is rejected
+                (CONTENT_NOT_APPROVED). Review content on the Approved content page.
+              </p>
+            </div>
+            <Switch
+              id="content-approval"
+              checked={org.content_approval_required}
+              disabled={setApproval.isPending}
+              onCheckedChange={(v) => (v ? setApprovalOn(true) : setApproval.mutate(false))}
+            />
+          </div>
+        ) : null}
+
         <ConfirmDialog
           open={pendingOff !== null}
           onOpenChange={(o) => !o && setPendingOff(null)}
@@ -89,6 +115,18 @@ export function ChannelsTab({ org, kind }: { org: OrgDetail; kind: OrgKind }) {
           confirmLabel="Turn off"
           onConfirm={async () => {
             if (pendingOff) await update.mutateAsync({ [pendingOff]: false });
+          }}
+        />
+        <ConfirmDialog
+          open={approvalOn}
+          onOpenChange={(o) => !o && setApprovalOn(false)}
+          title="Require content approval?"
+          destructive={false}
+          description="From now on this account can only send message content that a super admin has approved. Approve its content on the Approved content page, or it won't be able to send."
+          confirmLabel="Require approval"
+          onConfirm={async () => {
+            await setApproval.mutateAsync(true);
+            setApprovalOn(false);
           }}
         />
       </CardContent>

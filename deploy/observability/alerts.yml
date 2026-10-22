@@ -1,0 +1,76 @@
+groups:
+  - name: sms-gateway-engine
+    rules:
+      - alert: EngineDown
+        expr: up{job="sms-engine"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "SMS engine is not scrapeable"
+          description: "Prometheus cannot reach the engine /metrics endpoint for 2m. Sending is likely down."
+
+      - alert: UpstreamConnectionDown
+        expr: smsgw_upstream_connection_up == 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Upstream carrier connection down: {{ $labels.name }}"
+          description: "Connection {{ $labels.name }} ({{ $labels.connection }}) has reported down for 5m. Routes depending on it will fail over or fail."
+
+      - alert: CDRWriteQueueBacklog
+        expr: smsgw_cdr_queue_length > 1000
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "CDR write queue backing up"
+          description: "smsgw_cdr_queue_length has been above 1000 for 10m — the CDR writer is not keeping up and call records may be delayed or lost on restart."
+
+      - alert: CDRWriteErrors
+        expr: increase(smsgw_cdr_errors_total[15m]) > 0
+        for: 0m
+        labels: { severity: warning }
+        annotations:
+          summary: "CDR write errors"
+          description: "{{ $value }} CDR write errors in the last 15m. Message logs may be incomplete."
+
+      - alert: DispatchQueueBacklog
+        expr: smsgw_dispatch_queue_depth > 5000
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Dispatch queue depth high"
+          description: "smsgw_dispatch_queue_depth above 5000 for 10m — the dispatcher is behind; submit latency will climb."
+
+      - alert: ConfigReloadFailing
+        expr: increase(smsgw_config_reloads{result="failed"}[15m]) > 0
+        for: 0m
+        labels: { severity: warning }
+        annotations:
+          summary: "Engine config reloads are failing"
+          description: "The engine failed to reload config from Postgres in the last 15m; it is running on stale routes/rates/templates."
+
+      - alert: HighSubmitRejectRatio
+        expr: |
+          sum(rate(smsgw_submit_total{result!="accepted"}[10m]))
+            / clamp_min(sum(rate(smsgw_submit_total[10m])), 0.001) > 0.5
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "More than half of submits are being rejected"
+          description: "Over 50% of message submits have been rejected for 10m. Check balances, routing, sender IDs and blocklists."
+
+      - alert: DispatchFailoverSpike
+        expr: increase(smsgw_dispatch_failover_total[15m]) > 20
+        for: 0m
+        labels: { severity: warning }
+        annotations:
+          summary: "Upstream failovers spiking"
+          description: "{{ $value }} dispatch failovers in 15m — an upstream is flaky."
+
+      - alert: RefundSpike
+        expr: increase(smsgw_refunds_total[15m]) > 50
+        for: 0m
+        labels: { severity: warning }
+        annotations:
+          summary: "Refund volume spiking"
+          description: "{{ $value }} refunds in 15m — a large share of sends are failing after being billed."

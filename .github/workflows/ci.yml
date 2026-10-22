@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Fast checks with no database: type-check the TS, vet the Go, lint the web, static deploy checks.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.23" }
+      - name: Install shellcheck (for deploy static checks)
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Deploy static checks (compose/env/Dockerfile/scripts)
+        run: make test-deploy
+      - name: API type-check
+        run: cd api && npm ci --no-audit --no-fund && npm run lint
+      - name: Web lint + type-check
+        run: cd web && npm ci --no-audit --no-fund && npm run lint && npm run typecheck
+      - name: Engine go vet
+        run: cd engine && go vet ./...
+
+  # Full suite: DB schema, migrations, Lua, Go (-race), api e2e, web. Mirrors `make test`.
+  # The Makefile's DB targets use `su postgres` (peer auth) + login roles over localhost, and
+  # Redis on port 6399, so we set those up on the runner and run the suite as root.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.23" }
+      - name: Install Postgres 16, Redis, shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-16 postgresql-client-16 redis-server shellcheck || \
+            sudo apt-get install -y postgresql postgresql-client redis-server shellcheck
+      - name: Start Postgres (peer auth for the postgres user)
+        run: |
+          sudo pg_ctlcluster "$(ls /etc/postgresql)" main start || sudo systemctl start postgresql
+          for i in $(seq 1 30); do sudo -u postgres psql -c 'select 1' >/dev/null 2>&1 && break; sleep 1; done
+          sudo -u postgres psql -c 'select version()'
+      - name: Start Redis on 6399
+        run: redis-server --port 6399 --daemonize yes && redis-cli -p 6399 ping
+      - name: Install npm deps
+        run: |
+          cd api && npm ci --no-audit --no-fund && cd ..
+          cd web && npm ci --no-audit --no-fund && cd ..
+      - name: Run full test suite
+        # DB targets need root for `su postgres`; preserve PATH so go/node/npm resolve.
+        run: sudo env "PATH=$PATH" REDIS_PORT=6399 PGPORT=5432 make test

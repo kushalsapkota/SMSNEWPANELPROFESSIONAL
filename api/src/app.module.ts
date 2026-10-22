@@ -18,6 +18,10 @@ import { CryptoModule } from './crypto/crypto.service';
 import { DashboardModule } from './dashboard/dashboard.controller';
 import { DbModule } from './db/db.module';
 import { EngineModule } from './engine/engine-client.service';
+import { FirewallModule } from './firewall/firewall.module';
+import { DomainsModule } from './domains/domains.module';
+import { SwitchesModule } from './switches/switches.module';
+import { ApprovedContentModule } from './approved-content/approved-content.module';
 import { HealthModule } from './health/health.module';
 import { IpWhitelistModule } from './ip-whitelist/ip-whitelist.module';
 import { MessagesModule } from './messages/messages.module';
@@ -53,6 +57,10 @@ export const FEATURE_MODULES = [
   NotificationsModule,
   AuditLogsModule,
   MonitorModule,
+  FirewallModule,
+  DomainsModule,
+  SwitchesModule,
+  ApprovedContentModule,
   // part 2
   PublicApiModule,
   MessagesModule,

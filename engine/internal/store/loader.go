@@ -55,11 +55,13 @@ func LoadData(ctx context.Context, db interface {
 		{"org_route_assignments", loadAssignments},
 		{"route_templates", loadTemplates},
 		{"sender_ids", loadSenderIDs},
+		{"approved_content", loadApprovedContent},
 		{"smpp_accounts", loadSMPPAccounts},
 		{"ip_whitelists", loadIPRules},
 		{"webhooks", loadWebhooks},
 		{"blocked_numbers", loadBlockedNumbers},
 		{"blocked_keywords", loadBlockedKeywords},
+		{"service_switches", loadSwitches},
 	}
 	for _, st := range steps {
 		if err := st.fn(ctx, tx, d, cipher); err != nil {
@@ -73,7 +75,7 @@ func loadOrgs(ctx context.Context, q querier, d *Data, _ *crypto.Cipher) error {
 	rows, err := q.Query(ctx, `
 		SELECT o.id::text, o.role::text, coalesce(o.parent_id::text, ''), o.name, o.status::text,
 		       coalesce(o.suspended_reason, ''), o.sending_enabled, o.api_enabled, o.smpp_enabled,
-		       o.web_enabled, o.max_tps, coalesce(o.daily_limit, 0), coalesce(o.monthly_limit, 0),
+		       o.web_enabled, o.content_approval_required, o.max_tps, coalesce(o.daily_limit, 0), coalesce(o.monthly_limit, 0),
 		       coalesce(o.brand_name, ''), o.timezone, o.updated_at,
 		       e.is_active, e.can_send, e.can_api, e.can_smpp, e.effective_max_tps,
 		       ab.org_id IS NOT NULL, coalesce(ab.billing_mode::text, ''), coalesce(ab.balance_micros, 0),
@@ -90,7 +92,7 @@ func loadOrgs(ctx context.Context, q querier, d *Data, _ *crypto.Cipher) error {
 		var hasAcct bool
 		a := &Account{}
 		if err := rows.Scan(&o.ID, &o.Role, &o.ParentID, &o.Name, &o.Status, &o.SuspendedReason,
-			&o.SendingEnabled, &o.APIEnabled, &o.SMPPEnabled, &o.WebEnabled, &o.MaxTPS,
+			&o.SendingEnabled, &o.APIEnabled, &o.SMPPEnabled, &o.WebEnabled, &o.ContentApprovalRequired, &o.MaxTPS,
 			&o.DailyLimit, &o.MonthlyLimit, &o.BrandName, &o.Timezone, &o.UpdatedAt,
 			&o.Effective.IsActive, &o.Effective.CanSend, &o.Effective.CanAPI, &o.Effective.CanSMPP,
 			&o.Effective.EffectiveMaxTPS, &hasAcct, &a.BillingMode, &a.BalanceMicros,
@@ -385,6 +387,43 @@ func loadBlockedNumbers(ctx context.Context, q querier, d *Data, _ *crypto.Ciphe
 			return err
 		}
 		d.BlockedNumbers = append(d.BlockedNumbers, b)
+	}
+	return rows.Err()
+}
+
+func loadApprovedContent(ctx context.Context, q querier, d *Data, _ *crypto.Cipher) error {
+	rows, err := q.Query(ctx, `SELECT id::text, org_id::text, content, status::text FROM approved_content`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		a := &ApprovedContent{}
+		if err := rows.Scan(&a.ID, &a.OrgID, &a.Content, &a.Status); err != nil {
+			return err
+		}
+		d.ApprovedContent = append(d.ApprovedContent, a)
+	}
+	return rows.Err()
+}
+
+// loadSwitches reads the single-row global service_switches table. A
+// missing row leaves d.Switches nil, which the snapshot treats as all-on
+// (DefaultSwitches) — the kill switch must never cause an outage by its
+// absence.
+func loadSwitches(ctx context.Context, q querier, d *Data, _ *crypto.Cipher) error {
+	rows, err := q.Query(ctx, `SELECT all_enabled, http_api_enabled, smpp_enabled, bulk_enabled, updated_at
+		FROM service_switches ORDER BY id LIMIT 1`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		sw := &Switches{}
+		if err := rows.Scan(&sw.AllEnabled, &sw.HTTPAPIEnabled, &sw.SMPPEnabled, &sw.BulkEnabled, &sw.UpdatedAt); err != nil {
+			return err
+		}
+		d.Switches = sw
 	}
 	return rows.Err()
 }

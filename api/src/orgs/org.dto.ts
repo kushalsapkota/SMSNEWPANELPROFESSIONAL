@@ -12,6 +12,7 @@ export function publicOrg(o: Organization) {
     api_enabled: o.api_enabled,
     smpp_enabled: o.smpp_enabled,
     web_enabled: o.web_enabled,
+    content_approval_required: o.content_approval_required,
     max_tps: o.max_tps,
     daily_limit: o.daily_limit,
     monthly_limit: o.monthly_limit,

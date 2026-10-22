@@ -750,14 +750,15 @@ func (m *Manager) ack(e entry) {
 // --- per message -------------------------------------------------------------
 
 type attemptResult struct {
-	ids         []string // smsc ids by PDU index ("" = rejected or unknown)
-	failed      []int    // PDU indexes rejected
-	unknown     []int    // PDU indexes whose outcome is unknown (may have been accepted)
-	pdus        int
-	errCode     string
-	unknownCode string
-	abort       bool // shutdown before anything was written: leave pending
-	noDLR       bool // HTTP adapter without delivery reports (dlr_stat NODLR)
+	ids               []string // smsc ids by PDU index ("" = rejected or unknown)
+	failed            []int    // PDU indexes rejected
+	unknown           []int    // PDU indexes whose outcome is unknown (may have been accepted)
+	pdus              int
+	errCode           string
+	unknownCode       string
+	abort             bool // shutdown before anything was written: leave pending
+	noDLR             bool // HTTP adapter without delivery reports (dlr_stat NODLR)
+	deliveredOnAccept bool // noDLR adapter whose accept means delivered (record DELIVERED)
 }
 
 func (r *attemptResult) accepted() int { return r.pdus - len(r.failed) - len(r.unknown) }
@@ -1045,10 +1046,19 @@ func (m *Manager) succeed(job *pipeline.DispatchJob, c *store.Connection, r atte
 		code := r.unknownCode
 		upd.ErrorCode = &code
 	} else if r.noDLR && len(r.failed) == 0 {
-		// No delivery report will ever come: SUBMITTED is final for this
-		// message (never failed / refunded by anything later).
-		stat := NoDLRStat
-		upd.DLRStat = &stat
+		if r.deliveredOnAccept {
+			// This adapter has no DLR and a successful submit is itself the
+			// delivery signal: record DELIVERED now (no later DLR will come).
+			upd.Status = cdr.StatusDelivered
+			stat := "DELIVRD"
+			upd.DLRStat = &stat
+			upd.DLRReceivedAt = &now
+		} else {
+			// No delivery report will ever come: SUBMITTED is final for this
+			// message (never failed / refunded by anything later).
+			stat := NoDLRStat
+			upd.DLRStat = &stat
+		}
 	}
 	switch {
 	case len(r.failed) > 0:

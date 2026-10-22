@@ -2,10 +2,12 @@
 
 import { zodResolver } from "@hookform/resolvers/zod";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
-import { KeyRound, MoreHorizontal, Pencil, Plus, Trash2 } from "lucide-react";
+import { KeyRound, MoreHorizontal, Pencil, Plug, Plus, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
+import { SMPP_PORT, useSmppHost } from "@/components/developer/smpp-connection-info";
+import { CopyButton, CopyField } from "@/components/shared/copy-button";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -68,7 +70,17 @@ const passwordSchema = z.object({ password: smppPasswordSchema });
 type CreateValues = z.input<typeof createSchema>;
 type EditValues = z.input<typeof editSchema>;
 
-function CreateDialog({ open, onOpenChange, orgId }: { open: boolean; onOpenChange: (v: boolean) => void; orgId?: string }) {
+function CreateDialog({
+  open,
+  onOpenChange,
+  orgId,
+  onCreated,
+}: {
+  open: boolean;
+  onOpenChange: (v: boolean) => void;
+  orgId?: string;
+  onCreated?: (a: SmppAccount) => void;
+}) {
   const form = useForm<CreateValues, unknown, z.output<typeof createSchema>>({
     resolver: zodResolver(createSchema),
     defaultValues: { system_id: "", password: "", max_binds: 2, max_tps: null, allowed_bind_types: ["TX", "TRX"] },
@@ -81,9 +93,10 @@ function CreateDialog({ open, onOpenChange, orgId }: { open: boolean; onOpenChan
       ),
     success: (a) => `SMPP account ${a.system_id} created`,
     invalidate: [qk.smppAccounts.all, qk.orgs.all],
-    onSuccess: () => {
+    onSuccess: (a: SmppAccount) => {
       onOpenChange(false);
       form.reset();
+      onCreated?.(a);
     },
   });
   return (
@@ -199,6 +212,73 @@ function PasswordDialog({ account, onClose }: { account: SmppAccount | null; onC
   );
 }
 
+function ConnectionDialog({ account, onClose }: { account: SmppAccount | null; onClose: () => void }) {
+  const host = useSmppHost();
+  const q = useQuery({
+    queryKey: qk.smppAccounts.credentials(account?.id ?? ""),
+    queryFn: () => api.smppAccounts.credentials((account as SmppAccount).id),
+    enabled: !!account,
+    staleTime: 0,
+    gcTime: 0,
+  });
+  const cred = q.data;
+  const port = String(SMPP_PORT);
+  const allText = cred
+    ? `Host: ${host}\nPort: ${port}\nSystem ID: ${cred.system_id}\nPassword: ${cred.password ?? "(set a new password to reveal)"}`
+    : "";
+
+  return (
+    <Dialog open={!!account} onOpenChange={(v) => !v && onClose()}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>SMPP connection for {account?.system_id}</DialogTitle>
+          <DialogDescription>
+            Give these to the client to bind over SMPP 3.4. The password is shown to you and the administrator only.
+          </DialogDescription>
+        </DialogHeader>
+        {q.isLoading ? (
+          <p className="py-6 text-center text-sm text-muted-foreground">Loading credentials…</p>
+        ) : q.error ? (
+          <p className="py-6 text-center text-sm text-destructive">Couldn&apos;t load credentials.</p>
+        ) : cred ? (
+          <div className="space-y-4">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="space-y-1">
+                <p className="text-xs text-muted-foreground">Host / IP</p>
+                <CopyField value={host} />
+              </div>
+              <div className="space-y-1">
+                <p className="text-xs text-muted-foreground">Port</p>
+                <CopyField value={port} />
+              </div>
+              <div className="space-y-1">
+                <p className="text-xs text-muted-foreground">System ID (username)</p>
+                <CopyField value={cred.system_id} />
+              </div>
+              <div className="space-y-1">
+                <p className="text-xs text-muted-foreground">Password</p>
+                {cred.password ? (
+                  <CopyField value={cred.password} />
+                ) : (
+                  <p className="rounded-md border bg-muted/40 px-3 py-2 text-sm text-muted-foreground">
+                    Set a new password to reveal it here.
+                  </p>
+                )}
+              </div>
+            </div>
+            <DialogFooter>
+              <Button type="button" variant="outline" onClick={onClose}>
+                Close
+              </Button>
+              <CopyButton value={allText} label="Copy all" showLabel variant="default" />
+            </DialogFooter>
+          </div>
+        ) : null}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 export function SmppAccountsPanel({ orgId }: { orgId?: string }) {
   const t = useTableState({ prefix: "smpp", defaultPageSize: 10 });
   const params = { ...t.params, org_id: orgId };
@@ -210,6 +290,7 @@ export function SmppAccountsPanel({ orgId }: { orgId?: string }) {
   const [creating, setCreating] = useState(false);
   const [editing, setEditing] = useState<SmppAccount | null>(null);
   const [pwd, setPwd] = useState<SmppAccount | null>(null);
+  const [conn, setConn] = useState<SmppAccount | null>(null);
   const [deleting, setDeleting] = useState<SmppAccount | null>(null);
 
   const toggle = useApiMutation({
@@ -261,6 +342,9 @@ export function SmppAccountsPanel({ orgId }: { orgId?: string }) {
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end">
+            <DropdownMenuItem onSelect={() => setConn(a)}>
+              <Plug className="mr-2 h-4 w-4" /> Connection details
+            </DropdownMenuItem>
             <DropdownMenuItem onSelect={() => setEditing(a)}>
               <Pencil className="mr-2 h-4 w-4" /> Edit
             </DropdownMenuItem>
@@ -300,9 +384,10 @@ export function SmppAccountsPanel({ orgId }: { orgId?: string }) {
         onStateChange={t.setState}
         empty={{ title: "No SMPP accounts" }}
       />
-      <CreateDialog open={creating} onOpenChange={setCreating} orgId={orgId} />
+      <CreateDialog open={creating} onOpenChange={setCreating} orgId={orgId} onCreated={(a) => setConn(a)} />
       <EditDialog account={editing} onClose={() => setEditing(null)} />
       <PasswordDialog account={pwd} onClose={() => setPwd(null)} />
+      <ConnectionDialog account={conn} onClose={() => setConn(null)} />
       <ConfirmDialog
         open={!!deleting}
         onOpenChange={(v) => !v && setDeleting(null)}

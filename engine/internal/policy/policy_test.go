@@ -32,7 +32,7 @@ func TestErrorBasics(t *testing.T) {
 			t.Fatal(c)
 		}
 	}
-	if len(AllCodes) != 21 || Code("NOPE").Valid() {
+	if len(AllCodes) != 22 || Code("NOPE").Valid() {
 		t.Fatal("codes")
 	}
 }

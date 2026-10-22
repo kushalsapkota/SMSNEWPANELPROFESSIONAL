@@ -8,3 +8,6 @@ coverage/
 deploy/.build-reports.json
 deploy/.finish-report.json
 deploy/.run/
+
+# Local database backups (deploy/backup.sh)
+deploy/.backups/

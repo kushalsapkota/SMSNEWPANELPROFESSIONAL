@@ -35,6 +35,7 @@ const (
 	CodeOTPNotFound        Code = "OTP_NOT_FOUND"
 	CodeDestinationBlocked Code = "DESTINATION_BLOCKED"
 	CodeContentBlocked     Code = "CONTENT_BLOCKED"
+	CodeContentNotApproved Code = "CONTENT_NOT_APPROVED"
 	CodeInvalidDestination Code = "INVALID_DESTINATION"
 	CodeMessageTooLong     Code = "MESSAGE_TOO_LONG"
 	CodeNotFound           Code = "NOT_FOUND"
@@ -48,7 +49,7 @@ var AllCodes = []Code{
 	CodeAccountSuspended, CodeSendingDisabled, CodeChannelDisabled,
 	CodeInsufficientFunds, CodeRateLimited, CodeDailyLimit, CodeMonthlyLimit,
 	CodeRouteNotFound, CodeSenderNotAllowed, CodeOTPNotFound,
-	CodeDestinationBlocked, CodeContentBlocked, CodeInvalidDestination,
+	CodeDestinationBlocked, CodeContentBlocked, CodeContentNotApproved, CodeInvalidDestination,
 	CodeMessageTooLong, CodeNotFound, CodeConflict, CodeInternal,
 }
 

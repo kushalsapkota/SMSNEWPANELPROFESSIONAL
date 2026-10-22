@@ -49,6 +49,7 @@ export const qk = {
   smppAccounts: {
     all: ["smpp-accounts"] as const,
     list: (params: object) => ["smpp-accounts", "list", params] as const,
+    credentials: (id: string) => ["smpp-accounts", "credentials", id] as const,
   },
   ipWhitelist: {
     all: ["ip-whitelist"] as const,
@@ -78,12 +79,14 @@ export const qk = {
     summary: (params: object) => ["analytics", "summary", params] as const,
     timeseries: (params: object) => ["analytics", "timeseries", params] as const,
     breakdown: (params: object) => ["analytics", "breakdown", params] as const,
+    clients: (params: object) => ["analytics", "clients", params] as const,
     live: ["analytics", "live"] as const,
   },
   monitor: {
     all: ["monitor"] as const,
     connections: ["monitor", "connections"] as const,
     smppSessions: ["monitor", "smpp-sessions"] as const,
+    smppEvents: ["monitor", "smpp-events"] as const,
   },
   tester: {
     all: ["tester"] as const,
@@ -98,6 +101,22 @@ export const qk = {
   auditLogs: {
     all: ["audit-logs"] as const,
     list: (params: object) => ["audit-logs", "list", params] as const,
+  },
+  firewall: {
+    all: ["firewall"] as const,
+    status: ["firewall", "status"] as const,
+  },
+  domains: {
+    all: ["domains"] as const,
+    status: ["domains", "status"] as const,
+  },
+  switches: {
+    all: ["switches"] as const,
+    status: ["switches", "status"] as const,
+  },
+  approvedContent: {
+    all: ["approved-content"] as const,
+    list: (params: object) => ["approved-content", "list", params] as const,
   },
   dashboard: ["dashboard"] as const,
 };
