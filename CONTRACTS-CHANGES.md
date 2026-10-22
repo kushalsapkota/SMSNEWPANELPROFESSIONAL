@@ -843,3 +843,148 @@ dlr, internalapi). All additions are backward compatible; clarifications of the 
 11. **Outbound requests** have a 10 s timeout, keep-alive pooling and `User-Agent: smsgw/1.0`. Redirects are
     not followed: a 3xx counts as a retryable failure. No private-IP guard applies. generic_http URLs must be
     http(s) (`BAD_CONFIG` otherwise).
+
+## admin controls (db 008-010, engine, api, web, deploy)
+
+All additions are backward compatible. No existing endpoint changes its request or response, except
+for the fields added below. Every new admin endpoint is SUPER_ADMIN only unless stated otherwise.
+
+1. **Migration 008: `smpp_accounts.password_enc`** (nullable, app-encrypted `v1:...` like
+   `upstream_connections.password_enc`). It is display-only: binding still checks `password_hash`.
+   Create and rotate write both. Accounts created before 008 stay NULL until their password is next set.
+   - **`GET /api/smpp-accounts/:id/credentials`** returns `{id, system_id, password, password_available,
+     enabled}`. Anyone who can read the org may call it (admin, its reseller, the client itself).
+   - `password` is null when there is no copy or it cannot be decrypted, for example after a key
+     rotation. Each call is audited as `smpp_account.credentials_view`, without the password.
+2. **Migration 009: `service_switches`**, a single row (`id boolean PK CHECK (id)`) with
+   `all_enabled`, `http_api_enabled`, `smpp_enabled`, `bulk_enabled`, `note`, `updated_at`,
+   `updated_by`. RLS restricts it to admins. The switches are **global**: the per-org channel flags on
+   `organizations` are unchanged and remain the per-org controls.
+   - **`GET /api/switches`** returns the row. **`PUT /api/switches`** takes a strict body where every
+     key is optional and at least one is required. Only the keys sent are changed.
+   - After commit the api forces an engine config reload, so changes apply live. Each PUT is audited
+     as `switches.update`, with the before and after values of the four booleans.
+   - **Fail open:** a missing row means all-on, in both the api (`status()`) and the engine
+     (`DefaultSwitches`).
+3. **Engine: switch enforcement** (`policy.CheckSwitches`, which runs first in the pipeline).
+   - Master off → `SENDING_DISABLED`.
+   - Channel switch off → `CHANNEL_DISABLED` (HTTP or SMPP).
+   - Bulk off and the request is bulk → `SENDING_DISABLED`. A request counts as bulk when it comes in
+     through the batch path of `POST /internal/v1/submit`.
+   - These reuse existing codes, so `AllCodes` gains no switch codes.
+   - `CheckBind` refuses new binds when SMPP or the master is off. On reload with either one off, the
+     engine also drops every bound session (`KickSystemID` per session).
+4. **Migration 010: content pre-approval.**
+   - **Schema:** adds `organizations.content_approval_required` (default false) and the
+     `content_status` enum (`PENDING | APPROVED | REJECTED`).
+   - **`approved_content` table:** columns `id, org_id, content (1-2000), status, note, reviewed_by,
+     reviewed_at, created_at`. A unique index on `(org_id, md5(content))` blocks duplicates. RLS
+     `tenant_isolation` uses `app.can_see_org`, like `sender_ids`.
+   - **Engine:** when the flag is on, text must match an APPROVED entry for the org, otherwise the
+     message is rejected with new code **`CONTENT_NOT_APPROVED`** (`AllCodes` 21 → 22).
+   - **Matching** is on a normalized form: lower-case, trimmed, whitespace runs collapsed. An org with
+     the flag on and no approved entries can send nothing. The flag gates submits only, never binds.
+   - **`PATCH /api/orgs/:id/content-approval`** `{required: boolean}` works on any org. It is audited as
+     `org.content_approval`.
+   - **`GET /api/approved-content`** takes `?org_id, status, include_children, page, page_size`.
+     `include_children=true` without `org_id` returns the review queue: every org for an admin, a
+     reseller's direct clients for a reseller. Rows add `org_name`.
+   - **`POST /api/approved-content?org_id=`** `{content}`. From an admin (who may target any non-admin
+     org) the entry is APPROVED immediately. From the org or its reseller it is PENDING. Unlike sender
+     IDs, a reseller cannot approve. Exact duplicates → 409.
+   - **`DELETE /api/approved-content/:id`**: the org may withdraw a PENDING entry. A reviewed entry can
+     only be removed by an admin (403 otherwise).
+   - **`POST /api/approved-content/:id/approve|reject`** is admin only.
+   - Create, delete and review are audited as `approved_content.*` and publish a `cfg:invalidate`
+     message.
+5. **Engine: HTTP adapter `kavrelisms` (Kavreli SMS).** The catalogue now lists **11** adapters, with
+   `kavrelisms` inserted before `generic_http`.
+   - **Request:** no credentials (`credentials: []`). `base_url` is required. Each message is a form
+     POST of `mobile=<NP local 10-digit>&message=<text>`. NP destinations only.
+   - **Outcome:** a 2xx response is accepted unless its body has `status` error/failed/fail or
+     `success:false` (→ `PROVIDER_ERROR`).
+   - **New optional adapter interface `AcceptIsDelivery`:** an accepted message is recorded
+     **`DELIVERED`** with `dlr_stat = 'DELIVRD'` and `dlr_received_at = now`, not NODLR. Kavreli SMS is
+     the only adapter that implements it. The NODLR rules in "http connections (engine)" §5 are
+     unchanged for the other `dlr_mode = none` adapters.
+6. **Engine: SMPP bind events.** **`GET /internal/v1/smpp/events?limit=`** (default 500, max 2000)
+   returns `{events:[{time, type: bound|rejected|unbound, system_id, org_id, remote_addr, bind_type,
+   status, reason, session_id}]}`, newest first. Events come from an in-memory ring buffer
+   (`BindEventLogSize`, default 2000) and are lost on restart. A rejected bind carries the
+   authenticator's reason.
+   - **api `GET /api/monitor/smpp-events`:** an admin sees every event. Other roles see only events
+     for orgs they can see. Rejections for an unknown system_id are admin only. Rows add `org_name`.
+   - **`GET /api/monitor/sessions`** rows add `location` (`{country, country_code, city, isp}` or
+     null), described in §10.
+7. **Engine env `CFG_INVALIDATE_CHANNEL`** (default `cfg:invalidate`). It must match the api's
+   value. Give each stack its own value when several stacks share one Redis.
+8. **api: orgs.**
+   - **`POST /api/orgs/bulk`** (admin) `{clients: [1..200 rows]}`. Each row has: `reseller_id`, `name`,
+     `email?`, `password?`, `billing_mode`, `credit_limit_micros = 0` (must be 0 for PREPAID),
+     `smpp_system_id?` (≤15 chars, `[A-Za-z0-9_.-]`), `smpp_password?` (≤8), `max_binds = 2`,
+     `max_tps = 1000`, `allowed_bind_types = [TX, TRX]`, `route_id?`, and `rate_micros?` (requires
+     `route_id`).
+   - Rows are created independently, one transaction per row. The response is 201 `{created, failed,
+     results:[{index, name, status: created|error, ...}]}`. Generated passwords appear **only in this
+     response**.
+   - A missing email becomes `<slug>@${CLIENT_EMAIL_DOMAIN}` (default `clients.local`). Duplicate
+     emails or system_ids within the batch, or against the db, fail that row only.
+   - **`DELETE /api/orgs/:id`** (parent of the org): the default is a reversible **close**. It sets
+     `status = CLOSED`, sets every channel flag false, revokes refresh tokens for the org's users and
+     for impersonations into it, reloads the engine, and kicks the org and its children. `activate`
+     undoes it.
+   - **`?purge=true`** deletes the org permanently. It needs the org to be closed or suspended first and
+     to have no sub-orgs (400 otherwise). Dependent rows cascade, but `message_logs` and `audit_logs`
+     are kept.
+   - Both forms accept `?reason=`. They are audited as `<role>.close` or `<role>.delete`.
+   - **`DELETE /api/orgs/:id/users/:uid`** (parent only) is refused for yourself and for the org's last
+     user. Audited as `user.delete`.
+   - Channel toggles: an admin may now toggle channels on **any** org, including a reseller's client.
+     A reseller still only toggles its own direct clients.
+   - The org DTO adds `content_approval_required`.
+9. **api: `GET /api/analytics/clients`** (same range query as the other analytics endpoints) returns
+   `{rows:[{org_id, name, role, status, reseller_name, currency, messages, parts, delivered, failed,
+   delivery_rate, charged_micros}], totals, currency, from, to}`.
+   - Rows come from `message_stats_hourly`. `charged_micros` = `client_cost_micros`. Rows are sorted by
+     charged, then messages, with a limit of 1000.
+   - Scope follows the caller. `org_id` narrows the result to one reseller's clients.
+10. **api: login and env.**
+    - **Per-IP login limiter:** `LOGIN_RATE_LIMIT` (20) attempts per `LOGIN_RATE_WINDOW_S` (60) per
+      client IP. It uses a Redis fixed window, fails open, and runs before the per-account lockout.
+      Over the limit → 429 `RATE_LIMITED` with `details.retry_after_seconds`.
+    - The exception filter now sets `Retry-After` on every `RATE_LIMITED` response.
+    - `INTERNAL_TOKEN` and `JWT_SECRET` must now also pass a weak-secret check: no placeholder words
+      and at least 10 or 12 distinct characters. A deployment with a weak value **fails to boot**.
+    - GeoIP for the sessions monitor: `GEOIP_ENABLED` (default on), `GEOIP_ENDPOINT` (template with
+      `{ip}`, default ip-api.com), and `GEOIP_CACHE_TTL_S` (7 days). Private IPs are never looked up.
+      Set `GEOIP_ENABLED=false` to keep bind IPs inside the deployment.
+11. **api: host agents.** Both agents use the same pattern: a Unix socket plus a token header, with
+    status reported as `available: false` when the token is empty.
+    - Any other call made while the agent is not configured or unreachable → **503**. A non-JSON or
+      5xx reply → 502. A 400 from the agent → 400 with the agent's message.
+    - **Firewall** (`FW_AGENT_SOCKET` `/run/fwagent/agent.sock`, `FW_AGENT_TOKEN`; this is the
+      `firewall-agent` container): `GET /api/firewall`; `PUT /api/firewall` `{enabled, default_policy:
+      allow|deny, rules: ≤200 [{action, proto = tcp|udp|any, port|null, source: IP/CIDR|null}]}`.
+    - The PUT **stages** the ruleset. The agent reverts it automatically unless `POST
+      /api/firewall/commit` is called within its window. `POST /api/firewall/revert` reverts at once.
+      Audited as `firewall.apply|commit|revert`.
+    - **Domains** (`DOMAIN_AGENT_SOCKET` `/run/domainagent/agent.sock`, `DOMAIN_AGENT_TOKEN`; this is
+      the host systemd `domain-agent` from `deploy/domain-agent/`): `GET /api/domains`; `POST
+      /api/domains` `{domain, role: panel|smpp|both}`; `DELETE /api/domains/:domain`.
+    - The agent writes only `smsgw-managed-<domain>` vhosts and issues a webroot certificate. It runs
+      `nginx -t` before every reload and rolls back on failure.
+    - It refuses domains that are already served by a non-managed vhost. Remove keeps the certificate.
+      Audited as `domains.add|remove`.
+12. **Web:** new pages `/kill-switch`, `/approved-content`, `/firewall`, `/domains`, `/billing` and
+    `/bulk-clients`. `/billing` is for SUPER_ADMIN and RESELLER, `/approved-content` is for every role,
+    and the rest are admin only.
+    - The SMPP accounts panel gains a reveal/copy of the full connection.
+    - The monitor gains the bind-event log and session location.
+    - Org pages gain close/delete and user delete.
+13. **Deploy:**
+    - `docker-compose.prod.yml` adds the firewall-agent service. It is opt-in: set `FW_AGENT_TOKEN` and
+     run with `--profile firewall`.
+    - The api bind-mounts the host's `/run/domainagent` and takes `DOMAIN_AGENT_TOKEN` and
+      `FW_AGENT_TOKEN` from `deploy/.env`, which `.env.example` documents.
+    - Also added: `docker-compose.observability.yml` (Prometheus, Alertmanager, Grafana),
+      `backup.sh` / `restore.sh` (`BACKUP.md`) and `nginx-duckdns.conf`.

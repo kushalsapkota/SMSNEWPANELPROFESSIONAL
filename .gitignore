@@ -11,3 +11,7 @@ deploy/.run/
 
 # Local database backups (deploy/backup.sh)
 deploy/.backups/
+
+# Python bytecode (deploy agents)
+__pycache__/
+*.pyc
