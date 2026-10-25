@@ -450,3 +450,199 @@ func hmacHex(key, msg string) string {
 	m.Write([]byte(msg))
 	return hex.EncodeToString(m.Sum(nil))
 }
+
+type trackTransport struct {
+	calls atomic.Int32
+	do    func(r *httpadapter.Request) (*httpadapter.Response, error)
+}
+
+func (t *trackTransport) Do(ctx context.Context, r *httpadapter.Request) (*httpadapter.Response, error) {
+	t.calls.Add(1)
+	if t.do != nil {
+		return t.do(r)
+	}
+	return &httpadapter.Response{
+		Status: 200,
+		Body:   []byte(`{"count":1,"response_code":200,"response":"1 mesages has been queued for delivery"}`),
+	}, nil
+}
+
+func TestRouteMerolagThroughTor(t *testing.T) {
+	regularTr := &trackTransport{}
+	torTr := &trackTransport{}
+
+	// Create route "merolag"
+	merolagRouteID := uuid.NewString()
+	connID := uuid.NewString()
+
+	c := httpConnRow(connID, "sparrow_v2", "https://api.sparrowsms.com/v2", nil)
+	r := &store.Route{
+		ID:          merolagRouteID,
+		Name:        "merolag",
+		Description: "Route for merolag",
+		Enabled:     true,
+	}
+
+	snap := store.NewSnapshot(store.Data{
+		Routes:      []*store.Route{r},
+		Connections: []*store.Connection{c},
+		RouteConnections: []*store.RouteConnection{
+			{RouteID: merolagRouteID, ConnectionID: connID, Priority: 1, Weight: 10, Enabled: true},
+		},
+	})
+
+	e := newEnvWith(t, snap, merolagRouteID, time.Minute, func(_ *env, o *Options) {
+		o.HTTPTransport = regularTr
+		o.TorTransport = torTr
+		o.HTTPRetryBackoff = 20 * time.Millisecond
+	}, nil)
+
+	// Send message through route merolag
+	job := e.enqueue(npDest, "test via tor", 1)
+	var u *cdr.Update
+	waitUntil(t, "submitted via tor", func() bool {
+		u = e.sink.find(job.ID, cdr.StatusSubmitted)
+		return u != nil
+	})
+
+	// Assert: Tor transport was called, regular transport was NOT called
+	if torTr.calls.Load() != 1 {
+		t.Fatalf("expected Tor transport to be called once, got %d", torTr.calls.Load())
+	}
+	if regularTr.calls.Load() != 0 {
+		t.Fatalf("expected regular transport to have 0 calls, got %d", regularTr.calls.Load())
+	}
+}
+
+func TestNormalRouteDoesNotUseTor(t *testing.T) {
+	regularTr := &trackTransport{}
+	torTr := &trackTransport{}
+
+	normalRouteID := uuid.NewString()
+	connID := uuid.NewString()
+
+	c := httpConnRow(connID, "sparrow_v2", "https://api.sparrowsms.com/v2", nil)
+	r := &store.Route{
+		ID:          normalRouteID,
+		Name:        "Standard Route",
+		Description: "Standard non-tor route",
+		Enabled:     true,
+	}
+
+	snap := store.NewSnapshot(store.Data{
+		Routes:      []*store.Route{r},
+		Connections: []*store.Connection{c},
+		RouteConnections: []*store.RouteConnection{
+			{RouteID: normalRouteID, ConnectionID: connID, Priority: 1, Weight: 10, Enabled: true},
+		},
+	})
+
+	e := newEnvWith(t, snap, normalRouteID, time.Minute, func(_ *env, o *Options) {
+		o.HTTPTransport = regularTr
+		o.TorTransport = torTr
+		o.HTTPRetryBackoff = 20 * time.Millisecond
+	}, nil)
+
+	job := e.enqueue(npDest, "normal send", 1)
+	var u *cdr.Update
+	waitUntil(t, "submitted normally", func() bool {
+		u = e.sink.find(job.ID, cdr.StatusSubmitted)
+		return u != nil
+	})
+
+	// Assert: Regular transport was called, Tor transport was NOT called
+	if regularTr.calls.Load() != 1 {
+		t.Fatalf("expected regular transport to be called once, got %d", regularTr.calls.Load())
+	}
+	if torTr.calls.Load() != 0 {
+		t.Fatalf("expected Tor transport to have 0 calls, got %d", torTr.calls.Load())
+	}
+}
+
+func TestRouteMerolagVariantsAndSettings(t *testing.T) {
+	for _, name := range []string{"mero lag", "MeroLag", "Route-merolag", "mero_lag"} {
+		t.Run("name="+name, func(t *testing.T) {
+			regularTr := &trackTransport{}
+			torTr := &trackTransport{}
+
+			routeID := uuid.NewString()
+			connID := uuid.NewString()
+
+			c := httpConnRow(connID, "sparrow_v2", "https://api.sparrowsms.com/v2", nil)
+			r := &store.Route{
+				ID:      routeID,
+				Name:    name,
+				Enabled: true,
+			}
+
+			snap := store.NewSnapshot(store.Data{
+				Routes:      []*store.Route{r},
+				Connections: []*store.Connection{c},
+				RouteConnections: []*store.RouteConnection{
+					{RouteID: routeID, ConnectionID: connID, Priority: 1, Weight: 10, Enabled: true},
+				},
+			})
+
+			e := newEnvWith(t, snap, routeID, time.Minute, func(_ *env, o *Options) {
+				o.HTTPTransport = regularTr
+				o.TorTransport = torTr
+				o.HTTPRetryBackoff = 20 * time.Millisecond
+			}, nil)
+
+			job := e.enqueue(npDest, "variant test", 1)
+			waitUntil(t, "submitted", func() bool {
+				return e.sink.find(job.ID, cdr.StatusSubmitted) != nil
+			})
+
+			if torTr.calls.Load() != 1 {
+				t.Fatalf("variant %q expected Tor transport to be called once, got %d", name, torTr.calls.Load())
+			}
+			if regularTr.calls.Load() != 0 {
+				t.Fatalf("variant %q expected regular transport 0 calls, got %d", name, regularTr.calls.Load())
+			}
+		})
+	}
+
+	t.Run("connection_setting_tor", func(t *testing.T) {
+		regularTr := &trackTransport{}
+		torTr := &trackTransport{}
+
+		routeID := uuid.NewString()
+		connID := uuid.NewString()
+
+		// Route has an arbitrary name, but connection has tor: true
+		c := httpConnRow(connID, "sparrow_v2", "https://api.sparrowsms.com/v2", map[string]any{"tor": true})
+		r := &store.Route{
+			ID:      routeID,
+			Name:    "Custom Route",
+			Enabled: true,
+		}
+
+		snap := store.NewSnapshot(store.Data{
+			Routes:      []*store.Route{r},
+			Connections: []*store.Connection{c},
+			RouteConnections: []*store.RouteConnection{
+				{RouteID: routeID, ConnectionID: connID, Priority: 1, Weight: 10, Enabled: true},
+			},
+		})
+
+		e := newEnvWith(t, snap, routeID, time.Minute, func(_ *env, o *Options) {
+			o.HTTPTransport = regularTr
+			o.TorTransport = torTr
+			o.HTTPRetryBackoff = 20 * time.Millisecond
+		}, nil)
+
+		job := e.enqueue(npDest, "conn tor setting test", 1)
+		waitUntil(t, "submitted", func() bool {
+			return e.sink.find(job.ID, cdr.StatusSubmitted) != nil
+		})
+
+		if torTr.calls.Load() != 1 {
+			t.Fatalf("expected Tor transport to be called once, got %d", torTr.calls.Load())
+		}
+		if regularTr.calls.Load() != 0 {
+			t.Fatalf("expected regular transport 0 calls, got %d", regularTr.calls.Load())
+		}
+	})
+}
+

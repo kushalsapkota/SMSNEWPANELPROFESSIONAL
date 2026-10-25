@@ -41,6 +41,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -127,6 +128,12 @@ type Options struct {
 	HTTPTransport    httpadapter.Transport
 	HTTPRetries      int
 	HTTPRetryBackoff time.Duration
+
+	// TorTransport performs provider requests routed through Tor (used for
+	// route "merolag" or connections marked for Tor). Default builds one from
+	// TorProxyURL or the TOR_PROXY_URL environment variable.
+	TorTransport httpadapter.Transport
+	TorProxyURL  string
 	// Receipts applies provider delivery statuses (poll / callback DLRs);
 	// Pending lists messages to poll (default DBPending(db) when db is set).
 	// PollTick is how often due pollers are checked (default 5s);
@@ -231,6 +238,18 @@ func New(src ConfigSource, rdb redis.UniversalClient, biller pipeline.Biller, db
 	}
 	if o.HTTPTransport == nil {
 		o.HTTPTransport = httpadapter.NewHTTPTransport(nil)
+	}
+	if o.TorTransport == nil {
+		torURL := o.TorProxyURL
+		if torURL == "" {
+			torURL = os.Getenv("TOR_PROXY_URL")
+		}
+		if torURL == "" {
+			torURL = httpadapter.DefaultTorProxyURL
+		}
+		if tr, err := httpadapter.NewTorHTTPTransport(torURL, nil); err == nil {
+			o.TorTransport = tr
+		}
 	}
 	if o.HTTPRetries <= 0 {
 		o.HTTPRetries = 3

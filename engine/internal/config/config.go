@@ -87,6 +87,7 @@ type Config struct {
 	// (<base>/v1/provider-dlr/<dlr_token>), sent to adapters that take a
 	// callback URL per request. Empty = not sent.
 	PublicAPIBaseURL string
+	TorProxyURL      string        // TOR_PROXY_URL, default "socks5://127.0.0.1:9050"
 	CDRFlushInterval time.Duration // ENGINE_CDR_FLUSH_INTERVAL, default 250ms
 	CDRBatchSize     int           // ENGINE_CDR_BATCH_SIZE, default 500
 
@@ -157,6 +158,7 @@ func LoadFrom(getenv Getenv) (*Config, error) {
 		WebhookWorkers:      l.int("ENGINE_WEBHOOK_WORKERS", 16, 1, 1024),
 		WebhookAllowPrivate: truthy(l.str("WEBHOOK_ALLOW_PRIVATE_TARGETS", "")),
 		PublicAPIBaseURL:    strings.TrimRight(l.str("PUBLIC_API_BASE_URL", ""), "/"),
+		TorProxyURL:         l.str("TOR_PROXY_URL", "socks5://127.0.0.1:9050"),
 		CDRFlushInterval:    l.dur("ENGINE_CDR_FLUSH_INTERVAL", 250*time.Millisecond, time.Millisecond),
 		CDRBatchSize:        l.int("ENGINE_CDR_BATCH_SIZE", 500, 1, 100000),
 

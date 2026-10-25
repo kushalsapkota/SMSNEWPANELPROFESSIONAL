@@ -800,3 +800,40 @@ func TestGenericHTTP(t *testing.T) {
 		t.Fatal("generic_http has no DLR")
 	}
 }
+
+func TestTorTransport(t *testing.T) {
+	// Default
+	tr, err := NewTorHTTPTransport("", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if tr == nil || tr.Client == nil || tr.Timeout != TorTimeout {
+		t.Fatalf("invalid default tor transport: %+v", tr)
+	}
+
+	// Custom
+	tr2, err := NewTorHTTPTransport("socks5://127.0.0.1:9150", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if tr2 == nil || tr2.Client == nil {
+		t.Fatalf("invalid custom tor transport: %+v", tr2)
+	}
+
+	// Env var override
+	t.Setenv("TOR_PROXY_URL", "socks5://10.0.0.1:9050")
+	tr3, err := NewTorHTTPTransport("", nil)
+	if err != nil {
+		t.Fatalf("unexpected error with env: %v", err)
+	}
+	if tr3 == nil {
+		t.Fatal("expected non-nil transport")
+	}
+
+	// Bad URL
+	_, err = NewTorHTTPTransport("://invalid-url", nil)
+	if err == nil {
+		t.Fatal("expected error for invalid url")
+	}
+}
+

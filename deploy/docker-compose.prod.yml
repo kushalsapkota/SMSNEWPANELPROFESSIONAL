@@ -171,6 +171,7 @@ services:
       ENGINE_SHUTDOWN_TIMEOUT: ${ENGINE_SHUTDOWN_TIMEOUT:-20s}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       LOG_FORMAT: json
+      TOR_PROXY_URL: ${TOR_PROXY_URL:-socks5://127.0.0.1:9050}
     ports:
       - "${SMPP_PUBLISH_ADDR:-0.0.0.0}:${SMPP_PUBLIC_PORT:-2775}:2775"
     ulimits:

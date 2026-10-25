@@ -218,10 +218,66 @@ func (m *Manager) reconcileHTTP(snap *store.Snapshot) {
 	}
 }
 
+// isMerolag reports whether a route/connection name or ID represents "merolag"
+// (case-insensitive, ignores spaces, hyphens, underscores).
+func isMerolag(name, id string) bool {
+	cleanName := strings.ToLower(strings.TrimSpace(name))
+	stripped := strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(cleanName, " ", ""), "_", ""), "-", "")
+	if stripped == "merolag" || strings.Contains(stripped, "merolag") {
+		return true
+	}
+	cleanID := strings.ToLower(strings.TrimSpace(id))
+	strippedID := strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(cleanID, " ", ""), "_", ""), "-", "")
+	return strippedID == "merolag" || strings.Contains(strippedID, "merolag")
+}
+
+// shouldUseTor reports whether HTTP requests for c under route r (or routeID)
+// should be routed through Tor.
+func (m *Manager) shouldUseTor(r *store.Route, routeID string, c *store.Connection) bool {
+	if r != nil && isMerolag(r.Name, r.ID) {
+		return true
+	}
+	if routeID != "" && isMerolag("", routeID) {
+		return true
+	}
+	if c != nil {
+		if isMerolag(c.Name, c.ID) {
+			return true
+		}
+		if c.HTTPSettings != nil {
+			if tor, ok := c.HTTPSettings["tor"].(bool); ok && tor {
+				return true
+			}
+			if useTor, ok := c.HTTPSettings["use_tor"].(bool); ok && useTor {
+				return true
+			}
+			if proxy, ok := c.HTTPSettings["proxy"].(string); ok && strings.EqualFold(proxy, "tor") {
+				return true
+			}
+		}
+	}
+	if snap := m.src.Current(); snap != nil && c != nil {
+		for _, route := range snap.Routes() {
+			if isMerolag(route.Name, route.ID) {
+				for _, rc := range route.Connections {
+					if rc.ConnectionID == c.ID {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
 // adapterConn builds the adapter's view of c.
-func (m *Manager) adapterConn(c *store.Connection, a httpadapter.Adapter) *httpadapter.Conn {
+func (m *Manager) adapterConn(c *store.Connection, a httpadapter.Adapter, useTor bool) *httpadapter.Conn {
 	info := a.Info()
-	return httpadapter.NewConn(c.ID, &info, c.HTTPCredentials, c.HTTPSettings, c.DLRToken, m.opts.HTTPTransport)
+	tr := m.opts.HTTPTransport
+	if useTor && m.opts.TorTransport != nil {
+		tr = m.opts.TorTransport
+	}
+	return httpadapter.NewConn(c.ID, &info, c.HTTPCredentials, c.HTTPSettings, c.DLRToken, tr)
 }
 
 // callbackURL is the public provider-DLR URL of c ("" when unknown).
@@ -249,7 +305,19 @@ func (m *Manager) attemptHTTP(ctx context.Context, job *pipeline.DispatchJob, c 
 		m.log.Info("destination not served by adapter; failing over", "message_id", job.ID, "connection_id", c.ID, "adapter", c.Adapter)
 		return attemptResult{errCode: "DESTINATION_NOT_SUPPORTED"}
 	}
-	hc := m.adapterConn(c, ad)
+	var r *store.Route
+	if snap := m.src.Current(); snap != nil && job.RouteID != "" {
+		r = snap.Route(job.RouteID)
+	}
+	useTor := m.shouldUseTor(r, job.RouteID, c)
+	if useTor {
+		rName := ""
+		if r != nil {
+			rName = r.Name
+		}
+		m.log.Info("routing provider request through Tor", "route_id", job.RouteID, "route_name", rName, "connection_id", c.ID, "adapter", c.Adapter)
+	}
+	hc := m.adapterConn(c, ad, useTor)
 	msg := &httpadapter.Message{ID: job.ID, To: job.Dest, Text: job.Text, Source: job.Source, Encoding: job.Encoding,
 		Parts: job.Parts, CallbackURL: m.callbackURL(c)}
 
@@ -457,7 +525,7 @@ func (m *Manager) TestSend(ctx context.Context, id, to, text, from string) (*Tes
 	if strings.TrimSpace(text) == "" {
 		return fail("text is required")
 	}
-	hc := m.adapterConn(c, ad)
+	hc := m.adapterConn(c, ad, m.shouldUseTor(nil, "", c))
 	msg := &httpadapter.Message{ID: pipeline.NewMessageID(), To: dest, Text: text, Source: from, Parts: 1,
 		CallbackURL: m.callbackURL(c)}
 	start := time.Now()
@@ -535,7 +603,7 @@ func (m *Manager) ProviderBalance(ctx context.Context, id string) (*BalanceResul
 	if c.PasswordErr != nil {
 		return &BalanceResult{Supported: true, Error: strPtr("credentials cannot be decrypted")}, nil
 	}
-	hc := m.adapterConn(c, ad)
+	hc := m.adapterConn(c, ad, m.shouldUseTor(nil, "", c))
 	r := bc.Balance(ctx, hc)
 	out := &BalanceResult{Supported: true, Raw: firstBytes(hc.Mask(r.Raw), 1024)}
 	if r.Balance != "" {
@@ -567,7 +635,7 @@ func (m *Manager) ProviderDLR(ctx context.Context, dlrToken string, cb *httpadap
 		m.log.Info("provider callback for an adapter without callback DLRs; ignored", "connection_id", c.ID, "adapter", c.Adapter)
 		return 0, nil
 	}
-	hc := m.adapterConn(c, ad)
+	hc := m.adapterConn(c, ad, m.shouldUseTor(nil, "", c))
 	receipts, err := p.ParseCallback(hc, cb)
 	if err != nil {
 		m.log.Warn("provider DLR callback rejected", "connection_id", c.ID, "adapter", c.Adapter, "err", hc.Mask(err.Error()))
@@ -631,7 +699,7 @@ func (m *Manager) pollLoop(ctx context.Context) {
 				continue
 			}
 			poller, ok := ad.(httpadapter.DLRPoller)
-			hc := m.adapterConn(c, ad)
+			hc := m.adapterConn(c, ad, m.shouldUseTor(nil, "", c))
 			if !ok || httpadapter.EffectiveDLRMode(ad, hc) != httpadapter.DLRPoll {
 				continue
 			}

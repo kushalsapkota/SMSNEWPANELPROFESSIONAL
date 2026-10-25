@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -102,6 +103,46 @@ func NewHTTPTransport(tlsCfg *tls.Config) *HTTPTransport {
 		Timeout: DefaultTimeout,
 	}
 }
+
+// DefaultTorProxyURL is the default SOCKS5 address for Tor.
+const DefaultTorProxyURL = "socks5://127.0.0.1:9050"
+
+// TorTimeout bounds requests routed through Tor (circuits can add latency).
+const TorTimeout = 30 * time.Second
+
+// NewTorHTTPTransport builds an HTTP transport routed through a Tor SOCKS5 proxy.
+// If torProxyURL is empty, it uses the TOR_PROXY_URL environment variable,
+// or defaults to "socks5://127.0.0.1:9050".
+func NewTorHTTPTransport(torProxyURL string, tlsCfg *tls.Config) (*HTTPTransport, error) {
+	if torProxyURL == "" {
+		torProxyURL = os.Getenv("TOR_PROXY_URL")
+	}
+	if torProxyURL == "" {
+		torProxyURL = DefaultTorProxyURL
+	}
+	u, err := url.Parse(torProxyURL)
+	if err != nil {
+		return nil, fmt.Errorf("httpadapter: invalid tor proxy url %q: %w", torProxyURL, err)
+	}
+	tr := &http.Transport{
+		Proxy:                 http.ProxyURL(u),
+		DialContext:           (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          256,
+		MaxIdleConnsPerHost:   64,
+		IdleConnTimeout:       50 * time.Second,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ExpectContinueTimeout: time.Second,
+		TLSClientConfig:       tlsCfg,
+	}
+	return &HTTPTransport{
+		Client: &http.Client{Transport: tr, CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}},
+		Timeout: TorTimeout,
+	}, nil
+}
+
 
 // Do executes r.
 func (t *HTTPTransport) Do(ctx context.Context, r *Request) (*Response, error) {

@@ -988,3 +988,16 @@ for the fields added below. Every new admin endpoint is SUPER_ADMIN only unless 
       `FW_AGENT_TOKEN` from `deploy/.env`, which `.env.example` documents.
     - Also added: `docker-compose.observability.yml` (Prometheus, Alertmanager, Grafana),
       `backup.sh` / `restore.sh` (`BACKUP.md`) and `nginx-duckdns.conf`.
+
+## Tor Routing for Route "merolag"
+
+1. **Tor SOCKS5 Transport:**
+   - Added `httpadapter.NewTorHTTPTransport(proxyURL, tlsCfg)` providing an HTTP transport configured to proxy all HTTP requests over Tor SOCKS5 (`TOR_PROXY_URL`, default `socks5://127.0.0.1:9050`).
+   - Circuit-tolerant timeouts (15s dial, 15s TLS handshake, 30s request timeout) with keep-alive connection pooling.
+2. **Route "merolag" Outbound POST / Sending Requests:**
+   - Engine HTTP dispatch checks if a route or connection is "merolag" (`isMerolag`: case-insensitive, punctuation/spacing-tolerant for "merolag", "mero lag", "MeroLag", etc., or ID "merolag").
+   - Connections with `tor: true` or `use_tor: true` or `proxy: "tor"` also route through Tor.
+   - All outbound POST requests and sending requests (SMS submit, DLR polling, balance checks, connection test sends) for route "merolag" are dispatched through Tor SOCKS5.
+3. **Environment & Deploy Configuration:**
+   - `TOR_PROXY_URL` added to `config.Config` (engine), `deploy/.env`, `deploy/.env.example`, `deploy/docker-compose.prod.yml`, and `deploy/dev-up.sh`.
+

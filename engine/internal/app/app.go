@@ -208,6 +208,7 @@ func New(ctx context.Context, cfg *config.Config, log *slog.Logger, ov Overrides
 		ClaimIdle: cfg.DispatchClaimIdle, MsgStateTTL: cfg.MsgStateTTL, MaxQueueAge: ov.DispatchMaxQueueAge, ScanInterval: ov.DispatchScanInterval,
 		DrainTimeout: cfg.ShutdownTimeout / 2, OnDeliver: a.DLR.HandleDeliver, TLSConfig: ov.UpstreamTLS,
 		Receipts: a.DLR, PublicBaseURL: cfg.PublicAPIBaseURL, PollTick: ov.HTTPDLRPollTick, PollInterval: ov.HTTPDLRPollInterval,
+		TorProxyURL: cfg.TorProxyURL,
 		Refunder: a.Refunder, Logger: log, Metrics: a.Metrics,
 	})
 	a.Forwarder = dlr.NewForwarder(a.rdb, a.Store, a.SMPP, a.Webhooks, dlr.ForwarderOptions{
