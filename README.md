@@ -42,7 +42,7 @@ panel / API / SMPP, encrypted credentials (AES-256-GCM), login rate limiting, au
 On a fresh Ubuntu/Debian server, with a DNS record pointing at it:
 
 ```bash
-git clone https://github.com/<you>/sms-gateway.git && cd sms-gateway
+git clone https://github.com/kushalsapkota/SMSNEWPANELPROFESSIONAL.git sms-gateway && cd sms-gateway
 sudo ./setup.sh --domain panel.example.com --email you@example.com
 ```
 

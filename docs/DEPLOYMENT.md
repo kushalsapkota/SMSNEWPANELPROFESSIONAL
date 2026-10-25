@@ -12,7 +12,7 @@ ports 80, 443 and 2775 reachable. For HTTPS, a DNS A record pointing at the serv
 ## 1. One-command install (`setup.sh`)
 
 ```bash
-git clone <this repo> sms-gateway && cd sms-gateway
+git clone https://github.com/kushalsapkota/SMSNEWPANELPROFESSIONAL.git sms-gateway && cd sms-gateway
 sudo ./setup.sh --domain panel.example.com --email you@example.com
 ```
 
