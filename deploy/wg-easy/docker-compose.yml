@@ -1,0 +1,47 @@
+# Admin VPN (wg-easy v15): WireGuard + web UI to manage devices.
+#   WireGuard: udp/51820 public (the only way in to SSH + panel once smsgw-vpn-lock is applied).
+#   Web UI:    NOT public. Over the VPN: http://10.8.0.1:51821 ; from the host: 127.0.0.1:51821
+#              (first login without a device: ssh -L 51821:127.0.0.1:51821 root@<host>).
+# VPN clients reach the host through the br-wgeasy bridge (NAT'd as 10.42.42.42), which
+# smsgw-vpn-lock accepts. Admin login lives in /root/wg-easy-admin.txt (0600).
+# Start: docker compose -f deploy/wg-easy/docker-compose.yml up -d
+name: wg-easy
+
+services:
+  wg-easy:
+    image: ghcr.io/wg-easy/wg-easy:15
+    container_name: wg-easy
+    env_file:
+      - path: ./init.env   # first-start unattended setup only; deleted after setup
+        required: false
+    environment:
+      - INSECURE=true      # UI is plain HTTP, but only reachable inside the encrypted tunnel / localhost
+      - DISABLE_IPV6=true
+    networks:
+      wg:
+        ipv4_address: 10.42.42.42
+    volumes:
+      - etc_wireguard:/etc/wireguard
+      - /lib/modules:/lib/modules:ro
+    ports:
+      - "51820:51820/udp"
+      - "127.0.0.1:51821:51821/tcp"
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv4.conf.all.src_valid_mark=1
+
+volumes:
+  etc_wireguard:
+
+networks:
+  wg:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: br-wgeasy
+    ipam:
+      config:
+        - subnet: 10.42.42.0/24

@@ -1,0 +1,93 @@
+#!/bin/sh
+# smsgw-vpn-lock — restrict the host to the admin WireGuard VPN, except SMPP.
+#
+# Public (internet):  SMPP :2775 (docker-published, FORWARD path — never touched here),
+#                     WireGuard udp/51820, tcp/80 (Let's Encrypt HTTP-01 renewals; the rest of :80
+#                     only redirects to https, which is closed), ICMP.
+# VPN only (wg-easy): everything else — SSH, the panel/API on :443, dev redis, etc.
+#
+#   smsgw-vpn-lock apply     load the rules and arm an auto-revert in 5 minutes
+#   smsgw-vpn-lock confirm   keep them: cancel the revert and load them on every boot
+#   smsgw-vpn-lock revert    remove the rules now (and stop loading them at boot)
+#   smsgw-vpn-lock status
+#
+# Rules live in their own nftables table (inet smsgw_vpn_lock), separate from Docker's
+# iptables-nft tables, so reverting is just deleting that table.
+set -eu
+
+TABLE="inet smsgw_vpn_lock"
+RULES=/etc/smsgw-vpn-lock.nft
+UNIT=smsgw-vpn-lock.service
+REVERT_UNIT=smsgw-vpn-lock-revert
+
+write_rules() {
+  cat > "$RULES" <<'EOF'
+table inet smsgw_vpn_lock {
+  chain input {
+    type filter hook input priority -10; policy accept;
+    iif "lo" accept
+    ct state established,related accept
+    ct state invalid drop
+    # VPN clients: wg-easy NATs them onto its bridge (br-wgeasy, 10.42.42.0/24).
+    iifname "br-wgeasy" accept
+    # Other Docker bridges reaching host services (containers -> host).
+    iifname { "docker0", "br-*" } accept
+    meta l4proto { icmp, ipv6-icmp } accept
+    udp dport 51820 accept
+    tcp dport 80 accept
+    drop
+  }
+}
+EOF
+}
+
+load() {
+  nft list table $TABLE >/dev/null 2>&1 && nft delete table $TABLE
+  nft -f "$RULES"
+}
+
+case "${1:-status}" in
+  apply)
+    [ "$(docker inspect -f '{{.State.Running}}' wg-easy 2>/dev/null)" = true ] || { echo "wg-easy is not running; refusing to lock" >&2; exit 1; }
+    write_rules
+    load
+    systemctl stop "$REVERT_UNIT.timer" 2>/dev/null || true
+    systemd-run --quiet --unit="$REVERT_UNIT" --on-active=300 /usr/local/sbin/smsgw-vpn-lock revert
+    echo "applied; auto-revert in 5 minutes unless 'smsgw-vpn-lock confirm' is run (over the VPN)"
+    ;;
+  confirm)
+    nft list table $TABLE >/dev/null 2>&1 || { echo "not applied" >&2; exit 1; }
+    systemctl stop "$REVERT_UNIT.timer" 2>/dev/null || true
+    cat > /etc/systemd/system/$UNIT <<EOF
+[Unit]
+Description=SMS gateway: restrict host to the admin WireGuard VPN (except SMPP)
+After=network-pre.target
+Before=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f $RULES
+ExecStop=/usr/sbin/nft delete table $TABLE
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable "$UNIT" >/dev/null 2>&1
+    echo "confirmed; rules load on every boot"
+    ;;
+  revert)
+    nft list table $TABLE >/dev/null 2>&1 && nft delete table $TABLE
+    systemctl disable "$UNIT" >/dev/null 2>&1 || true
+    systemctl stop "$REVERT_UNIT.timer" 2>/dev/null || true
+    echo "reverted; host is open again"
+    ;;
+  status)
+    if nft list table $TABLE >/dev/null 2>&1; then echo "locked (VPN only, SMPP public)"; else echo "open"; fi
+    systemctl is-enabled "$UNIT" 2>/dev/null | sed 's/^/boot: /' || echo "boot: disabled"
+    systemctl list-timers "$REVERT_UNIT.timer" --no-legend 2>/dev/null | grep -q . && echo "auto-revert pending"
+    true
+    ;;
+  *) echo "usage: $0 apply|confirm|revert|status" >&2; exit 2 ;;
+esac

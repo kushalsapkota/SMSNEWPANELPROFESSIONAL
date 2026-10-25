@@ -15,3 +15,6 @@ deploy/.backups/
 # Python bytecode (deploy agents)
 __pycache__/
 *.pyc
+
+# wg-easy first-start secrets
+deploy/wg-easy/init.env
